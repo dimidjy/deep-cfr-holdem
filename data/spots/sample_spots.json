@@ -1,0 +1,46 @@
+{
+  "version": "1.0",
+  "spots": [
+    {
+      "id": "preflop_btn_vs_bb",
+      "description": "Button vs Big Blind preflop",
+      "situation": "preflop",
+      "position": "button",
+      "expected_legal_actions": [0, 1, 2, 3, 4, 5],
+      "notes": "All actions should be available preflop"
+    },
+    {
+      "id": "flop_continuation_bet",
+      "description": "Flop after preflop raise",
+      "situation": "flop",
+      "action_history": ["raise", "call"],
+      "expected_legal_actions": [0, 1, 2, 3, 4, 5],
+      "notes": "Standard continuation bet spot"
+    },
+    {
+      "id": "river_all_in_call",
+      "description": "River facing all-in",
+      "situation": "river",
+      "action_history": ["bet", "raise", "all-in"],
+      "expected_legal_actions": [0, 1],
+      "notes": "Only fold or call available facing all-in"
+    },
+    {
+      "id": "turn_check_back",
+      "description": "Turn after checking flop",
+      "situation": "turn",
+      "action_history": ["check", "check"],
+      "expected_legal_actions": [0, 1, 2, 3, 4, 5],
+      "notes": "Full action range after checking"
+    },
+    {
+      "id": "3bet_pot_flop",
+      "description": "Flop in 3-bet pot",
+      "situation": "flop",
+      "position": "in_position",
+      "action_history": ["raise", "3bet", "call"],
+      "pot_size": 600,
+      "notes": "3-bet pot continuation"
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "game": {
+    "num_players": 2,
+    "starting_chips": 10000,
+    "small_blind": 50,
+    "big_blind": 100
+  },
+  "training": {
+    "num_iterations": 1000,
+    "batch_size": 128,
+    "learning_rate": 0.001,
+    "buffer_size": 100000,
+    "traversals_per_iteration": 1000,
+    "checkpoint_interval": 100
+  },
+  "network": {
+    "hidden_layers": [256, 256, 128],
+    "activation": "relu",
+    "dropout": 0.1
+  },
+  "paths": {
+    "models": "models/",
+    "data": "data/",
+    "logs": "data/logs/"
+  }
+}

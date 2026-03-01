@@ -1,0 +1,73 @@
+{
+  "version": "1.0",
+  "description": "Advanced poker spots for validation",
+  "spots": [
+    {
+      "id": "squeeze_spot",
+      "description": "Squeeze play opportunity",
+      "situation": "preflop",
+      "position": "big_blind",
+      "action_history": ["raise", "call", "call"],
+      "stack_depth": "deep",
+      "notes": "Multiple callers, opportunity to squeeze"
+    },
+    {
+      "id": "river_bluff_catch",
+      "description": "River bluff catcher decision",
+      "situation": "river",
+      "board_texture": "completed_draws",
+      "action_history": ["check", "bet"],
+      "pot_odds": 0.33,
+      "notes": "Facing river bet with marginal hand"
+    },
+    {
+      "id": "flop_check_raise",
+      "description": "Flop check-raise spot",
+      "situation": "flop",
+      "position": "out_of_position",
+      "action_history": ["check", "bet"],
+      "board_texture": "wet",
+      "notes": "Check-raise with strong range"
+    },
+    {
+      "id": "turn_probe_bet",
+      "description": "Turn probe bet after checking",
+      "situation": "turn",
+      "action_history": ["check", "check"],
+      "position": "out_of_position",
+      "notes": "Probe bet after opponent checks back flop"
+    },
+    {
+      "id": "river_thin_value",
+      "description": "River thin value bet",
+      "situation": "river",
+      "action_history": ["bet", "call", "bet", "call"],
+      "hand_strength": "medium",
+      "notes": "Thin value bet on river"
+    },
+    {
+      "id": "3bet_pot_turn",
+      "description": "Turn decision in 3-bet pot",
+      "situation": "turn",
+      "action_history": ["raise", "3bet", "call", "bet", "call"],
+      "pot_size": 1200,
+      "notes": "Turn play in 3-bet pot after flop continuation"
+    },
+    {
+      "id": "multiway_flop",
+      "description": "Multiway flop continuation",
+      "situation": "flop",
+      "num_players_in_hand": 3,
+      "position": "button",
+      "notes": "Multiway pot dynamics"
+    },
+    {
+      "id": "short_stack_push",
+      "description": "Short stack all-in decision",
+      "situation": "preflop",
+      "stack_depth": "short",
+      "big_blinds": 8,
+      "notes": "Push/fold spot with short stack"
+    }
+  ]
+}
