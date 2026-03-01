@@ -1,6 +1,6 @@
 pettingzoo[classic]==1.24.3
 torch==2.2.0
 numpy==1.26.4
-pygame==2.5.2
+pygame==2.3.0
 pytest==8.0.0
 pytest-cov==4.1.0

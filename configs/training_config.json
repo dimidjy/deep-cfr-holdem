@@ -1,9 +1,6 @@
 {
   "game": {
-    "num_players": 2,
-    "starting_chips": 10000,
-    "small_blind": 50,
-    "big_blind": 100
+    "num_players": 2
   },
   "training": {
     "num_iterations": 1000,

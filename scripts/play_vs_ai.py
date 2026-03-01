@@ -16,10 +16,9 @@ def get_human_action(legal_actions):
     action_names = {
         0: "Fold",
         1: "Check/Call",
-        2: "Raise (Small)",
-        3: "Raise (Medium)",
-        4: "Raise (Large)",
-        5: "All-In"
+        2: "Raise Half Pot",
+        3: "Raise Full Pot",
+        4: "All-In"
     }
     
     print("\nLegal actions:")

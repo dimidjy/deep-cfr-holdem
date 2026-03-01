@@ -61,7 +61,7 @@ class TestPokerValidator:
         assert PokerValidator.validate_pot_calculation(bets, expected_pot) is False
     
     def test_validate_hand_ranking_pair(self):
-        cards = [0, 13, 26, 39, 1]
+        cards = [0, 13, 1, 2, 4]
         ranking = PokerValidator.validate_hand_ranking(cards)
         assert ranking == "pair"
     

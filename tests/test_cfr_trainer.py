@@ -42,7 +42,7 @@ class TestCFRTrainer:
         
         reward = trainer.run_traversal(player_idx=0)
         
-        assert isinstance(reward, (int, float))
+        assert isinstance(reward, (int, float, np.integer, np.floating))
         assert len(deep_cfr.replay_buffer) > 0
         
         engine.close()

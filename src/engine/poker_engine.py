@@ -5,9 +5,8 @@ from typing import Dict, List, Tuple, Optional, Any
 
 class PokerEngine:
     
-    def __init__(self, num_players: int = 2, starting_chips: int = 10000):
+    def __init__(self, num_players: int = 2):
         self.num_players = num_players
-        self.starting_chips = starting_chips
         self.env = None
         self.current_agent = None
         self.agents = []
@@ -97,3 +96,76 @@ class PokerEngine:
     def get_observation_space_size(self) -> int:
         obs_space = self.env.observation_space(self.agents[0])
         return obs_space['observation'].shape[0]
+    
+    def _get_game(self):
+        try:
+            return self.env.unwrapped.env.game
+        except:
+            return None
+    
+    def _card_to_string(self, card) -> str:
+        return f"{card.rank}{card.suit}"
+    
+    def get_player_cards(self, player: str) -> List[str]:
+        if not self.env or player not in self.agents:
+            return []
+        
+        try:
+            game = self._get_game()
+            if game:
+                player_idx = self.agents.index(player)
+                return [self._card_to_string(c) for c in game.players[player_idx].hand]
+        except:
+            pass
+        
+        return []
+    
+    def get_community_cards(self) -> List[str]:
+        if not self.env:
+            return []
+        
+        try:
+            game = self._get_game()
+            if game:
+                return [self._card_to_string(c) for c in game.public_cards]
+        except:
+            pass
+        
+        return []
+    
+    def get_pot_size(self) -> int:
+        if not self.env:
+            return 0
+        
+        try:
+            game = self._get_game()
+            if game:
+                return sum(p.in_chips for p in game.players)
+        except:
+            pass
+        
+        return 0
+    
+    def get_player_chips(self, player: str) -> int:
+        if not self.env or player not in self.agents:
+            return 0
+        
+        try:
+            game = self._get_game()
+            if game:
+                player_idx = self.agents.index(player)
+                return game.players[player_idx].remained_chips
+        except:
+            pass
+        
+        return 0
+    
+    def get_stage(self) -> str:
+        try:
+            game = self._get_game()
+            if game:
+                return game.stage.name.capitalize()
+        except:
+            pass
+        
+        return "Unknown"

@@ -175,9 +175,9 @@ class DeepCFR:
             if not player_batch:
                 continue
             
-            states = torch.FloatTensor([s['state'] for s in player_batch]).to(self.device)
-            actions = torch.LongTensor([s['action'] for s in player_batch]).to(self.device)
-            regrets = torch.FloatTensor([s['regret'] for s in player_batch]).to(self.device)
+            states = torch.FloatTensor(np.array([s['state'] for s in player_batch])).to(self.device)
+            actions = torch.LongTensor(np.array([s['action'] for s in player_batch])).to(self.device)
+            regrets = torch.FloatTensor(np.array([s['regret'] for s in player_batch])).to(self.device)
             
             self.advantage_optimizers[player_idx].zero_grad()
             
@@ -201,8 +201,8 @@ class DeepCFR:
             if not player_batch:
                 continue
             
-            states = torch.FloatTensor([s['state'] for s in player_batch]).to(self.device)
-            target_strategies = torch.FloatTensor([s['strategy'] for s in player_batch]).to(self.device)
+            states = torch.FloatTensor(np.array([s['state'] for s in player_batch])).to(self.device)
+            target_strategies = torch.FloatTensor(np.array([s['strategy'] for s in player_batch])).to(self.device)
             
             self.strategy_optimizers[player_idx].zero_grad()
             
