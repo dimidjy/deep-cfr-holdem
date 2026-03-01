@@ -7,13 +7,12 @@ class PokerEngine:
     
     def __init__(self, num_players: int = 2):
         self.num_players = num_players
-        self.env = None
+        self.env = texas_holdem_no_limit_v6.env(num_players=self.num_players)
         self.current_agent = None
         self.agents = []
         self.reset()
     
     def reset(self) -> Dict[str, Any]:
-        self.env = texas_holdem_no_limit_v6.env(num_players=self.num_players)
         self.env.reset()
         self.agents = self.env.agents.copy()
         self.current_agent = self.env.agent_selection
@@ -22,12 +21,16 @@ class PokerEngine:
         
         return {
             'observation': observation,
-            'legal_actions': self._get_legal_actions(),
+            'legal_actions': self.get_legal_actions(),
             'current_player': self.current_agent,
             'info': info
         }
     
     def step(self, action: int) -> Dict[str, Any]:
+        legal_actions = self.get_legal_actions()
+        if legal_actions and action not in legal_actions:
+            raise ValueError(f"Illegal action {action}. Legal actions: {legal_actions}")
+        
         self.env.step(action)
         
         observation, reward, termination, truncation, info = self.env.last()
@@ -41,12 +44,12 @@ class PokerEngine:
             'done': done,
             'termination': termination,
             'truncation': truncation,
-            'legal_actions': self._get_legal_actions() if not done else [],
+            'legal_actions': self.get_legal_actions() if not done else [],
             'current_player': self.current_agent,
             'info': info
         }
     
-    def _get_legal_actions(self) -> List[int]:
+    def get_legal_actions(self) -> List[int]:
         if self.env.terminations[self.current_agent] or self.env.truncations[self.current_agent]:
             return []
         
@@ -57,6 +60,9 @@ class PokerEngine:
             return [i for i, legal in enumerate(action_mask) if legal]
         
         return list(range(self.env.action_space(self.current_agent).n))
+    
+    def _get_legal_actions(self) -> List[int]:
+        return self.get_legal_actions()
     
     def get_observation(self) -> np.ndarray:
         observation, _, _, _, _ = self.env.last()
@@ -71,7 +77,7 @@ class PokerEngine:
             'termination': termination,
             'truncation': truncation,
             'current_player': self.current_agent,
-            'legal_actions': self._get_legal_actions(),
+            'legal_actions': self.get_legal_actions(),
             'info': info,
             'agents': self.agents
         }

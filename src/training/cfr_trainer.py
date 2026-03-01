@@ -32,7 +32,7 @@ class CFRTrainer:
             agent_idx = self.engine.agents.index(current_agent)
             
             observation = self.engine.get_observation()
-            legal_actions = self.engine._get_legal_actions()
+            legal_actions = self.engine.get_legal_actions()
             
             if not legal_actions:
                 break
@@ -145,7 +145,7 @@ class CFRTrainer:
                 agent_idx = self.engine.agents.index(current_agent)
                 
                 observation = self.engine.get_observation()
-                legal_actions = self.engine._get_legal_actions()
+                legal_actions = self.engine.get_legal_actions()
                 
                 if not legal_actions:
                     break

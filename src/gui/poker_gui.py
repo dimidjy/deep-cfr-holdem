@@ -35,10 +35,14 @@ class PokerGUI:
     BUTTON_HOVER_COLOR = (100, 160, 210)
     HIGHLIGHT_COLOR = (255, 215, 0)
     
-    def __init__(self, num_players: int = 2):
+    def __init__(self, num_players: int = 2, ai_model=None):
         pygame.init()
         self.screen = pygame.display.set_mode((self.WINDOW_WIDTH, self.WINDOW_HEIGHT))
-        pygame.display.set_caption("Poker Training Engine")
+        
+        if ai_model:
+            pygame.display.set_caption("Poker vs Trained AI")
+        else:
+            pygame.display.set_caption("Poker Training Engine")
         
         self.font_large = pygame.font.Font(None, 48)
         self.font_medium = pygame.font.Font(None, 36)
@@ -61,6 +65,10 @@ class PokerGUI:
         self.wins = 0
         self.losses = 0
         self.result_counted = False
+        
+        self.ai_model = ai_model
+        self.ai_name = "Trained AI" if ai_model else "AI (Random)"
+        self.show_opponent_cards = False
         
     def reset_game(self):
         self.state = self.engine.reset()
@@ -128,7 +136,7 @@ class PokerGUI:
             is_current = agent == self.state['current_player']
             color = self.HIGHLIGHT_COLOR if is_current else self.TEXT_COLOR
             
-            player_name = "You" if agent == self.human_player else "AI (Random)"
+            player_name = "You" if agent == self.human_player else self.ai_name
             chips = self.engine.get_player_chips(agent)
             
             player_text = self.font_medium.render(f"{player_name}", True, color)
@@ -156,7 +164,7 @@ class PokerGUI:
                     x = start_x + card_idx * (card_width + card_spacing)
                     y = pos_y + y_offset
                     
-                    if agent == self.human_player:
+                    if agent == self.human_player or self.show_opponent_cards:
                         self.draw_card(x, y, card_str, card_width, card_height)
                     else:
                         self.draw_card(x, y, "", card_width, card_height, face_down=True)
@@ -388,7 +396,23 @@ class PokerGUI:
         
         if not self.engine.is_done() and self.state and self.state['current_player'] != self.human_player:
             if self.state['legal_actions']:
-                ai_action = np.random.choice(self.state['legal_actions'])
+                if self.ai_model:
+                    current_agent = self.state['current_player']
+                    agent_idx = self.engine.agents.index(current_agent)
+                    observation = self.engine.get_observation()
+                    legal_actions = self.state['legal_actions']
+                    
+                    strategy = self.ai_model.get_strategy(observation, agent_idx, legal_actions)
+                    legal_strategy = strategy[legal_actions]
+                    legal_strategy_sum = legal_strategy.sum()
+                    
+                    if legal_strategy_sum > 0:
+                        ai_action = np.random.choice(legal_actions, p=legal_strategy / legal_strategy_sum)
+                    else:
+                        ai_action = np.random.choice(legal_actions)
+                else:
+                    ai_action = np.random.choice(self.state['legal_actions'])
+                
                 action_name = self.get_action_name(ai_action)
                 
                 pygame.time.delay(500)
@@ -413,6 +437,9 @@ class PokerGUI:
                 elif event.key == pygame.K_SPACE:
                     if self.state and self.state['legal_actions']:
                         self.selected_action = np.random.choice(self.state['legal_actions'])
+                elif event.key == pygame.K_v:
+                    self.show_opponent_cards = not self.show_opponent_cards
+                    print(f"Show opponent cards: {self.show_opponent_cards}")
             
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1:
@@ -430,9 +457,15 @@ class PokerGUI:
         self.draw_action_history()
         self.draw_game_info()
         
-        help_text = self.font_small.render("R: Next Hand | SPACE: Random Action | Q: Quit", 
+        help_text = self.font_small.render("R: Next Hand | SPACE: Random | V: Show/Hide Cards | Q: Quit", 
                                           True, self.TEXT_COLOR)
         self.screen.blit(help_text, (10, self.WINDOW_HEIGHT - 30))
+        
+        if self.show_opponent_cards:
+            reveal_text = pygame.font.Font(None, 18).render(
+                "👁 Opponent cards visible (Press V to hide)", 
+                True, (255, 215, 0))
+            self.screen.blit(reveal_text, (10, self.WINDOW_HEIGHT - 55))
         
         pygame.display.flip()
     
