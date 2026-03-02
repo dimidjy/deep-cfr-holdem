@@ -42,3 +42,4 @@ data/cache/
 .vscode/
 *.swp
 *.swo
+models/*
