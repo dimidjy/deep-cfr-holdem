@@ -14,11 +14,12 @@ class ModelAdapter:
         
         # Calculate observation sizes
         # Base: 52 (cards) + 2 (chips/pot) = 54
-        # Position features: trained_players (one-hot) + 2 (relative pos, is button)
+        # Position features: N (one-hot) + 2 (relative pos, is button)
         # Pot odds: 3
-        # Hand strength: 2
-        self.trained_obs_size = 54 + trained_players + 2 + 3 + 2
-        self.target_obs_size = 54 + target_players + 2 + 3 + 2
+        # Hand strength: 5 (is_pair, is_suited, high_rank, low_rank, rank_gap)
+        # Stack features: 2 (m_ratio, relative_stack)
+        self.trained_obs_size = 54 + trained_players + 2 + 3 + 5 + 2
+        self.target_obs_size = 54 + target_players + 2 + 3 + 5 + 2
         
     def adapt_observation(self, obs: np.ndarray) -> np.ndarray:
         """Convert observation from target player count to trained player count"""
@@ -49,17 +50,21 @@ class ModelAdapter:
         # Pot odds features (same for any player count)
         pot_start = pos_end + 2
         pot_features = obs[pot_start:pot_start + 3]
-        
-        # Hand strength features (same for any player count)
-        hand_features = obs[pot_start + 3:pot_start + 5]
-        
+
+        # Hand strength features (5 dims: is_pair, is_suited, high_rank, low_rank, rank_gap)
+        hand_features = obs[pot_start + 3:pot_start + 8]
+
+        # Stack features (2 dims: m_ratio, relative_stack)
+        stack_features = obs[pot_start + 8:pot_start + 10]
+
         # Combine into adapted observation
         adapted_obs = np.concatenate([
             base_obs,
             trained_position,
             [rel_pos, is_button],
             pot_features,
-            hand_features
+            hand_features,
+            stack_features
         ])
         
         return adapted_obs

@@ -4,15 +4,18 @@
   },
   "training": {
     "num_iterations": 2000,
-    "batch_size": 256,
+    "batch_size": 512,
     "learning_rate": 0.001,
-    "buffer_size": 100000,
-    "traversals_per_iteration": 1000,
-    "checkpoint_interval": 50
+    "buffer_size": 1000000,
+    "traversals_per_iteration": 4000,
+    "checkpoint_interval": 50,
+    "train_passes": 30,
+    "gradient_clip": 1.0,
+    "lr_scheduler_t_max": 2000
   },
   "network": {
-    "hidden_layers": [256, 256, 128],
-    "activation": "relu",
+    "hidden_layers": [512, 512, 256],
+    "activation": "leaky_relu",
     "dropout": 0.1
   },
   "paths": {
