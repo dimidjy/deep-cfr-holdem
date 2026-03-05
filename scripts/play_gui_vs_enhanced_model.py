@@ -27,7 +27,8 @@ def load_model(model_path: str, num_players: int = 2):
                     num_players=test_players,
                     add_position_features=True,
                     add_pot_odds_features=True,
-                    add_hand_strength_features=True
+                    add_hand_strength_features=True,
+                    add_stack_features=True,
                 )
                 if test_engine.get_observation_space_size() == model_input_size:
                     num_players = test_players
@@ -40,7 +41,8 @@ def load_model(model_path: str, num_players: int = 2):
         num_players=num_players,
         add_position_features=True,
         add_pot_odds_features=True,
-        add_hand_strength_features=True
+        add_hand_strength_features=True,
+        add_stack_features=True,
     )
     observation_size = engine.get_observation_space_size()
     action_size = engine.get_action_space_size()
@@ -175,7 +177,8 @@ def main():
         num_players=gui_players,
         add_position_features=True,
         add_pot_odds_features=True,
-        add_hand_strength_features=True
+        add_hand_strength_features=True,
+        add_stack_features=True,
     )
     gui.engine.reset()
     

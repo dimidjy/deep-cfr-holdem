@@ -21,22 +21,48 @@ import multiprocessing as mp
 from multiprocessing import Pool
 from pathlib import Path
 
+import copy
+
 import numpy as np
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.dirname(__file__))  # so validate_spots is importable
 
 from src.engine import EnhancedPokerEngine
 from src.training import DeepCFR
 from src.utils import load_config
+from validate_spots import run_validation, validation_summary_line
 
 
-def _worker_init():
-    """Suppress noisy third-party warnings in every subprocess."""
+# Shared-memory CPU networks — set once per worker via initializer,
+# then updated in-place by the main process before each iteration.
+_SHARED_ADV_NETS   = None
+_SHARED_STRAT_NETS = None
+
+
+def _worker_init(shared_adv, shared_strat):
+    """Store shared model references and suppress noisy warnings."""
+    global _SHARED_ADV_NETS, _SHARED_STRAT_NETS
+    _SHARED_ADV_NETS   = shared_adv
+    _SHARED_STRAT_NETS = shared_strat
     warnings.filterwarnings('ignore')
     logging.disable(logging.WARNING)
-    # Keep gymnasium quiet
     os.environ['GYMNASIUM_DISABLE_LOGGING'] = '1'
+
+
+def _regret_match_np(adv, legal, epsilon=0.05):
+    """Regret-matching strategy from advantage values, with epsilon-uniform mix."""
+    strategy = np.zeros(len(adv), dtype=np.float32)
+    pos = np.maximum(adv[legal], 0.0)
+    s = pos.sum()
+    if s > 0:
+        strategy[legal] = pos / s
+    else:
+        strategy[legal] = 1.0 / len(legal)
+    # Mix with uniform to ensure all actions (including fold) get sampled
+    strategy[legal] = (1.0 - epsilon) * strategy[legal] + epsilon / len(legal)
+    return strategy
 
 
 # ---------------------------------------------------------------------------
@@ -45,9 +71,12 @@ def _worker_init():
 
 def _traversal_worker(args):
     """
-    Pure game simulator. Uses EnhancedPokerEngine with uniform random actions.
-    All inference / regret computation happens in the main (GPU) process.
+    Game simulator. The traversed player samples actions from the current
+    regret-matching strategy (advantage nets). Opponents sample from the
+    current strategy network — proper self-play MCCFR, not random.
+    All regret computation still happens in the main (GPU) process.
     """
+    global _SHARED_ADV_NETS, _SHARED_STRAT_NETS
     player_idx, seed, num_players = args
     np.random.seed(seed)
 
@@ -71,7 +100,28 @@ def _traversal_worker(args):
         if not legal:
             break
 
-        action = int(np.random.choice(legal))
+        if agent_idx == player_idx and _SHARED_ADV_NETS is not None:
+            # Traversed player: sample from current regret-matching strategy
+            with torch.no_grad():
+                obs_t = torch.from_numpy(obs.astype(np.float32)).unsqueeze(0)
+                adv_np = _SHARED_ADV_NETS[agent_idx](obs_t).numpy()[0]
+            strategy = _regret_match_np(adv_np, legal)
+            legal_probs = strategy[legal]
+            legal_probs = legal_probs / legal_probs.sum()
+            action = int(np.random.choice(legal, p=legal_probs))
+        else:
+            # Opponent: use current strategy network (self-play MCCFR)
+            if _SHARED_STRAT_NETS is not None:
+                with torch.no_grad():
+                    obs_t = torch.from_numpy(obs.astype(np.float32)).unsqueeze(0)
+                    strat = _SHARED_STRAT_NETS[agent_idx](obs_t).numpy()[0]
+                legal_probs = np.maximum(strat[legal], 0.0)
+                s = legal_probs.sum()
+                legal_probs = legal_probs / s if s > 0 else np.ones(len(legal)) / len(legal)
+                action = int(np.random.choice(legal, p=legal_probs))
+            else:
+                action = int(np.random.choice(legal))
+
         episode_data.append({
             'player': agent_idx,
             'obs': obs.copy(),
@@ -90,6 +140,12 @@ def _traversal_worker(args):
 # ---------------------------------------------------------------------------
 # Batched GPU regret computation
 # ---------------------------------------------------------------------------
+
+# Normalise terminal rewards so the advantage network always sees values in
+# roughly the same ±1 range regardless of num_players or stack size.
+# PettingZoo texas_holdem_no_limit_v6 starts each player with 100 chips.
+_REWARD_SCALE = 100.0
+
 
 def _compute_regrets_gpu(episodes, deep_cfr, iteration):
     """
@@ -129,6 +185,7 @@ def _compute_regrets_gpu(episodes, deep_cfr, iteration):
     # Compute per-action regrets and push to replay buffer
     for entry_idx, (ep_idx, _, player_idx, obs, action, legal) in enumerate(entries):
         _, final_reward, _ = episodes[ep_idx]
+        final_reward = final_reward / _REWARD_SCALE  # normalise to ±1 range
         adv = all_advantages[entry_idx]
 
         mask = np.zeros(deep_cfr.action_size, dtype=np.float32)
@@ -212,6 +269,21 @@ def main():
         start_iter = deep_cfr.iteration
         print(f'Resumed from checkpoint — iteration {start_iter}')
 
+    # Shared-memory CPU copies of advantage + strategy networks.
+    # Workers read from these; main process writes updated weights each iteration.
+    # share_memory() maps tensors to OS shared memory — zero-copy across processes.
+    shared_adv_nets = []
+    for net in deep_cfr.advantage_networks:
+        cpu_net = copy.deepcopy(net).cpu().eval()
+        cpu_net.share_memory()
+        shared_adv_nets.append(cpu_net)
+
+    shared_strat_nets = []
+    for net in deep_cfr.strategy_networks:
+        cpu_net = copy.deepcopy(net).cpu().eval()
+        cpu_net.share_memory()
+        shared_strat_nets.append(cpu_net)
+
     num_iterations = config['training']['num_iterations']
     traversals    = config['training']['traversals_per_iteration']
     batch_size    = config['training'].get('batch_size', 256)
@@ -226,13 +298,26 @@ def main():
     # Create Pool ONCE — avoid re-spawning 30 processes every iteration.
     # With 'spawn' + torch, each process takes ~3s to start, so per-iter
     # Pool creation would add 3s × num_workers of overhead each iteration.
-    pool = Pool(processes=num_workers, initializer=_worker_init)
+    pool = Pool(processes=num_workers, initializer=_worker_init,
+                initargs=(shared_adv_nets, shared_strat_nets))
     print('Workers ready.\n')
 
     try:
         for iteration in range(start_iter, num_iterations):
             iter_num = iteration + 1
             t0 = time.time()
+
+            # Push latest trained weights into shared memory so workers use them.
+            # load_state_dict does an in-place copy → shared memory is updated
+            # before pool.map dispatches any tasks (no concurrent read/write).
+            for gpu_net, cpu_net in zip(deep_cfr.advantage_networks, shared_adv_nets):
+                cpu_net.load_state_dict(
+                    {k: v.cpu() for k, v in gpu_net.state_dict().items()}
+                )
+            for gpu_net, cpu_net in zip(deep_cfr.strategy_networks, shared_strat_nets):
+                cpu_net.load_state_dict(
+                    {k: v.cpu() for k, v in gpu_net.state_dict().items()}
+                )
 
             # --- Build work items ---
             work = []
@@ -282,6 +367,12 @@ def main():
                         'config': config['training']}
                 with open(ckpt.replace('.pt', '_metadata.json'), 'w') as f:
                     json.dump(meta, f, indent=2)
+
+                # Spot validation — runs ~500 games to get enough postflop samples
+                val_results = run_validation(
+                    deep_cfr, engine, num_games=500, verbose=False
+                )
+                print(f'  {validation_summary_line(val_results)}')
     finally:
         pool.terminate()
         pool.join()
