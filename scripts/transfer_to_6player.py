@@ -15,11 +15,12 @@ And run Phase 2:
 
 How it works
 ------------
-Obs layout: [base(54) | pos_one_hot(N) | rel_pos(1) | is_btn(1) | pot_odds(3) | hand(5) | stack(2)]
-  2-player: 54 + 2 + 1 + 1 + 3 + 5 + 2 = 68 dims
-  6-player: 54 + 6 + 1 + 1 + 3 + 5 + 2 = 72 dims
+Obs layout (feature-only, no raw card encoding):
+  [pos_one_hot(N) | rel_pos(1) | is_btn(1) | pot_odds(3) | hand(5) | stack(2) | equity(4) | street(4) | game_state(3)]
+  2-player: 2 + 1 + 1 + 3 + 5 + 2 + 4 + 4 + 3 = 25 dims
+  6-player: 6 + 1 + 1 + 3 + 5 + 2 + 4 + 4 + 3 = 29 dims
 
-The 4 extra dims (positions 56-59 in 6-player obs) are the extra 4 position one-hot entries.
+The 4 extra dims are the extra position one-hot entries at indices 2-5 in 6-player obs.
 All other weights (hidden layers, output layer) are identical shapes and copied directly.
 The input layer weight matrix is padded with zeros for the 4 new position columns.
 
@@ -41,9 +42,9 @@ from src.engine import EnhancedPokerEngine
 from src.utils import load_config
 
 # Number of obs dims where the 4 extra 6-player position one-hot dims are inserted
-# 2-player obs: [0:54 base | 54:56 pos_oh | 56 rel_pos | 57 is_btn | 58:68 rest]
-# 6-player obs: [0:54 base | 54:60 pos_oh | 60 rel_pos | 61 is_btn | 62:72 rest]
-OBS_SPLIT = 56        # cols 0..55 are shared (base + first 2 pos dims)
+# 2-player obs: [0:2 pos_oh | 2 rel_pos | 3 is_btn | 4:25 rest]
+# 6-player obs: [0:6 pos_oh | 6 rel_pos | 7 is_btn | 8:29 rest]
+OBS_SPLIT = 2         # first 2 cols are shared (pos_oh[0], pos_oh[1])
 EXTRA_COLS = 4        # 4 extra one-hot dims for 6-player positions 2-5
 SRC_PLAYERS = 2
 DST_PLAYERS = 6
@@ -92,6 +93,9 @@ def main():
             add_pot_odds_features=True,
             add_hand_strength_features=True,
             add_stack_features=True,
+            add_equity_features=True,
+            add_street_features=True,
+            add_game_state_features=True,
         )
         return e.get_observation_space_size(), e.get_action_space_size()
 

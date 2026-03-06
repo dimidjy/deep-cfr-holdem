@@ -1,17 +1,17 @@
 {
   "game": {
-    "num_players": 6
+    "num_players": 2
   },
   "training": {
-    "num_iterations": 1000,
+    "num_iterations": 700,
     "batch_size": 512,
     "learning_rate": 0.001,
     "buffer_size": 1000000,
-    "traversals_per_iteration": 4000,
+    "traversals_per_iteration": 6000,
     "checkpoint_interval": 50,
-    "train_passes": 30,
+    "train_passes": 15,
     "gradient_clip": 1.0,
-    "lr_scheduler_t_max": 2000
+    "lr_scheduler_t_max": 3000
   },
   "network": {
     "hidden_layers": [512, 512, 256],

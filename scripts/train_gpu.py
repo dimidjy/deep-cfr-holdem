@@ -22,6 +22,7 @@ from multiprocessing import Pool
 from pathlib import Path
 
 import copy
+from collections import deque
 
 import numpy as np
 import torch
@@ -39,13 +40,19 @@ from validate_spots import run_validation, validation_summary_line
 # then updated in-place by the main process before each iteration.
 _SHARED_ADV_NETS   = None
 _SHARED_STRAT_NETS = None
+# Opponent pool — list of frozen strategy-network lists (one per checkpoint).
+# Each game randomly picks one model from the pool for all opponent decisions.
+# Best response to a diverse pool converges toward Nash equilibrium much faster
+# than best response to a single fixed opponent.
+_FROZEN_STRAT_POOL = None   # list[ list[nn.Module] ]  (pool × players)
 
 
-def _worker_init(shared_adv, shared_strat):
+def _worker_init(shared_adv, shared_strat, frozen_pool):
     """Store shared model references and suppress noisy warnings."""
-    global _SHARED_ADV_NETS, _SHARED_STRAT_NETS
-    _SHARED_ADV_NETS   = shared_adv
-    _SHARED_STRAT_NETS = shared_strat
+    global _SHARED_ADV_NETS, _SHARED_STRAT_NETS, _FROZEN_STRAT_POOL
+    _SHARED_ADV_NETS    = shared_adv
+    _SHARED_STRAT_NETS  = shared_strat
+    _FROZEN_STRAT_POOL  = frozen_pool   # None  or  list of 6-net lists
     warnings.filterwarnings('ignore')
     logging.disable(logging.WARNING)
     os.environ['GYMNASIUM_DISABLE_LOGGING'] = '1'
@@ -76,7 +83,7 @@ def _traversal_worker(args):
     current strategy network — proper self-play MCCFR, not random.
     All regret computation still happens in the main (GPU) process.
     """
-    global _SHARED_ADV_NETS, _SHARED_STRAT_NETS
+    global _SHARED_ADV_NETS, _SHARED_STRAT_NETS, _FROZEN_STRAT_POOL
     player_idx, seed, num_players = args
     np.random.seed(seed)
 
@@ -87,8 +94,19 @@ def _traversal_worker(args):
         add_pot_odds_features=True,
         add_hand_strength_features=True,
         add_stack_features=True,
+        add_equity_features=True,
+        add_street_features=True,
+        add_game_state_features=True,
     )
     engine.reset()
+
+    # Pick one opponent model for the whole game (consistent within each hand).
+    # Randomly sampling from the pool each game means the traversed player must
+    # be good against ALL pool members, pushing strategy toward Nash equilibrium.
+    if _FROZEN_STRAT_POOL is not None:
+        opp_nets = _FROZEN_STRAT_POOL[np.random.randint(len(_FROZEN_STRAT_POOL))]
+    else:
+        opp_nets = _SHARED_STRAT_NETS
 
     episode_data = []
     while not engine.is_done():
@@ -110,11 +128,11 @@ def _traversal_worker(args):
             legal_probs = legal_probs / legal_probs.sum()
             action = int(np.random.choice(legal, p=legal_probs))
         else:
-            # Opponent: use current strategy network (self-play MCCFR)
-            if _SHARED_STRAT_NETS is not None:
+            # Opponent: use the game's selected pool model (or self-play nets).
+            if opp_nets is not None:
                 with torch.no_grad():
                     obs_t = torch.from_numpy(obs.astype(np.float32)).unsqueeze(0)
-                    strat = _SHARED_STRAT_NETS[agent_idx](obs_t).numpy()[0]
+                    strat = opp_nets[agent_idx](obs_t).numpy()[0]
                 legal_probs = np.maximum(strat[legal], 0.0)
                 s = legal_probs.sum()
                 legal_probs = legal_probs / s if s > 0 else np.ones(len(legal)) / len(legal)
@@ -192,14 +210,43 @@ def _compute_regrets_gpu(episodes, deep_cfr, iteration):
         mask[legal] = 1.0
         adv = adv * mask
 
+        # Step 1: initial strategy for EV estimation (regret-matching on raw adv).
+        # Strategy is ratio-based so it is scale-invariant.
         pos = np.maximum(adv, 0.0) * mask
         pos_sum = pos.sum()
-        strategy = pos / pos_sum if pos_sum > 0 else mask / mask.sum()
+        strategy_init = pos / pos_sum if pos_sum > 0 else mask / mask.sum()
 
-        ev = float(np.sum(strategy[legal] * adv[legal]))
+        # Step 2: Normalize adv to [-1, 1] so that ev is on the same scale as
+        # final_reward (which is already divided by _REWARD_SCALE).
+        # Without this, ev grows with the network's output magnitude (seen as
+        # adv loss explosion) while final_reward stays in [-1,+1], making
+        # regret(sampled) = final_reward - ev consistently large-negative.
+        # Normalization only scales down (adv_scale >= 1), never amplifies noise.
+        legal_adv = adv[legal]
+        adv_scale = max(float(np.abs(legal_adv).max()), 1.0)
+        adv_normed = adv / adv_scale
 
+        ev = float(np.sum(strategy_init[legal] * adv_normed[legal]))
+
+        # Step 3: relative advantages — centers on EV so "less bad" actions
+        # get positive regret even when all absolute values are negative.
+        # Use adv_normed so rel_adv is in the same [-1,1] scale as final_reward.
+        rel_adv = adv_normed - ev
+        rel_adv = rel_adv * mask
+
+        # Step 4: proper strategy from relative advantages (stored in buffer
+        # and used to train the strategy network). Scale-invariant.
+        pos2 = np.maximum(rel_adv, 0.0) * mask
+        pos2_sum = pos2.sum()
+        strategy = pos2 / pos2_sum if pos2_sum > 0 else mask / mask.sum()
+
+        # Step 5: regrets — both now in the same [-1,+1] scale.
+        # Sampled action: grounded in actual terminal reward.
+        # Unsampled actions: bootstrapped from normalized relative advantages.
+        _REGRET_CLIP = 2.0
         for a in legal:
-            regret = (final_reward - ev) if a == action else (float(adv[a]) - ev)
+            regret = (final_reward - ev) if a == action else float(rel_adv[a])
+            regret = float(np.clip(regret, -_REGRET_CLIP, _REGRET_CLIP))
             deep_cfr.replay_buffer.add(obs, a, regret, strategy,
                                        player_idx, iteration=iteration)
 
@@ -218,6 +265,11 @@ def main():
                         help='CPU worker count (default: cpu_count - 1)')
     parser.add_argument('--device', type=str, default=None,
                         help='cuda | cpu  (auto-detected if omitted)')
+    parser.add_argument('--frozen-opponents', type=str, nargs='+', default=None,
+                        help='One or more checkpoints used as frozen opponents '
+                             '(e.g. models/6player_transferred.pt models/checkpoint_iter_100.pt). '
+                             'Each game randomly picks one model from the pool, '
+                             'preventing bad self-play equilibria in 6-player training.')
     args = parser.parse_args()
 
     config_path = Path(__file__).parent.parent / 'configs/training_config.json'
@@ -245,6 +297,9 @@ def main():
         add_pot_odds_features=True,
         add_hand_strength_features=True,
         add_stack_features=True,
+        add_equity_features=True,
+        add_street_features=True,
+        add_game_state_features=True,
     )
     obs_size = engine.get_observation_space_size()
     act_size = engine.get_action_space_size()
@@ -284,6 +339,27 @@ def main():
         cpu_net.share_memory()
         shared_strat_nets.append(cpu_net)
 
+    # Load frozen opponent pool if requested.
+    # Each entry in the pool is a list of num_players strategy networks from one checkpoint.
+    # Workers randomly pick one pool member per game → best response to a diverse
+    # mixture of strategies converges toward Nash equilibrium (fictitious play).
+    frozen_strat_pool = None
+    if args.frozen_opponents:
+        frozen_strat_pool = []
+        for ckpt_path in args.frozen_opponents:
+            print(f'Loading frozen opponent checkpoint: {ckpt_path}')
+            frozen_ckpt = torch.load(ckpt_path, map_location='cpu')
+            src_nets = frozen_ckpt['strategy_networks']
+            pool_nets = []
+            for i in range(num_players):
+                net = copy.deepcopy(deep_cfr.strategy_networks[i]).cpu()
+                net.load_state_dict(src_nets[i % len(src_nets)])
+                net.eval()
+                net.share_memory()
+                pool_nets.append(net)
+            frozen_strat_pool.append(pool_nets)
+        print(f'  Frozen pool: {len(frozen_strat_pool)} checkpoint(s), {num_players} networks each.')
+
     num_iterations = config['training']['num_iterations']
     traversals    = config['training']['traversals_per_iteration']
     batch_size    = config['training'].get('batch_size', 256)
@@ -299,8 +375,30 @@ def main():
     # With 'spawn' + torch, each process takes ~3s to start, so per-iter
     # Pool creation would add 3s × num_workers of overhead each iteration.
     pool = Pool(processes=num_workers, initializer=_worker_init,
-                initargs=(shared_adv_nets, shared_strat_nets))
+                initargs=(shared_adv_nets, shared_strat_nets, frozen_strat_pool))
     print('Workers ready.\n')
+
+    # Rolling history for trend indicators (last 10 iters)
+    _adv_hist   = deque(maxlen=10)
+    _strat_hist = deque(maxlen=10)
+    _last_trash_fold  = None   # updated at each checkpoint validation
+    _last_72o_fold    = None
+
+    def _trend(val, hist):
+        """Return arrow showing whether val is trending up/down vs recent avg."""
+        if len(hist) < 3:
+            return ' '
+        avg = sum(hist) / len(hist)
+        if avg == 0:
+            return ' '
+        ratio = val / avg
+        if ratio > 1.20:
+            return '↑!'
+        if ratio > 1.05:
+            return '↑ '
+        if ratio < 0.95:
+            return '↓ '
+        return '→ '
 
     try:
         for iteration in range(start_iter, num_iterations):
@@ -348,13 +446,25 @@ def main():
             adv   = np.mean(adv_losses)   if adv_losses   else 0.0
             strat = np.mean(strat_losses) if strat_losses else 0.0
             total = time.time() - t0
+
+            adv_arrow   = _trend(adv,   _adv_hist)
+            strat_arrow = _trend(strat, _strat_hist)
+            _adv_hist.append(adv)
+            _strat_hist.append(strat)
+
+            fold_str = ''
+            if _last_trash_fold is not None:
+                fold_str = f'  trash={_last_trash_fold:.0%}'
+            if _last_72o_fold is not None:
+                fold_str += f'  72o={_last_72o_fold:.0%}'
+
             print(
                 f'Iter {iter_num:4d}/{num_iterations}'
                 f'  buf={len(deep_cfr.replay_buffer):>7d}'
-                f'  adv={adv:.4f}'
-                f'  strat={strat:.4f}'
+                f'  adv={adv:.4f}{adv_arrow}'
+                f'  strat={strat:.4f}{strat_arrow}'
+                f'{fold_str}'
                 f'  trav={t_trav:.1f}s'
-                f'  regret={t_regret:.1f}s'
                 f'  train={t_train:.1f}s'
                 f'  total={total:.1f}s'
             )
@@ -372,6 +482,8 @@ def main():
                 val_results = run_validation(
                     deep_cfr, engine, num_games=500, verbose=False
                 )
+                _last_trash_fold = val_results.get('trash_offsuit', {}).get('fold_pct')
+                _last_72o_fold   = val_results.get('72o',           {}).get('fold_pct')
                 print(f'  {validation_summary_line(val_results)}')
     finally:
         pool.terminate()

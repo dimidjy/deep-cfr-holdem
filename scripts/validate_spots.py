@@ -416,7 +416,8 @@ def validation_summary_line(results: dict) -> str:
                 tag += '?'
             parts.append(
                 f"{cat}:fold={r['fold_pct']:.0%}"
-                f",aggr={r['aggr_pct']:.0%}({tag})"
+                f",call={r['call_pct']:.0%}"
+                f",raise={r['aggr_pct']:.0%}({tag})"
             )
     s = results.get('_summary', {})
     return f"[spots {s.get('passed',0)}/{s.get('total',0)}] " + '  '.join(parts)
@@ -453,6 +454,9 @@ def main():
                 add_pot_odds_features=True,
                 add_hand_strength_features=True,
                 add_stack_features=True,
+                add_equity_features=True,
+                add_street_features=True,
+                add_game_state_features=True,
             )
             if test_eng.get_observation_space_size() == input_size:
                 num_players = p
@@ -467,6 +471,9 @@ def main():
         add_pot_odds_features=True,
         add_hand_strength_features=True,
         add_stack_features=True,
+        add_equity_features=True,
+        add_street_features=True,
+        add_game_state_features=True,
     )
 
     config_path = Path(__file__).parent.parent / 'configs/training_config.json'
