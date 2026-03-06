@@ -50,26 +50,68 @@ SRC_PLAYERS = 2
 DST_PLAYERS = 6
 
 
-def _pad_input_weight(w2: torch.Tensor, src_obs: int, dst_obs: int) -> torch.Tensor:
+def _pad_input_weight(w2: torch.Tensor, src_obs: int, dst_obs: int,
+                      src_players: int, dst_players: int) -> torch.Tensor:
     """
     Expand input weight matrix from [hidden, src_obs] to [hidden, dst_obs].
-    The 4 new columns are inserted at position OBS_SPLIT (zero-initialised).
+
+    Feature layout (in order):
+      pos_oh(N), rel_pos(1), is_btn(1), pot_odds(3), hand(5), stack(2),
+      [equity(4) — optional], street(4), game_state(3)
+
+    Without equity: obs = N + 19
+    With    equity: obs = N + 23
+
+    Handles two possible gaps:
+      1. Extra pos_oh columns (dst_players - src_players), always 4.
+      2. Equity columns (4) present in dst but absent in src (or vice versa).
     """
     assert w2.shape[1] == src_obs, f"Expected src weight cols={src_obs}, got {w2.shape[1]}"
     hidden = w2.shape[0]
     w6 = torch.zeros(hidden, dst_obs, dtype=w2.dtype)
-    w6[:, :OBS_SPLIT]       = w2[:, :OBS_SPLIT]          # base obs + pos_oh[0,1]
-    # w6[:, OBS_SPLIT:OBS_SPLIT+EXTRA_COLS] = 0           # pos_oh[2,3,4,5] — already zero
-    w6[:, OBS_SPLIT + EXTRA_COLS:] = w2[:, OBS_SPLIT:]   # rel_pos, is_btn, pot_odds, hand, stack
+
+    src_has_equity = (src_obs - src_players) == 23
+    dst_has_equity = (dst_obs - dst_players) == 23
+
+    sc, dc = 0, 0  # src/dst column cursors
+
+    # pos_oh: copy first src_players cols, remaining dst_players-src_players stay zero
+    w6[:, dc:dc + src_players] = w2[:, sc:sc + src_players]
+    sc += src_players
+    dc += dst_players
+
+    # rel_pos(1) + is_btn(1) + pot_odds(3) + hand(5) + stack(2) = 12 cols — identical
+    w6[:, dc:dc + 12] = w2[:, sc:sc + 12]
+    sc += 12
+    dc += 12
+
+    # equity (4 cols) — may be absent in source
+    if src_has_equity and dst_has_equity:
+        w6[:, dc:dc + 4] = w2[:, sc:sc + 4]
+        sc += 4
+        dc += 4
+    elif dst_has_equity:
+        dc += 4          # insert zeros in dst; src has no equity cols
+    elif src_has_equity:
+        sc += 4          # skip equity in src; dst doesn't use it
+
+    # street(4) + game_state(3) = 7 cols — identical
+    w6[:, dc:dc + 7] = w2[:, sc:sc + 7]
+    sc += 7
+    dc += 7
+
+    assert sc == src_obs, f"Column mapping error: consumed {sc} src cols, expected {src_obs}"
+    assert dc == dst_obs, f"Column mapping error: filled {dc} dst cols, expected {dst_obs}"
     return w6
 
 
-def _transfer_state_dict(src_sd: dict, src_obs: int, dst_obs: int) -> dict:
+def _transfer_state_dict(src_sd: dict, src_obs: int, dst_obs: int,
+                         src_players: int, dst_players: int) -> dict:
     """Return a new state dict with the input layer weight padded for 6-player."""
     dst_sd = {}
     for k, v in src_sd.items():
         if k == 'network.0.weight':
-            dst_sd[k] = _pad_input_weight(v, src_obs, dst_obs)
+            dst_sd[k] = _pad_input_weight(v, src_obs, dst_obs, src_players, dst_players)
         else:
             dst_sd[k] = v.clone()
     return dst_sd
@@ -99,15 +141,10 @@ def main():
         )
         return e.get_observation_space_size(), e.get_action_space_size()
 
-    src_obs, src_act = _make_engine(SRC_PLAYERS)
+    _, src_act = _make_engine(SRC_PLAYERS)
     dst_obs, dst_act = _make_engine(DST_PLAYERS)
     assert src_act == dst_act, "Action space must be the same"
-    assert dst_obs - src_obs == EXTRA_COLS, (
-        f"Expected obs size diff of {EXTRA_COLS}, got {dst_obs - src_obs}"
-    )
 
-    print(f"Source: {SRC_PLAYERS}-player  obs={src_obs}  act={src_act}")
-    print(f"Target: {DST_PLAYERS}-player  obs={dst_obs}  act={dst_act}")
     print(f"Loading 2-player checkpoint: {args.src}")
 
     src_ckpt = torch.load(args.src, map_location='cpu')
@@ -115,6 +152,12 @@ def main():
     src_strat = src_ckpt['strategy_networks']    # list of 2 state dicts
     src_iter  = src_ckpt.get('iteration', 0)
 
+    # Read the actual obs size from the checkpoint weights (may differ from engine if
+    # treys was unavailable during training — equity features would be absent)
+    src_obs = src_adv[0]['network.0.weight'].shape[1]
+
+    print(f"Source: {SRC_PLAYERS}-player  obs={src_obs}  act={src_act}  (from checkpoint)")
+    print(f"Target: {DST_PLAYERS}-player  obs={dst_obs}  act={dst_act}")
     print(f"Source checkpoint iteration: {src_iter}")
 
     hidden_layers = config['network']['hidden_layers']
@@ -135,8 +178,8 @@ def main():
         # Players 2-5 are cloned from player 0 (they diverge during fine-tuning).
         src_p = min(p, SRC_PLAYERS - 1)
 
-        adv_sd   = _transfer_state_dict(src_adv[src_p],   src_obs, dst_obs)
-        strat_sd = _transfer_state_dict(src_strat[src_p], src_obs, dst_obs)
+        adv_sd   = _transfer_state_dict(src_adv[src_p],   src_obs, dst_obs, SRC_PLAYERS, DST_PLAYERS)
+        strat_sd = _transfer_state_dict(src_strat[src_p], src_obs, dst_obs, SRC_PLAYERS, DST_PLAYERS)
 
         dst_deep_cfr.advantage_networks[p].load_state_dict(adv_sd)
         dst_deep_cfr.strategy_networks[p].load_state_dict(strat_sd)

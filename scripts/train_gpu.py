@@ -165,6 +165,54 @@ def _traversal_worker(args):
 _REWARD_SCALE = 100.0
 
 
+def _preflop_fold_synthetic_reward(obs, num_players):
+    """
+    When a non-blind player folds preflop (reward == 0), the zero reward
+    creates a self-reinforcing feedback loop: network estimates play as
+    negative EV → fold gets positive regret → strategy converges to fold
+    even for premium hands (AA ends up folding more than 72o).
+
+    Fix: replace the 0 reward with a small negative synthetic reward
+    proportional to how much equity the player gave up by folding.
+    This gives the gradient the correct direction (fold AA = bad,
+    fold 72o = less bad) without changing the CFR math for any case
+    where chips were actually at stake.
+
+    Hand features are at obs[num_players+5 : num_players+10]:
+      [is_pair, is_suited, high_card_norm, low_card_norm, rank_gap_norm]
+    This holds for both obs_size=25 (6p no equity) and obs_size=29 (6p with equity).
+    """
+    hand_start = num_players + 5  # pos_oh(N) + rel_pos(1) + is_btn(1) + pot_odds(3)
+    is_pair    = float(obs[hand_start])
+    is_suited  = float(obs[hand_start + 1])
+    high_card  = float(obs[hand_start + 2])
+    low_card   = float(obs[hand_start + 3])
+
+    # Same preflop equity formula as EnhancedPokerEngine._get_equity_features
+    if is_pair > 0.5:
+        equity = 0.53 + high_card * 0.32          # 22→0.53, AA→0.85
+    else:
+        gap     = max(0.0, high_card - low_card)
+        equity  = (0.36
+                   + high_card * 0.15
+                   + low_card  * 0.08
+                   + is_suited * 0.03
+                   - gap       * 0.12)
+    equity = float(np.clip(equity, 0.25, 0.85))
+
+    # Symmetric synthetic reward: penalise folding premium hands, reward folding trash.
+    # Threshold 0.5 is the equity break-even point.
+    # AA  (equity=0.85): synth = (0.5-0.85)*4 = -1.4 → clipped to -1.0  (don't fold)
+    # J9o (equity=0.50): synth ≈ 0                                        (neutral)
+    # 72o (equity=0.37): synth = (0.5-0.37)*4 = +0.51                     (fold more)
+    # 32o (equity=0.36): synth = (0.5-0.36)*4 = +0.55                     (fold more)
+    # The positive reward for trash gives regret(fold)=synth-EV>0 even with a noisy
+    # network, breaking the frozen-uniform-strategy problem.
+    THRESHOLD = 0.50
+    synthetic = (THRESHOLD - equity) * 4.0
+    return float(np.clip(synthetic, -1.0, 1.0))
+
+
 def _compute_regrets_gpu(episodes, deep_cfr, iteration):
     """
     Collect every (obs, legal_actions) from the traversed player's steps across
@@ -187,6 +235,20 @@ def _compute_regrets_gpu(episodes, deep_cfr, iteration):
     if not entries:
         return
 
+    # Pre-compute effective rewards.  For non-blind preflop folds (raw reward == 0)
+    # replace the zero with a small equity-based negative signal to break the
+    # self-reinforcing fold feedback loop in multi-player outcome sampling.
+    effective_rewards = []
+    for ep_data, raw_reward, trav_player in episodes:
+        eff = raw_reward / _REWARD_SCALE
+        if abs(raw_reward) < 0.5:   # reward ≈ 0 → possible non-blind preflop fold
+            trav_steps = [s for s in ep_data if s['player'] == trav_player]
+            if len(trav_steps) == 1 and trav_steps[0]['action'] == 0:
+                eff = _preflop_fold_synthetic_reward(
+                    trav_steps[0]['obs'], deep_cfr.num_players
+                )
+        effective_rewards.append(eff)
+
     all_advantages = [None] * len(entries)
 
     # One GPU forward pass per player
@@ -202,8 +264,7 @@ def _compute_regrets_gpu(episodes, deep_cfr, iteration):
 
     # Compute per-action regrets and push to replay buffer
     for entry_idx, (ep_idx, _, player_idx, obs, action, legal) in enumerate(entries):
-        _, final_reward, _ = episodes[ep_idx]
-        final_reward = final_reward / _REWARD_SCALE  # normalise to ±1 range
+        final_reward = effective_rewards[ep_idx]   # already /-scaled or synthetic
         adv = all_advantages[entry_idx]
 
         mask = np.zeros(deep_cfr.action_size, dtype=np.float32)
