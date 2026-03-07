@@ -33,7 +33,6 @@ from pathlib import Path
 
 # Import the functions we want to test directly from train_gpu
 from train_gpu import (
-    _preflop_fold_synthetic_reward,
     _compute_regrets_gpu,
     _traversal_worker,
     _REWARD_SCALE,
@@ -72,156 +71,110 @@ def hand_obs(num_players, is_pair, is_suited, high_rank_norm, low_rank_norm):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TEST 1 — Synthetic reward values
+# TEST 1 — External sampling: branch structure
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_synthetic_rewards(num_players=6):
+def test_external_sampling_structure(num_players=6):
+    """Check that _traversal_worker returns a list with a precomputed-regret episode."""
     print("\n" + "="*60)
-    print("TEST 1: Synthetic reward values")
+    print("TEST 1: External sampling branch structure")
     print("="*60)
 
-    # (label, is_pair, is_suited, high_norm, low_norm)
-    # rank_norm: A=1.0, K=11/12, Q=10/12, ..., 2=0.0
-    hands = [
-        ("AA",      True,  False, 1.0,      1.0),
-        ("KK",      True,  False, 11/12,    11/12),
-        ("QQ",      True,  False, 10/12,    10/12),
-        ("JJ",      True,  False, 9/12,     9/12),
-        ("22",      True,  False, 0.0,      0.0),
-        ("AKs",     False, True,  1.0,      11/12),
-        ("AKo",     False, False, 1.0,      11/12),
-        ("AQs",     False, True,  1.0,      10/12),
-        ("KQo",     False, False, 11/12,    10/12),
-        ("T9s",     False, True,  8/12,     7/12),
-        ("72o",     False, False, 5/12,     0.0),
-        ("32o",     False, False, 1/12,     0.0),
-        ("trash",   False, False, 2/12,     0.0),
-    ]
+    _worker_init(None, None, None)  # no networks → uniform strategy
 
-    baseline = 1.0 / num_players
-    # Build (equity, synth) pairs and sort by equity descending for ordered check
-    rows = []
-    for label, is_pair, is_suited, hi, lo in hands:
-        obs = hand_obs(num_players, is_pair, is_suited, hi, lo)
-        synth = _preflop_fold_synthetic_reward(obs, num_players)
-        if is_pair:
-            equity = 0.53 + hi * 0.32
-        else:
-            gap = max(0.0, hi - lo)
-            equity = 0.36 + hi*0.15 + lo*0.08 + (0.03 if is_suited else 0) - gap*0.12
-        equity = float(np.clip(equity, 0.25, 0.85))
-        rows.append((label, equity, synth))
-
-    # Sort by equity descending for the monotone check
-    rows.sort(key=lambda x: -x[1])
-
-    print(f"{'Hand':<12} {'equity':>8} {'synth_reward':>14} {'regret(fold,ev=0)':>18}")
-    print("-"*55)
     ok = True
-    prev_equity, prev_synth = None, None
-    for label, equity, synth in rows:
-        regret_at_ev0 = synth - 0.0
-        flag = ""
-        # A weaker hand should never get MORE negative synth than a stronger hand
-        if prev_synth is not None and prev_equity is not None:
-            if equity < prev_equity and synth < prev_synth - 0.01:
-                flag = "  ← BUG: weaker hand has MORE negative synth"
-                ok = False
-        print(f"{label:<12} {equity:>8.3f} {synth:>14.4f} {regret_at_ev0:>18.4f}{flag}")
-        prev_equity, prev_synth = equity, synth
+    branch_counts = []
+    for i in range(20):
+        player_idx = i % num_players
+        result = _traversal_worker((player_idx, i * 1000, num_players))
+        # result must be a list
+        if not isinstance(result, list):
+            print(f"  ✗ Episode {i}: expected list, got {type(result)}")
+            ok = False
+            continue
+        branch_counts.append(len(result))
+        # First episode should contain precomputed regret steps
+        first_ep_data = result[0][0]
+        has_precomp = any(s.get('type') == 'precomputed' for s in first_ep_data)
+        if len(result) > 1 and not has_precomp:
+            print(f"  ✗ Episode {i}: {len(result)} branches but no precomputed regret steps")
+            ok = False
+        # Check precomputed steps have required fields
+        for s in first_ep_data:
+            if s.get('type') == 'precomputed':
+                missing = [k for k in ('obs','action','legal','regret','strategy') if k not in s]
+                if missing:
+                    print(f"  ✗ precomputed step missing keys: {missing}")
+                    ok = False
 
+    avg = np.mean(branch_counts) if branch_counts else 0
+    print(f"  Episodes per traversal: min={min(branch_counts)} max={max(branch_counts)} avg={avg:.1f}")
+    print(f"  (>1 means external sampling branched at first decision)")
     print()
     if ok:
-        print("  ✓ Synthetic rewards: strongest hands most negative, weak hands near 0")
+        print("  ✓ Branch structure correct — precomputed regrets present")
     else:
         print("  ✗ BUGS FOUND — see above")
     return ok
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TEST 2 — Regret direction with mock advantages
+# TEST 2 — Exact regret direction from branch_rewards
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_regret_direction(num_players=6):
+def test_exact_regret_direction(num_players=6):
     """
-    Simulate _compute_regrets_gpu logic for a single fold episode.
-    Test with various adv network outputs to see when fold still gets
-    positive regret despite synthetic reward.
+    Simulate exact regret computation from branch_rewards.
+    For fold: regret = reward(fold)/scale - EV
+    With uniform strategy and reward(fold)=0, reward(call/raise)=negative for trash:
+      EV < 0  →  regret(fold) = 0 - EV > 0  →  fold more  (correct for 72o)
+    With reward(fold)=0, reward(call/raise)=positive for premium:
+      EV > 0  →  regret(fold) = 0 - EV < 0  →  don't fold (correct for AA)
     """
     print("\n" + "="*60)
-    print("TEST 2: Regret direction (synthetic reward vs network EV)")
+    print("TEST 2: Exact regret direction from branch rewards")
     print("="*60)
 
-    obs_aa   = hand_obs(num_players, True,  False, 1.0,   1.0)
-    obs_72o  = hand_obs(num_players, False, False, 5/12,  0.0)
-
-    synth_aa  = _preflop_fold_synthetic_reward(obs_aa,  num_players)
-    synth_72o = _preflop_fold_synthetic_reward(obs_72o, num_players)
-
-    print(f"  synth(AA)  = {synth_aa:.4f}")
-    print(f"  synth(72o) = {synth_72o:.4f}")
-    print()
-
-    # Simulate for different network EV estimates
-    # adv = [fold_score, call_score, raise_score] (5 actions but only 3 legal preflop)
-    legal = [0, 1, 2]  # fold=0, call=1, raise=2
-    action = 0         # fold was sampled
+    # Simulate: fold=0 reward (non-blind preflop), call/raise = terminal outcome
+    # For AA:   playing (call/raise) is profitable → positive reward
+    # For 72o:  playing (call/raise) usually loses → negative reward
+    legal = [0, 1, 2]  # fold, call, raise
+    strategy = np.array([1/3, 1/3, 1/3])  # uniform (early training)
 
     test_cases = [
-        ("random init (all zero)",    [0.0,  0.0,  0.0]),
-        ("random init (noisy)",       [-0.1, 0.1,  0.2]),
-        ("network thinks all bad",    [-0.5, -0.3, -0.4]),
-        ("network thinks play=bad",   [-0.1, -0.8, -0.9]),
-        ("network thinks play=great", [-0.1,  0.8,  0.9]),
+        ("AA  (call/raise profitable)", {0: 0.0,  1:  80.0, 2:  90.0}),
+        ("AA  (call/raise slightly+)",  {0: 0.0,  1:  20.0, 2:  30.0}),
+        ("72o (call/raise costly)",     {0: 0.0,  1: -60.0, 2: -70.0}),
+        ("72o (call/raise slightly-)",  {0: 0.0,  1: -10.0, 2: -15.0}),
+        ("J9o (borderline)",            {0: 0.0,  1:   5.0, 2:  -5.0}),
     ]
 
-    print(f"{'Scenario':<35} {'EV':>6}  {'regret(fold,AA)':>16}  {'regret(fold,72o)':>16}  {'AA_ok?':>6}")
-    print("-"*85)
+    print(f"{'Scenario':<35}  {'EV':>8}  {'regret(fold)':>14}  {'ok?':>6}")
+    print("-"*70)
     all_ok = True
-    for label, adv_raw in test_cases:
-        for hand_label, obs, synth in [("AA", obs_aa, synth_aa), ("72o", obs_72o, synth_72o)]:
-            adv = np.array(adv_raw[:5] if len(adv_raw)>=5 else adv_raw + [0.0]*(5-len(adv_raw)), dtype=np.float32)
-            mask = np.zeros(5, dtype=np.float32); mask[legal] = 1.0
-            adv_m = adv * mask
-
-            pos = np.maximum(adv_m, 0.0) * mask
-            ps  = pos.sum()
-            strat_init = pos / ps if ps > 0 else mask / mask.sum()
-
-            legal_adv = adv_m[legal]
-            adv_scale = max(float(np.abs(legal_adv).max()), 1.0)
-            adv_normed = adv_m / adv_scale
-
-            ev = float(np.sum(strat_init[legal] * adv_normed[legal]))
-            regret_fold = synth - ev  # action == 0 (fold) was sampled
-
-        # Redo for both hands
-        results = {}
-        for hl, obs_h, sy in [("AA", obs_aa, synth_aa), ("72o", obs_72o, synth_72o)]:
-            adv = np.array(adv_raw + [0.0]*(5-len(adv_raw)), dtype=np.float32)
-            mask = np.zeros(5, dtype=np.float32); mask[legal] = 1.0
-            adv_m = adv * mask
-            pos = np.maximum(adv_m, 0.0) * mask; ps = pos.sum()
-            strat_init = pos / ps if ps > 0 else mask / mask.sum()
-            legal_adv = adv_m[legal]
-            adv_scale = max(float(np.abs(legal_adv).max()), 1.0)
-            adv_normed = adv_m / adv_scale
-            ev = float(np.sum(strat_init[legal] * adv_normed[legal]))
-            results[hl] = (ev, sy - ev)
-
-        ev_aa, r_aa   = results["AA"]
-        ev_72, r_72   = results["72o"]
-        aa_ok = r_aa < 0   # fold AA should get negative regret
-        flag = "✓" if aa_ok else "✗ BAD"
-        if not aa_ok:
-            all_ok = False
-        print(f"{label:<35} {ev_aa:>6.3f}  {r_aa:>16.4f}  {r_72:>16.4f}  {flag:>6}")
+    for label, branch_rewards in test_cases:
+        ev = sum(strategy[a] * branch_rewards[a] / _REWARD_SCALE for a in legal)
+        regret_fold = 0.0 / _REWARD_SCALE - ev   # fold reward = 0 (non-blind)
+        is_aa  = "AA"  in label
+        is_72o = "72o" in label
+        if is_aa:
+            expected_neg = regret_fold < 0
+            flag = "✓" if expected_neg else "✗ BAD (should be negative)"
+            if not expected_neg: all_ok = False
+        elif is_72o:
+            expected_pos = regret_fold > 0
+            flag = "✓" if expected_pos else "✗ BAD (should be positive)"
+            if not expected_pos: all_ok = False
+        else:
+            flag = ""
+        print(f"{label:<35}  {ev:>8.4f}  {regret_fold:>14.4f}  {flag}")
 
     print()
     if all_ok:
-        print("  ✓ In all cases, fold AA gets negative regret")
+        print("  ✓ AA fold gets negative regret, 72o fold gets positive regret")
+        print("  ✓ No synthetic reward needed — exact branch rewards do the right thing")
     else:
-        print("  ✗ Some cases give fold AA positive regret — synthetic reward too weak!")
+        print("  ✗ BUGS FOUND — see above")
     return all_ok
 
 
@@ -231,74 +184,45 @@ def test_regret_direction(num_players=6):
 
 def test_live_traversals(deep_cfr, num_episodes=200, num_players=6):
     print("\n" + "="*60)
-    print(f"TEST 3: Live traversals ({num_episodes} episodes)")
+    print(f"TEST 3: Live traversals ({num_episodes} traversals)")
     print("="*60)
 
-    engine_tmp = make_engine(num_players)
-    obs_size = engine_tmp.get_observation_space_size()
-
-    # Init worker globals
     _worker_init(deep_cfr.advantage_networks, deep_cfr.strategy_networks, None)
 
-    synthetic_count = 0
-    regular_count   = 0
-    synth_by_hand_label = {}  # equity_bucket → [synth_rewards]
-    fold_regrets_high = []    # equity > 0.6 → premium hand
-    fold_regrets_low  = []    # equity < 0.35 → trash hand
+    branch_counts = []   # episodes per traversal
+    branch_episode_count = 0
+    normal_episode_count  = 0
 
-    all_episodes = []
+    flat_episodes = []
     for i in range(num_episodes):
         player_idx = i % num_players
         result = _traversal_worker((player_idx, i * 1000, num_players))
-        all_episodes.append(result)
-
-    # Analyse raw rewards
-    for ep_data, raw_reward, trav_player in all_episodes:
-        trav_steps = [s for s in ep_data if s['player'] == trav_player]
-        is_synthetic = (
-            abs(raw_reward) < 0.5 and
-            len(trav_steps) == 1 and
-            trav_steps[0]['action'] == 0
-        )
-        if is_synthetic:
-            synthetic_count += 1
-            obs  = trav_steps[0]['obs']
-            synth = _preflop_fold_synthetic_reward(obs, num_players)
-            # bucket by equity
-            h = num_players + 5
-            ip = obs[h] > 0.5
-            hi = obs[h+2]; lo = obs[h+3]
-            if ip:
-                eq = 0.53 + hi * 0.32
+        branch_counts.append(len(result))
+        for ep in result:
+            ep_data, reward, trav = ep
+            has_precomp = any(s.get('type') == 'precomputed' for s in ep_data)
+            if has_precomp:
+                branch_episode_count += 1
             else:
-                gap = max(0, hi - lo)
-                eq = 0.36 + hi*0.15 + lo*0.08 - gap*0.12
-            eq = float(np.clip(eq, 0.25, 0.85))
-            bucket = f"eq={eq:.2f}"
-            synth_by_hand_label.setdefault(bucket, []).append(synth)
-        else:
-            regular_count += 1
+                normal_episode_count += 1
+            flat_episodes.append(ep)
 
-    total = synthetic_count + regular_count
-    print(f"  Episodes:          {total}")
-    print(f"  Synthetic reward:  {synthetic_count} ({100*synthetic_count/total:.1f}%)")
-    print(f"  Regular reward:    {regular_count} ({100*regular_count/total:.1f}%)")
+    total_eps = len(flat_episodes)
+    avg_branches = np.mean(branch_counts)
+    print(f"  Traversals run:          {num_episodes}")
+    print(f"  Episodes generated:      {total_eps}  (avg {avg_branches:.1f} per traversal)")
+    print(f"  With precomputed regrets:{branch_episode_count}")
+    print(f"  Post-branch episodes:    {normal_episode_count}")
 
-    if synthetic_count == 0:
-        print("\n  ✗ ZERO synthetic rewards triggered!")
-        print("    Possible causes:")
-        print("    - All traversals start from SB/BB (always post chips)")
-        print("    - Game engine assigns non-zero rewards to preflop folders")
-        print("    - The fix is not running (wrong file on server)")
+    if avg_branches <= 1.0:
+        print("\n  ✗ All traversals returned 1 episode — branching not triggering!")
+        print("    Possible: traversal player never got to act (e.g. all others folded first)")
+        ok = False
     else:
-        print("\n  Synthetic reward distribution (sample of equity buckets):")
-        # sort by equity descending
-        for bucket, vals in sorted(synth_by_hand_label.items(), reverse=True)[:10]:
-            avg = np.mean(vals)
-            cnt = len(vals)
-            print(f"    {bucket:>12}  avg_synth={avg:>8.4f}  count={cnt}")
+        print(f"\n  ✓ External sampling active: avg {avg_branches:.1f} branches per traversal")
+        ok = True
 
-    return synthetic_count > 0
+    return ok
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -365,7 +289,8 @@ def test_full_pipeline(deep_cfr, num_episodes=100, num_players=6):
     for i in range(num_episodes):
         player_idx = i % num_players
         result = _traversal_worker((player_idx, i * 999, num_players))
-        episodes.append(result)
+        # result is now a list of episodes (external sampling)
+        episodes.extend(result)
 
     # Monkey-patch compute_regrets to capture regrets without adding to buffer
     regret_records = []   # (hand_equity, action, regret, is_synthetic)
@@ -465,8 +390,8 @@ def main():
         deep_cfr.load_models(args.checkpoint)
 
     # Run all tests
-    t1 = test_synthetic_rewards(args.players)
-    t2 = test_regret_direction(args.players)
+    t1 = test_external_sampling_structure(args.players)
+    t2 = test_exact_regret_direction(args.players)
     t3 = test_live_traversals(deep_cfr, num_episodes=args.episodes, num_players=args.players)
     test_network_sensitivity(deep_cfr, args.players)
     test_full_pipeline(deep_cfr, num_episodes=args.episodes, num_players=args.players)
