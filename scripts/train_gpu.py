@@ -249,9 +249,10 @@ def _traversal_worker(args):
 
 def main():
     parser = argparse.ArgumentParser(description='Deep CFR — multi-core CPU traversal + GPU training')
-    parser.add_argument('--resume',  type=str, default=None, help='Checkpoint to resume from')
-    parser.add_argument('--workers', type=int, default=None, help='CPU worker count (default: cpu_count - 1)')
-    parser.add_argument('--device',  type=str, default=None, help='cuda | cpu (auto-detected if omitted)')
+    parser.add_argument('--resume',  type=str,   default=None, help='Checkpoint to resume from')
+    parser.add_argument('--workers', type=int,   default=None, help='CPU worker count (default: cpu_count - 1)')
+    parser.add_argument('--device',  type=str,   default=None, help='cuda | cpu (auto-detected if omitted)')
+    parser.add_argument('--lr',      type=float, default=None, help='Override learning rate after resume')
     args = parser.parse_args()
 
     config_path = Path(__file__).parent.parent / 'configs/training_config.json'
@@ -296,6 +297,11 @@ def main():
         deep_cfr.load_models(args.resume)
         start_iter = deep_cfr.iteration
         print(f'Resumed from checkpoint — iteration {start_iter}')
+        if args.lr:
+            for opt in deep_cfr.advantage_optimizers + deep_cfr.strategy_optimizers:
+                for pg in opt.param_groups:
+                    pg['lr'] = args.lr
+            print(f'LR overridden to {args.lr}')
 
     # Shared-memory CPU copies so workers can read current network weights.
     shared_adv_nets = []

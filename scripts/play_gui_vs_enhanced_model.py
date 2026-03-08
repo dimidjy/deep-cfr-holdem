@@ -11,45 +11,46 @@ from src.engine import EnhancedPokerEngine
 import torch
 
 
-def load_model(model_path: str, num_players: int = 2):
-    print(f"\nLoading ENHANCED model from: {model_path}")
-    
-    # Try to detect the correct number of players from the model
-    try:
-        checkpoint = torch.load(model_path, map_location='cpu')
-        if 'advantage_networks' in checkpoint and len(checkpoint['advantage_networks']) > 0:
-            first_layer_weight = checkpoint['advantage_networks'][0]['network.0.weight']
-            model_input_size = first_layer_weight.shape[1]
-            
-            # Try different player counts to find the right one
-            for test_players in [2, 3, 4, 5, 6, 7, 8, 9]:
-                test_engine = EnhancedPokerEngine(
-                    num_players=test_players,
-                    add_position_features=True,
-                    add_pot_odds_features=True,
-                    add_hand_strength_features=True,
-                    add_stack_features=True,
-                )
-                if test_engine.get_observation_space_size() == model_input_size:
-                    num_players = test_players
-                    print(f"  Auto-detected: {num_players} players (obs size: {model_input_size})")
-                    break
-    except Exception as e:
-        print(f"  Could not auto-detect player count: {e}")
-    
-    engine = EnhancedPokerEngine(
+def _make_engine(num_players: int) -> EnhancedPokerEngine:
+    return EnhancedPokerEngine(
         num_players=num_players,
         add_position_features=True,
         add_pot_odds_features=True,
         add_hand_strength_features=True,
         add_stack_features=True,
+        add_equity_features=True,
+        add_street_features=True,
+        add_game_state_features=True,
     )
+
+
+def load_model(model_path: str, num_players: int = 6):
+    print(f"\nLoading ENHANCED model from: {model_path}")
+
+    # Auto-detect player count from checkpoint input size
+    try:
+        checkpoint = torch.load(model_path, map_location='cpu')
+        if 'advantage_networks' in checkpoint and len(checkpoint['advantage_networks']) > 0:
+            first_layer_weight = checkpoint['advantage_networks'][0]['network.0.weight']
+            model_input_size = first_layer_weight.shape[1]
+
+            for test_players in [2, 3, 4, 5, 6, 7, 8, 9]:
+                if _make_engine(test_players).get_observation_space_size() == model_input_size:
+                    num_players = test_players
+                    print(f"  Auto-detected: {num_players} players (obs size: {model_input_size})")
+                    break
+            else:
+                print(f"  WARNING: could not match obs size {model_input_size}, using {num_players} players")
+    except Exception as e:
+        print(f"  Could not auto-detect player count: {e}")
+
+    engine = _make_engine(num_players)
     observation_size = engine.get_observation_space_size()
     action_size = engine.get_action_space_size()
-    
+
     print(f"  Enhanced observation size: {observation_size}")
     print(f"  Number of players: {num_players}")
-    
+
     deep_cfr = DeepCFR(
         observation_size=observation_size,
         action_size=action_size,
@@ -59,7 +60,7 @@ def load_model(model_path: str, num_players: int = 2):
         buffer_size=100000,
         device='cpu'
     )
-    
+
     try:
         deep_cfr.load_models(model_path)
         print(f"✓ Enhanced model loaded successfully")
@@ -96,7 +97,7 @@ def main():
     parser = argparse.ArgumentParser(description='Play poker against a trained ENHANCED AI model')
     parser.add_argument('--model', type=str, help='Path to enhanced model file')
     parser.add_argument('--list', action='store_true', help='List available models')
-    parser.add_argument('--players', type=int, default=2, help='Number of players (default: 2)')
+    parser.add_argument('--players', type=int, default=6, help='Number of players fallback if auto-detect fails (default: 6)')
     
     args = parser.parse_args()
     
@@ -124,64 +125,20 @@ def main():
         print("\n⚠️  If you're trying to load a BASE model, use:")
         print("    python3 scripts/play_gui_vs_model.py --model", args.model)
         return
-    
+
     print("\n" + "="*60)
-    print("Starting GUI - Playing against ENHANCED trained AI")
+    print(f"Starting GUI - You vs {trained_players - 1} AI opponents ({trained_players}-player game)")
     print("="*60)
-    print("Enhanced features:")
-    print("  ✓ Explicit position encoding")
-    print("  ✓ Pot odds calculation")
-    print("  ✓ Hand strength features")
-    print()
-    
-    # Check if model was trained with more than 2 players
-    gui_players = 2  # GUI only supports heads-up
-    
-    if trained_players != gui_players:
-        print(f"⚠️  Model trained with {trained_players} players")
-        print(f"   Using adapter to play heads-up (2 players)")
-        print(f"   The AI will adapt its strategy accordingly.")
-        print()
-        
-        # Create adapter
-        adapter = ModelAdapter(trained_players=trained_players, target_players=gui_players)
-        
-        # Wrap the model with adapter
-        class AdaptedModel:
-            def __init__(self, model, adapter):
-                self.model = model
-                self.adapter = adapter
-            
-            def get_strategy(self, obs, player_idx, legal_actions):
-                # Adapt observation from 2-player to 6-player format
-                adapted_obs = self.adapter.adapt_observation(obs)
-                # Call the original model with adapted observation
-                return self.model.get_strategy(adapted_obs, player_idx, legal_actions)
-        
-        ai_model = AdaptedModel(deep_cfr, adapter)
-    else:
-        ai_model = deep_cfr
-    
     print("Controls:")
     print("  - Click buttons to take actions")
     print("  - R: Start new hand")
     print("  - V: Show/Hide opponent cards")
     print("  - Q: Quit")
     print("="*60 + "\n")
-    
-    # Create GUI with enhanced engine
-    gui = PokerGUI(num_players=gui_players, ai_model=ai_model)
-    
-    # Replace the GUI's engine with an enhanced one
-    gui.engine = EnhancedPokerEngine(
-        num_players=gui_players,
-        add_position_features=True,
-        add_pot_odds_features=True,
-        add_hand_strength_features=True,
-        add_stack_features=True,
-    )
+
+    gui = PokerGUI(num_players=trained_players, ai_model=deep_cfr)
+    gui.engine = engine
     gui.engine.reset()
-    
     gui.run()
 
 

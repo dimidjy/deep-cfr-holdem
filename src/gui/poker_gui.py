@@ -121,49 +121,64 @@ class PokerGUI:
         pygame.draw.ellipse(self.screen, self.TABLE_COLOR, 
                           (center_x - 300, center_y - 150, 600, 300))
     
+    def _player_positions(self):
+        """Return (x, y) seat positions for up to 6 players, index 0 = human (bottom center)."""
+        n = len(self.engine.agents)
+        cx, cy = self.WINDOW_WIDTH // 2, self.WINDOW_HEIGHT // 2
+        # Positions for each seat count
+        positions_map = {
+            2: [(cx, self.WINDOW_HEIGHT - 200), (cx, 120)],
+            3: [(cx, self.WINDOW_HEIGHT - 200), (cx + 320, 200), (cx - 320, 200)],
+            4: [(cx, self.WINDOW_HEIGHT - 200), (cx + 380, cy), (cx, 120), (cx - 380, cy)],
+            5: [(cx, self.WINDOW_HEIGHT - 200), (cx + 350, self.WINDOW_HEIGHT - 350),
+                (cx + 350, 200), (cx - 350, 200), (cx - 350, self.WINDOW_HEIGHT - 350)],
+            6: [(cx, self.WINDOW_HEIGHT - 200), (cx + 380, self.WINDOW_HEIGHT - 350),
+                (cx + 380, 200), (cx, 120), (cx - 380, 200), (cx - 380, self.WINDOW_HEIGHT - 350)],
+        }
+        return positions_map.get(n, positions_map[6])
+
     def draw_player_info(self):
         if not self.state:
             return
-        
-        player_positions = [
-            (self.WINDOW_WIDTH // 2, self.WINDOW_HEIGHT - 250),
-            (self.WINDOW_WIDTH // 2, 100)
-        ]
-        
+
+        positions = self._player_positions()
+
         for idx, agent in enumerate(self.engine.agents):
-            pos_x, pos_y = player_positions[idx]
-            
+            if idx >= len(positions):
+                break
+            pos_x, pos_y = positions[idx]
+
             is_current = agent == self.state['current_player']
             color = self.HIGHLIGHT_COLOR if is_current else self.TEXT_COLOR
-            
-            player_name = "You" if agent == self.human_player else self.ai_name
+
+            player_name = "You" if agent == self.human_player else f"AI-{idx}"
             chips = self.engine.get_player_chips(agent)
-            
-            player_text = self.font_medium.render(f"{player_name}", True, color)
+
+            player_text = self.font_medium.render(player_name, True, color)
             text_rect = player_text.get_rect(center=(pos_x, pos_y))
             self.screen.blit(player_text, text_rect)
-            
+
             chips_text = self.font_small.render(f"Chips: {chips}", True, self.TEXT_COLOR)
-            chips_rect = chips_text.get_rect(center=(pos_x, pos_y + 30))
+            chips_rect = chips_text.get_rect(center=(pos_x, pos_y + 25))
             self.screen.blit(chips_text, chips_rect)
-            
+
             if is_current:
-                pygame.draw.circle(self.screen, self.HIGHLIGHT_COLOR, 
-                                 (pos_x - 80, pos_y), 10)
-            
+                pygame.draw.circle(self.screen, self.HIGHLIGHT_COLOR,
+                                   (pos_x - 80, pos_y), 10)
+
             player_cards = self.engine.get_player_cards(agent)
             if player_cards:
-                card_width = 80
-                card_height = 110
-                card_spacing = 15
+                card_width = 60
+                card_height = 85
+                card_spacing = 8
                 start_x = pos_x - (len(player_cards) * (card_width + card_spacing)) // 2
-                
-                y_offset = 70 if agent == self.human_player else 60
-                
+
+                y_offset = 50 if agent == self.human_player else 45
+
                 for card_idx, card_str in enumerate(player_cards):
                     x = start_x + card_idx * (card_width + card_spacing)
                     y = pos_y + y_offset
-                    
+
                     if agent == self.human_player or self.show_opponent_cards:
                         self.draw_card(x, y, card_str, card_width, card_height)
                     else:
@@ -343,7 +358,7 @@ class PokerGUI:
         title = self.font_small.render("Game Info:", True, self.HIGHLIGHT_COLOR)
         self.screen.blit(title, (info_x, info_y))
         
-        bg_rect = pygame.Rect(info_x - 5, info_y + 25, 280, 130)
+        bg_rect = pygame.Rect(info_x - 5, info_y + 25, 280, 200)
         pygame.draw.rect(self.screen, (0, 0, 0, 128), bg_rect)
         pygame.draw.rect(self.screen, self.HIGHLIGHT_COLOR, bg_rect, 2, border_radius=5)
         
@@ -351,15 +366,17 @@ class PokerGUI:
         
         pot = self.engine.get_pot_size()
         your_chips = self.engine.get_player_chips(self.human_player)
-        ai_chips = self.engine.get_player_chips('player_1' if self.human_player == 'player_0' else 'player_0')
-        
+
         info_lines = [
             f"Hand: #{self.hand_count}",
             f"Record: {self.wins}W - {self.losses}L",
             f"Pot: {pot} chips",
             f"Your chips: {your_chips}",
-            f"AI chips: {ai_chips}"
         ]
+        for agent in self.engine.agents:
+            if agent != self.human_player:
+                idx = self.engine.agents.index(agent)
+                info_lines.append(f"AI-{idx} chips: {self.engine.get_player_chips(agent)}")
         
         for idx, line in enumerate(info_lines):
             y_pos = info_y + 35 + (idx * 22)
@@ -388,41 +405,53 @@ class PokerGUI:
             action_name = self.get_action_name(self.selected_action)
             self.add_action_to_history("You", action_name)
             self.last_action_text = f"You {action_name}"
-            
+
             self.state = self.engine.step(self.selected_action)
             self.selected_action = None
             self.update_round_info()
             self.create_action_buttons()
-        
-        if not self.engine.is_done() and self.state and self.state['current_player'] != self.human_player:
-            if self.state['legal_actions']:
-                if self.ai_model:
-                    current_agent = self.state['current_player']
-                    agent_idx = self.engine.agents.index(current_agent)
-                    observation = self.engine.get_observation()
-                    legal_actions = self.state['legal_actions']
-                    
-                    strategy = self.ai_model.get_strategy(observation, agent_idx, legal_actions)
-                    legal_strategy = strategy[legal_actions]
-                    legal_strategy_sum = legal_strategy.sum()
-                    
-                    if legal_strategy_sum > 0:
-                        ai_action = np.random.choice(legal_actions, p=legal_strategy / legal_strategy_sum)
-                    else:
-                        ai_action = np.random.choice(legal_actions)
+
+        # Loop through consecutive AI turns until it's the human's turn (or game over)
+        while (not self.engine.is_done()
+               and self.state
+               and self.state['current_player'] != self.human_player):
+            if not self.state['legal_actions']:
+                break
+
+            current_agent = self.state['current_player']
+            agent_idx = self.engine.agents.index(current_agent)
+
+            if self.ai_model:
+                observation = self.engine.get_observation()
+                legal_actions = self.state['legal_actions']
+                # Use advantage network + regret-matching (current strategy,
+                # not the historical average from strategy_network)
+                advantages = self.ai_model.compute_counterfactual_values(
+                    observation, agent_idx, legal_actions
+                )
+                pos_adv = np.maximum(advantages, 0.0)
+                s = pos_adv.sum()
+                if s > 0:
+                    strategy = pos_adv / s
                 else:
-                    ai_action = np.random.choice(self.state['legal_actions'])
-                
-                action_name = self.get_action_name(ai_action)
-                
-                pygame.time.delay(500)
-                
-                self.add_action_to_history("AI", action_name)
-                self.last_action_text = f"AI {action_name}"
-                
-                self.state = self.engine.step(ai_action)
-                self.update_round_info()
-                self.create_action_buttons()
+                    mask = np.zeros(self.ai_model.action_size)
+                    mask[legal_actions] = 1.0
+                    strategy = mask / mask.sum()
+                legal_strategy = strategy[legal_actions]
+                legal_strategy /= legal_strategy.sum()
+                ai_action = np.random.choice(legal_actions, p=legal_strategy)
+            else:
+                ai_action = np.random.choice(self.state['legal_actions'])
+
+            action_name = self.get_action_name(ai_action)
+            pygame.time.delay(300)
+
+            self.add_action_to_history(f"AI-{agent_idx}", action_name)
+            self.last_action_text = f"AI-{agent_idx} {action_name}"
+
+            self.state = self.engine.step(ai_action)
+            self.update_round_info()
+            self.create_action_buttons()
     
     def handle_events(self):
         for event in pygame.event.get():
