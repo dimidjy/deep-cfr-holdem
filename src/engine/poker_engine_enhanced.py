@@ -53,7 +53,8 @@ class EnhancedPokerEngine(PokerEngine):
             size += 2  # m_ratio, relative_stack
 
         if self.add_equity_features:
-            size += 4  # hand_strength, made_hand_cat, has_flush_draw, has_straight_draw
+            size += 8  # hand_strength, made_hand_cat, has_flush_draw, has_straight_draw,
+                       # top_pair, board_is_paired, board_flush_texture, board_straight_texture
 
         if self.add_street_features:
             size += 4  # preflop, flop, turn, river (one-hot)
@@ -173,23 +174,27 @@ class EnhancedPokerEngine(PokerEngine):
 
     def _get_equity_features(self, current_agent: str) -> np.ndarray:
         """
-        4 features:
-          hand_strength    – [0,1] preflop equity approx OR postflop treys percentile
-          made_hand_cat    – [0,1] hand category (0=preflop/high-card, 1=str-flush)
-          has_flush_draw   – 1 if 4 cards to a flush (postflop)
-          has_straight_draw– 1 if 4-card straight draw (postflop)
+        8 features:
+          hand_strength          – [0,1] preflop equity approx OR postflop treys percentile
+          made_hand_cat          – [0,1] hand category (0=high-card, 1=str-flush), postflop only
+          has_flush_draw         – 1 if player has 4 cards to a flush (postflop)
+          has_straight_draw      – 1 if player has 4-card straight draw (postflop)
+          top_pair               – 1 if player paired the highest board card (postflop)
+          board_is_paired        – 1 if board contains a pair (postflop)
+          board_flush_texture    – [0,1] board wetness by suit: 0=rainbow, 1=4-flush on board
+          board_straight_texture – [0,1] board connectedness: 0=disconnected, 1=fully connected
         """
         try:
             game = self._get_game()
             if not game:
-                return np.zeros(4, dtype=np.float32)
+                return np.zeros(8, dtype=np.float32)
 
             agent_idx = self.agents.index(current_agent)
             hole = game.players[agent_idx].hand
             board = game.public_cards
 
             if len(hole) < 2:
-                return np.zeros(4, dtype=np.float32)
+                return np.zeros(8, dtype=np.float32)
 
             r1 = self._rank_to_value(hole[0].rank)
             r2 = self._rank_to_value(hole[1].rank)
@@ -200,56 +205,83 @@ class EnhancedPokerEngine(PokerEngine):
             if not board:
                 # ── Preflop: equity approximation (no MC, instant) ──────────
                 if is_pair:
-                    # 22 → ~0.53, AA → ~0.85
                     hand_strength = 0.53 + (hi - 2) / 12.0 * 0.32
                 else:
-                    gap_penalty   = max(0, hi - lo - 1) * 0.01
-                    suited_bonus  = 0.03 if is_suited else 0.0
+                    gap_penalty  = max(0, hi - lo - 1) * 0.01
+                    suited_bonus = 0.03 if is_suited else 0.0
                     hand_strength = (0.36
                                      + (hi - 2) / 12.0 * 0.15
                                      + (lo - 2) / 12.0 * 0.08
                                      + suited_bonus
                                      - gap_penalty)
                 hand_strength = float(np.clip(hand_strength, 0.0, 1.0))
-                return np.array([hand_strength, 0.0, 0.0, 0.0], dtype=np.float32)
+                return np.array([hand_strength, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                                dtype=np.float32)
 
             # ── Postflop: treys evaluation ───────────────────────────────────
             treys_hole  = [self._to_treys_card(c) for c in hole[:2]]
             treys_board = [self._to_treys_card(c) for c in board]
 
-            rank_int    = _TREYS_EVALUATOR.evaluate(treys_board, treys_hole)
+            rank_int      = _TREYS_EVALUATOR.evaluate(treys_board, treys_hole)
             hand_strength = (7462 - rank_int) / 7462.0   # 1.0=nuts, 0.0=worst
 
-            rank_class  = _TREYS_EVALUATOR.get_rank_class(rank_int)
+            rank_class    = _TREYS_EVALUATOR.get_rank_class(rank_int)
             # treys classes: 1=SF 2=Quads 3=FH 4=Flush 5=Straight 6=Trips
             #                7=TwoPair 8=Pair 9=HighCard
             made_hand_cat = (9 - rank_class) / 8.0   # 0=HighCard, 1=StraightFlush
 
-            # Flush draw: 4+ cards of same suit among hole+board
-            all_cards  = list(hole[:2]) + list(board)
+            # ── Flush / straight draws (player) ─────────────────────────────
+            all_cards   = list(hole[:2]) + list(board)
             suit_counts = {}
             for c in all_cards:
                 suit_counts[c.suit] = suit_counts.get(c.suit, 0) + 1
             has_flush_draw = 1.0 if any(v == 4 for v in suit_counts.values()) else 0.0
 
-            # Straight draw: 4 consecutive ranks (OESD or gutshot)
-            ranks_set = sorted(set(self._rank_to_value(c.rank) for c in all_cards))
-            # Also treat Ace as 1 for A-2-3-4-5 draws
-            if 14 in ranks_set:
-                ranks_set = sorted(set([1] + ranks_set))
+            ranks_all = sorted(set(self._rank_to_value(c.rank) for c in all_cards))
+            if 14 in ranks_all:
+                ranks_all = sorted(set([1] + ranks_all))
             has_straight_draw = 0.0
             for start in range(1, 12):
-                window = set(range(start, start + 5))
-                if len(window & set(ranks_set)) >= 4:
+                if len(set(range(start, start + 5)) & set(ranks_all)) >= 4:
                     has_straight_draw = 1.0
                     break
 
+            # ── Top pair: player's hole card matches highest board rank ──────
+            board_ranks = [self._rank_to_value(c.rank) for c in board]
+            hole_ranks  = [r1, r2]
+            max_board   = max(board_ranks)
+            top_pair    = 1.0 if max_board in hole_ranks else 0.0
+
+            # ── Board is paired: any rank appears 2+ times on board ──────────
+            board_is_paired = 1.0 if len(board_ranks) != len(set(board_ranks)) else 0.0
+
+            # ── Board flush texture: how suited the board is ─────────────────
+            # 0=rainbow, 0.33=2-flush, 0.67=3-flush, 1.0=4-flush on board
+            board_suit_counts = {}
+            for c in board:
+                board_suit_counts[c.suit] = board_suit_counts.get(c.suit, 0) + 1
+            max_board_suit = max(board_suit_counts.values()) if board_suit_counts else 1
+            board_flush_texture = float(np.clip((max_board_suit - 1) / 3.0, 0.0, 1.0))
+
+            # ── Board straight texture: how connected the board is ───────────
+            # Count consecutive rank pairs among unique board ranks, normalize to [0,1]
+            board_ranks_unique = sorted(set(board_ranks))
+            if 14 in board_ranks_unique:
+                board_ranks_unique = sorted(set([1] + board_ranks_unique))
+            consecutive_pairs = sum(
+                1 for i in range(len(board_ranks_unique) - 1)
+                if board_ranks_unique[i + 1] - board_ranks_unique[i] == 1
+            )
+            max_possible = max(len(board_ranks_unique) - 1, 1)
+            board_straight_texture = float(consecutive_pairs / max_possible)
+
             return np.array(
-                [hand_strength, made_hand_cat, has_flush_draw, has_straight_draw],
+                [hand_strength, made_hand_cat, has_flush_draw, has_straight_draw,
+                 top_pair, board_is_paired, board_flush_texture, board_straight_texture],
                 dtype=np.float32
             )
         except Exception:
-            return np.zeros(4, dtype=np.float32)
+            return np.zeros(8, dtype=np.float32)
 
     def _get_street_features(self) -> np.ndarray:
         """4-dim one-hot: [preflop, flop, turn, river]"""

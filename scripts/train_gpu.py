@@ -1,9 +1,9 @@
 """
 Deep CFR training: parallel CPU traversals + batched GPU training.
 
-Workers run full external-sampling MCCFR traversals covering all streets:
-  - Preflop: exact external sampling (branch all actions, exact terminal rewards)
-  - Postflop: outcome sampling with network bootstrapping for unsampled actions
+Workers run full external-sampling MCCFR traversals covering all streets.
+At every traversal player decision (preflop and postflop), all legal actions
+are branched with exact terminal rewards — no network bootstrapping anywhere.
 Main process handles all GPU network inference and training.
 """
 import sys
@@ -24,6 +24,8 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, os.path.dirname(__file__))
+
+from torch.utils.tensorboard import SummaryWriter
 
 from src.engine import EnhancedPokerEngine
 from src.training import DeepCFR
@@ -76,19 +78,15 @@ def _make_engine(num_players):
 
 def _traversal_worker(args):
     """
-    External-sampling MCCFR traversal covering all streets.
+    External-sampling MCCFR with exact regrets at every traversal player decision.
 
-    Phase 1-3 (preflop): expand ALL legal actions at the traversal player's
-    first preflop decision, get exact terminal rewards per branch → exact regrets.
+    At EVERY decision point (preflop AND postflop):
+      - Branch all legal actions, play each to terminal → exact rewards
+      - Compute exact regrets (no network bootstrapping)
+      - Sample one action from regret-matching strategy, continue
 
-    Phase 4 (postflop): sample one preflop action from the current strategy,
-    continue the game, and collect outcome-sampling regrets for every subsequent
-    traversal player decision (flop/turn/river).
-      - Sampled action regret:   terminal_reward / REWARD_SCALE - ev_network
-      - Unsampled action regret: adv_network[a]  - ev_network  (bootstrapped)
-
-    Both game.np_random and game.dealer_id are saved/restored for each branch
-    to guarantee identical card deals and action ordering across all branches.
+    All branches replay the full action history from game start using the
+    saved game.np_random + dealer_id for identical card deals every time.
     """
     global _SHARED_ADV_NETS, _SHARED_STRAT_NETS, _ACT_SIZE
     player_idx, num_players = args
@@ -106,7 +104,7 @@ def _traversal_worker(args):
         return int(np.random.choice(legal))
 
     def _run_to_terminal(eng):
-        """Play to terminal with outcome sampling for all players. Returns reward."""
+        """Play to terminal using opponent strategy network. Returns reward."""
         while not eng.is_done():
             ca = eng.current_agent
             ai = eng.agents.index(ca)
@@ -120,73 +118,62 @@ def _traversal_worker(args):
         eng.close()
         return reward
 
-    def _run_collecting_postflop(eng):
-        """Play to terminal, collecting traversal player's decisions for regret computation.
-
-        Traversal player uses regret-matching on current advantage network.
-        Opponents use strategy network. Returns (decisions, terminal_reward).
-        """
-        decisions = []
-        while not eng.is_done():
-            ca    = eng.current_agent
-            ai    = eng.agents.index(ca)
-            obs   = eng.get_observation()
-            legal = eng.get_legal_actions()
-            if not legal:
-                break
-            if ai == player_idx:
-                if _SHARED_ADV_NETS is not None:
-                    with torch.no_grad():
-                        obs_t  = torch.from_numpy(obs.astype(np.float32)).unsqueeze(0)
-                        adv_np = _SHARED_ADV_NETS[player_idx](obs_t).numpy()[0]
-                else:
-                    adv_np = np.zeros(_ACT_SIZE, dtype=np.float32)
-                legal_int = [int(a) for a in legal]
-                strategy  = _regret_match(adv_np, legal_int)
-                lp = strategy[legal_int]
-                lp = lp / lp.sum()
-                action = int(np.random.choice(legal_int, p=lp))
-                decisions.append({
-                    'obs':      obs.copy(),
-                    'action':   action,
-                    'legal':    legal_int,
-                    'adv':      adv_np.copy(),
-                    'strategy': strategy.copy(),
-                })
-            else:
-                action = _pick_opponent_action(ai, obs, legal)
-            eng.step(action)
-        rw = eng.get_rewards()
-        terminal_reward = float(rw[eng.agents[player_idx]])
-        eng.close()
-        return decisions, terminal_reward
-
-    def _restore_engine():
-        """Create a fresh engine with the same card deal and button position."""
+    def _fresh_engine_at(history):
+        """Create engine with saved state, replay history, return positioned engine."""
         eng = _make_engine(num_players)
         g   = eng._get_game()
         g.np_random.set_state(pre_reset_game_rng)
         g.dealer_id = pre_reset_dealer_id
         eng.reset()
-        for stored_action in pre_actions:
-            eng.step(stored_action)
+        for a in history:
+            eng.step(a)
         return eng
 
-    # ── Phase 1: play until traversal player's first preflop decision ───────
-    # Save game RNG state AND dealer_id before reset.
-    # dealer_id (button position) is set randomly during engine creation from
-    # global np.random — it is NOT part of game.np_random — so must be saved
-    # separately. Without this, branches get different action orders despite
-    # the same card deal, causing replayed pre-actions to go to the wrong players.
+    def _branch_exact(history, legal_int, n_samples=3):
+        """Branch all legal actions, average n_samples rollouts to reduce variance."""
+        return {
+            ba: float(np.mean([
+                _run_to_terminal(_fresh_engine_at(history + [ba]))
+                for _ in range(n_samples)
+            ]))
+            for ba in legal_int
+        }
+
+    def _strategy_for(obs, legal_int):
+        """Regret-matching strategy from advantage network."""
+        if _SHARED_ADV_NETS is not None:
+            with torch.no_grad():
+                obs_t  = torch.from_numpy(obs.astype(np.float32)).unsqueeze(0)
+                adv_np = _SHARED_ADV_NETS[player_idx](obs_t).numpy()[0]
+            return _regret_match(adv_np, legal_int)
+        strat = np.zeros(_ACT_SIZE, dtype=np.float32)
+        strat[legal_int] = 1.0 / len(legal_int)
+        return strat
+
+    def _make_steps(obs, legal_int, branch_rewards, strategy):
+        """Turn branch rewards + strategy into buffer-ready step dicts."""
+        ev = sum(strategy[a] * branch_rewards[a] / _REWARD_SCALE for a in legal_int)
+        return [{
+            'player':   player_idx,
+            'obs':      obs,
+            'action':   a,
+            'legal':    legal_int,
+            'regret':   float(np.clip(branch_rewards[a] / _REWARD_SCALE - ev,
+                                      -_REGRET_CLIP, _REGRET_CLIP)),
+            'strategy': strategy,
+        } for a in legal_int]
+
+    # ── Save game state for deterministic replay ────────────────────────────
+    # dealer_id (button position) is set from global np.random during engine
+    # creation and is NOT part of game.np_random — save both separately.
     engine = _make_engine(num_players)
     game   = engine._get_game()
     pre_reset_game_rng  = game.np_random.get_state()
     pre_reset_dealer_id = game.dealer_id
     engine.reset()
 
-    pre_actions = []
-    first_obs   = None
-    first_legal = None
+    # ── Play opponent actions until traversal player's first decision ────────
+    history = []   # grows throughout traversal; used for exact replay per branch
 
     while not engine.is_done():
         ca    = engine.current_agent
@@ -196,82 +183,64 @@ def _traversal_worker(args):
         if not legal:
             break
         if ai == player_idx:
-            first_obs   = obs.copy()
-            first_legal = [int(a) for a in legal]
             break
         action = _pick_opponent_action(ai, obs, legal)
-        pre_actions.append(action)
+        history.append(action)
         engine.step(action)
 
-    engine.close()
-
-    if first_obs is None:
+    # Check if traversal player ever got to act
+    if engine.is_done():
+        engine.close()
+        return []
+    ca    = engine.current_agent
+    ai    = engine.agents.index(ca)
+    if ai != player_idx:
+        engine.close()
         return []
 
-    # ── Phase 2: branch over all preflop actions, get exact terminal rewards ─
-    branch_rewards = {}
-    for branch_action in first_legal:
-        eng2 = _restore_engine()
-        eng2.step(branch_action)
-        branch_rewards[branch_action] = _run_to_terminal(eng2)
+    first_obs   = engine.get_observation().copy()
+    first_legal = [int(a) for a in engine.get_legal_actions()]
+    engine.close()
 
-    # ── Phase 3: exact preflop regrets ──────────────────────────────────────
-    if _SHARED_ADV_NETS is not None:
-        with torch.no_grad():
-            obs_t  = torch.from_numpy(first_obs.astype(np.float32)).unsqueeze(0)
-            adv_np = _SHARED_ADV_NETS[player_idx](obs_t).numpy()[0]
-        strategy = _regret_match(adv_np, first_legal)
-    else:
-        strategy = np.zeros(_ACT_SIZE, dtype=np.float32)
-        strategy[first_legal] = 1.0 / len(first_legal)
+    # ── Exact external sampling at every traversal player decision ───────────
+    # For each decision: branch all actions → exact rewards → exact regrets.
+    # Then sample one action from strategy and advance.
+    all_steps = []
 
-    ev = sum(strategy[a] * branch_rewards[a] / _REWARD_SCALE for a in first_legal)
+    # Preflop decision
+    branch_rewards = _branch_exact(history, first_legal)
+    strategy       = _strategy_for(first_obs, first_legal)
+    all_steps     += _make_steps(first_obs, first_legal, branch_rewards, strategy)
 
-    preflop_steps = [{
-        'player':   player_idx,
-        'obs':      first_obs,
-        'action':   a,
-        'legal':    list(first_legal),
-        'regret':   float(np.clip(branch_rewards[a] / _REWARD_SCALE - ev, -_REGRET_CLIP, _REGRET_CLIP)),
-        'strategy': strategy,
-    } for a in first_legal]
+    lp = strategy[first_legal].copy(); lp /= lp.sum()
+    history.append(int(np.random.choice(first_legal, p=lp)))
 
-    # ── Phase 4: postflop outcome sampling ──────────────────────────────────
-    # Sample one preflop action from current strategy, then collect regrets
-    # at every subsequent traversal player decision (flop/turn/river).
-    lp = strategy[first_legal].copy()
-    lp /= lp.sum()
-    sampled_action = int(np.random.choice(first_legal, p=lp))
+    # Postflop decisions
+    eng = _fresh_engine_at(history)
+    while not eng.is_done():
+        ca    = eng.current_agent
+        ai    = eng.agents.index(ca)
+        obs   = eng.get_observation()
+        legal = eng.get_legal_actions()
+        if not legal:
+            break
 
-    eng3 = _restore_engine()
-    eng3.step(sampled_action)
-    postflop_decisions, terminal_reward = _run_collecting_postflop(eng3)
+        if ai == player_idx:
+            legal_int      = [int(a) for a in legal]
+            branch_rewards = _branch_exact(history, legal_int)
+            strategy       = _strategy_for(obs.copy(), legal_int)
+            all_steps     += _make_steps(obs.copy(), legal_int, branch_rewards, strategy)
 
-    # Outcome-sampling regrets:
-    #   sampled action  → grounded in actual terminal reward
-    #   unsampled actions → bootstrapped from advantage network
-    # Both centered on ev_network so relative ordering is preserved.
-    postflop_steps = []
-    for dec in postflop_decisions:
-        adv   = dec['adv']
-        legal = dec['legal']
-        strat = dec['strategy']
-        ev_net = float(np.dot(strat[legal], adv[legal]))
-        for a in legal:
-            if a == dec['action']:
-                regret = terminal_reward / _REWARD_SCALE - ev_net
-            else:
-                regret = float(adv[a]) - ev_net
-            postflop_steps.append({
-                'player':   player_idx,
-                'obs':      dec['obs'],
-                'action':   a,
-                'legal':    legal,
-                'regret':   float(np.clip(regret, -_REGRET_CLIP, _REGRET_CLIP)),
-                'strategy': strat,
-            })
+            lp = strategy[legal_int].copy(); lp /= lp.sum()
+            action = int(np.random.choice(legal_int, p=lp))
+        else:
+            action = _pick_opponent_action(ai, obs, legal)
 
-    return preflop_steps + postflop_steps
+        history.append(action)
+        eng.step(action)
+
+    eng.close()
+    return all_steps
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +317,11 @@ def main():
     ckpt_interval = config['training']['checkpoint_interval']
     models_dir    = Path(config['paths']['models'])
     models_dir.mkdir(parents=True, exist_ok=True)
+
+    logs_dir = Path(config['paths'].get('logs', 'data/logs')) / 'tensorboard'
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    writer = SummaryWriter(log_dir=str(logs_dir))
+    print(f'TensorBoard logs → {logs_dir}  (run: tensorboard --logdir {logs_dir})\n')
 
     print(f'Training iterations {start_iter + 1} → {num_iterations}')
     print(f'batch_size={batch_size}  train_passes={train_passes}')
@@ -428,6 +402,14 @@ def main():
                 f'  total={total:.1f}s'
             )
 
+            # ── TensorBoard: per-iteration metrics ──────────────────────────
+            writer.add_scalar('loss/advantage',  adv,   iter_num)
+            writer.add_scalar('loss/strategy',   strat, iter_num)
+            writer.add_scalar('perf/trav_time',  t_trav,  iter_num)
+            writer.add_scalar('perf/train_time', t_train, iter_num)
+            writer.add_scalar('perf/total_time', total,   iter_num)
+            writer.add_scalar('buffer/size', len(deep_cfr.replay_buffer), iter_num)
+
             if iter_num % ckpt_interval == 0:
                 ckpt = str(models_dir / f'checkpoint_iter_{iter_num}.pt')
                 deep_cfr.save_models(ckpt)
@@ -439,9 +421,24 @@ def main():
 
                 val_results = run_validation(deep_cfr, engine, num_games=500, verbose=False)
                 print(f'  {validation_summary_line(val_results)}')
+
+                # ── TensorBoard: validation metrics ─────────────────────────
+                for spot_key, spot_data in val_results.items():
+                    if spot_key == '_summary' or not isinstance(spot_data, dict):
+                        continue
+                    if spot_data.get('n', 0) == 0:
+                        continue
+                    writer.add_scalar(f'val/{spot_key}/fold', spot_data['fold_pct'], iter_num)
+                    writer.add_scalar(f'val/{spot_key}/call', spot_data['call_pct'], iter_num)
+                    writer.add_scalar(f'val/{spot_key}/aggr', spot_data['aggr_pct'], iter_num)
+                summary = val_results.get('_summary', {})
+                if summary.get('total', 0) > 0:
+                    writer.add_scalar('val/pass_rate',
+                                      summary['passed'] / summary['total'], iter_num)
     finally:
         pool.terminate()
         pool.join()
+        writer.close()
 
     final = str(models_dir / 'final_model_enhanced.pt')
     deep_cfr.save_models(final)

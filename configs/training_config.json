@@ -3,13 +3,13 @@
     "num_players": 6
   },
   "training": {
-    "num_iterations": 1000,
+    "num_iterations": 2000,
     "batch_size": 512,
-    "learning_rate": 0.001,
-    "buffer_size": 1000000,
-    "traversals_per_iteration": 6000,
+    "learning_rate": 0.0003,
+    "buffer_size": 2000000,
+    "traversals_per_iteration": 1000,
     "checkpoint_interval": 50,
-    "train_passes": 15,
+    "train_passes": 5,
     "gradient_clip": 1.0,
     "lr_scheduler_t_max": 3000
   },
