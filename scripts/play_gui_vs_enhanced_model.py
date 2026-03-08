@@ -21,6 +21,7 @@ def _make_engine(num_players: int) -> EnhancedPokerEngine:
         add_equity_features=True,
         add_street_features=True,
         add_game_state_features=True,
+        add_betting_history_features=True,
     )
 
 

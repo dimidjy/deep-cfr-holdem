@@ -19,7 +19,8 @@ class EnhancedPokerEngine(PokerEngine):
                  add_stack_features: bool = True,
                  add_equity_features: bool = True,
                  add_street_features: bool = True,
-                 add_game_state_features: bool = True):
+                 add_game_state_features: bool = True,
+                 add_betting_history_features: bool = True):
         super().__init__(num_players)
         self.add_position_features = add_position_features
         self.add_pot_odds_features = add_pot_odds_features
@@ -28,6 +29,7 @@ class EnhancedPokerEngine(PokerEngine):
         self.add_equity_features = add_equity_features and _TREYS_AVAILABLE
         self.add_street_features = add_street_features
         self.add_game_state_features = add_game_state_features
+        self.add_betting_history_features = add_betting_history_features
 
         self.enhanced_obs_size = self._calculate_enhanced_size()
 
@@ -61,6 +63,10 @@ class EnhancedPokerEngine(PokerEngine):
 
         if self.add_game_state_features:
             size += 3  # players_alive_norm, call_amount_norm, aggression_level
+
+        if self.add_betting_history_features:
+            size += 5  # raise_level, my_pot_share, not_raise_fraction,
+                       # facing_3bet_plus, pot_was_raised
 
         return size
 
@@ -340,6 +346,47 @@ class EnhancedPokerEngine(PokerEngine):
             pass
         return np.array([1.0, 0.0, 0.0], dtype=np.float32)
 
+    def _get_betting_history_features(self, current_agent: str) -> np.ndarray:
+        """
+        5 features capturing the betting action context:
+          raise_level        – log-scale aggression capped at 4-bet (0=limp, 1=4bet+)
+          my_pot_share       – fraction of pot I've personally put in [0,1]
+          not_raise_fraction – fraction of players who haven't raised this round [0,1]
+          facing_3bet_plus   – 1 if max_raised > 6×BB (3-bet or more)
+          pot_was_raised     – 1 if any raise occurred this round (max_raised > BB)
+        """
+        try:
+            import math
+            game = self._get_game()
+            if game:
+                agent_idx = self.agents.index(current_agent)
+                player = game.players[agent_idx]
+
+                big_blind = game.big_blind if hasattr(game, 'big_blind') else 2
+                max_raised = max(game.round.raised) if game.round.raised else 0
+                pot = max(sum(p.in_chips for p in game.players), 1)
+
+                ratio = max(max_raised, big_blind) / big_blind
+                raise_level = float(np.clip(math.log(ratio) / math.log(40), 0.0, 1.0))
+
+                my_pot_share = float(np.clip(player.in_chips / pot, 0.0, 1.0))
+
+                not_raise_fraction = float(
+                    np.clip(game.round.not_raise_num / max(self.num_players, 1), 0.0, 1.0)
+                )
+
+                facing_3bet_plus = 1.0 if max_raised > 6 * big_blind else 0.0
+                pot_was_raised   = 1.0 if max_raised > big_blind else 0.0
+
+                return np.array(
+                    [raise_level, my_pot_share, not_raise_fraction,
+                     facing_3bet_plus, pot_was_raised],
+                    dtype=np.float32
+                )
+        except Exception:
+            pass
+        return np.zeros(5, dtype=np.float32)
+
     def _rank_to_value(self, rank: str) -> int:
         rank_map = {
             '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7, '8': 8, '9': 9,
@@ -374,6 +421,9 @@ class EnhancedPokerEngine(PokerEngine):
 
         if self.add_game_state_features:
             features.append(self._get_game_state_features(self.current_agent))
+
+        if self.add_betting_history_features:
+            features.append(self._get_betting_history_features(self.current_agent))
 
         if features:
             return np.concatenate(features).astype(np.float32)
