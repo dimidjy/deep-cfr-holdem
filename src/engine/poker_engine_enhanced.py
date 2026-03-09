@@ -321,7 +321,7 @@ class EnhancedPokerEngine(PokerEngine):
         """3 features: players_alive_norm, call_amount_norm, aggression_level"""
         try:
             import math
-            from rlcard.games.nolimitholdem.player import PlayerStatus
+            from rlcard.games.limitholdem.player import PlayerStatus
             game = self._get_game()
             if game:
                 agent_idx = self.agents.index(current_agent)
@@ -364,7 +364,7 @@ class EnhancedPokerEngine(PokerEngine):
           min_opp_stack_norm – smallest remaining opponent stack / 100 (short stack pressure)
         """
         try:
-            from rlcard.games.nolimitholdem.player import PlayerStatus
+            from rlcard.games.limitholdem.player import PlayerStatus
             game = self._get_game()
             if game:
                 agent_idx = self.agents.index(current_agent)

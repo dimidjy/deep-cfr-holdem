@@ -4,12 +4,12 @@
   },
   "training": {
     "num_iterations": 4000,
-    "batch_size": 4096,
+    "batch_size": 32768,
     "learning_rate": 0.0003,
     "buffer_size": 2000000,
-    "traversals_per_iteration": 4000,
+    "traversals_per_iteration": 10000,
     "checkpoint_interval": 50,
-    "train_passes": 40,
+    "train_passes": 25,
     "gradient_clip": 1.0,
     "lr_scheduler_t_max": 4000
   },

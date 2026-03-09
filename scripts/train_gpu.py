@@ -79,7 +79,23 @@ def _regret_match(adv, legal, epsilon=0.05):
     return strategy
 
 
+_USE_FAST_ENGINE = False   # set from main() based on --engine flag
+
+
 def _make_engine(num_players):
+    if _USE_FAST_ENGINE:
+        from src.engine import FastEnhancedPokerEngine
+        return FastEnhancedPokerEngine(
+            num_players=num_players,
+            add_position_features=True,
+            add_pot_odds_features=True,
+            add_hand_strength_features=True,
+            add_stack_features=True,
+            add_equity_features=True,
+            add_street_features=True,
+            add_game_state_features=True,
+            add_betting_history_features=True,
+        )
     from src.engine import EnhancedPokerEngine
     return EnhancedPokerEngine(
         num_players=num_players,
@@ -273,7 +289,13 @@ def main():
     parser.add_argument('--workers', type=int,   default=None, help='CPU worker count (default: cpu_count - 1)')
     parser.add_argument('--device',  type=str,   default=None, help='cuda | cpu (auto-detected if omitted)')
     parser.add_argument('--lr',      type=float, default=None, help='Override learning rate after resume')
+    parser.add_argument('--engine',  type=str,   default='pettingzoo',
+                        choices=['pettingzoo', 'fast'],
+                        help='Game engine backend: pettingzoo (default) or fast (Rust-backed, ~30x faster)')
     args = parser.parse_args()
+
+    global _USE_FAST_ENGINE
+    _USE_FAST_ENGINE = (args.engine == 'fast')
 
     config_path = Path(__file__).parent.parent / 'configs/training_config.json'
     config = load_config(str(config_path))
@@ -288,6 +310,7 @@ def main():
     print(f'  device   : {device}')
     if device == 'cuda':
         print(f'  GPU      : {torch.cuda.get_device_name(0)}')
+    print(f'  engine   : {"fast (Rust)" if _USE_FAST_ENGINE else "pettingzoo (RLCard)"}')
     print(f'  workers  : {num_workers}')
     print(f'  players  : {num_players}')
     print(f'  iters    : {config["training"]["num_iterations"]}')
