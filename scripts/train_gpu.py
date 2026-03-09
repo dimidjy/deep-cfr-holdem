@@ -39,7 +39,23 @@ _SHARED_STRAT_NETS = None
 _ACT_SIZE          = None   # action space size, needed for uniform fallback strategy
 
 _REWARD_SCALE = 100.0
-_REGRET_CLIP  = 2.0
+_REGRET_CLIP  = 1.0
+
+# Worker-local engine pool — reuse PettingZoo envs instead of recreating per branch
+_ENGINE_POOL = []
+
+
+def _get_engine(num_players):
+    """Get engine from pool or create new one."""
+    global _ENGINE_POOL
+    if _ENGINE_POOL:
+        return _ENGINE_POOL.pop()
+    return _make_engine(num_players)
+
+
+def _return_engine(eng):
+    """Return engine to pool for reuse (avoids env teardown + recreation)."""
+    _ENGINE_POOL.append(eng)
 
 
 def _worker_init(shared_adv, shared_strat, act_size):
@@ -58,7 +74,8 @@ def _regret_match(adv, legal, epsilon=0.05):
     pos = np.maximum(adv[legal], 0.0)
     s = pos.sum()
     strategy[legal] = pos / s if s > 0 else 1.0 / len(legal)
-    strategy[legal] = (1.0 - epsilon) * strategy[legal] + epsilon / len(legal)
+    if epsilon > 0:
+        strategy[legal] = (1.0 - epsilon) * strategy[legal] + epsilon / len(legal)
     return strategy
 
 
@@ -90,7 +107,9 @@ def _traversal_worker(args):
     saved game.np_random + dealer_id for identical card deals every time.
     """
     global _SHARED_ADV_NETS, _SHARED_STRAT_NETS, _ACT_SIZE
-    player_idx, num_players = args
+    player_idx, num_players, current_iter = args
+    # Decay exploration: 5% early → 1% by iter 2000
+    epsilon = max(0.01, 0.05 * (1.0 - current_iter / 3000.0))
 
     def _pick_opponent_action(ai, obs, legal):
         nets = _SHARED_STRAT_NETS
@@ -116,12 +135,12 @@ def _traversal_worker(args):
             eng.step(_pick_opponent_action(ai, obs, legal))
         rw = eng.get_rewards()
         reward = float(rw[eng.agents[player_idx]])
-        eng.close()
+        _return_engine(eng)
         return reward
 
     def _fresh_engine_at(history):
-        """Create engine with saved state, replay history, return positioned engine."""
-        eng = _make_engine(num_players)
+        """Reuse pooled engine with saved state, replay history, return positioned engine."""
+        eng = _get_engine(num_players)
         g   = eng._get_game()
         g.np_random.set_state(pre_reset_game_rng)
         g.dealer_id = pre_reset_dealer_id
@@ -130,7 +149,7 @@ def _traversal_worker(args):
             eng.step(a)
         return eng
 
-    def _branch_exact(history, legal_int, n_samples=3):
+    def _branch_exact(history, legal_int, n_samples=5):
         """Branch all legal actions, average n_samples rollouts to reduce variance."""
         return {
             ba: float(np.mean([
@@ -146,7 +165,7 @@ def _traversal_worker(args):
             with torch.no_grad():
                 obs_t  = torch.from_numpy(obs.astype(np.float32)).unsqueeze(0)
                 adv_np = _SHARED_ADV_NETS[player_idx](obs_t).numpy()[0]
-            return _regret_match(adv_np, legal_int)
+            return _regret_match(adv_np, legal_int, epsilon=epsilon)
         strat = np.zeros(_ACT_SIZE, dtype=np.float32)
         strat[legal_int] = 1.0 / len(legal_int)
         return strat
@@ -167,7 +186,7 @@ def _traversal_worker(args):
     # ── Save game state for deterministic replay ────────────────────────────
     # dealer_id (button position) is set from global np.random during engine
     # creation and is NOT part of game.np_random — save both separately.
-    engine = _make_engine(num_players)
+    engine = _get_engine(num_players)
     game   = engine._get_game()
     pre_reset_game_rng  = game.np_random.get_state()
     pre_reset_dealer_id = game.dealer_id
@@ -191,17 +210,17 @@ def _traversal_worker(args):
 
     # Check if traversal player ever got to act
     if engine.is_done():
-        engine.close()
+        _return_engine(engine)
         return []
     ca    = engine.current_agent
     ai    = engine.agents.index(ca)
     if ai != player_idx:
-        engine.close()
+        _return_engine(engine)
         return []
 
     first_obs   = engine.get_observation().copy()
     first_legal = [int(a) for a in engine.get_legal_actions()]
-    engine.close()
+    _return_engine(engine)
 
     # ── Exact external sampling at every traversal player decision ───────────
     # For each decision: branch all actions → exact rewards → exact regrets.
@@ -240,7 +259,7 @@ def _traversal_worker(args):
         history.append(action)
         eng.step(action)
 
-    eng.close()
+    _return_engine(eng)
     return all_steps
 
 
@@ -353,44 +372,64 @@ def main():
         if r < 0.95: return '↓ '
         return '→ '
 
+    def _push_weights():
+        """Copy GPU-trained weights into shared-memory CPU nets for workers."""
+        for gpu_net, cpu_net in zip(deep_cfr.advantage_networks, shared_adv_nets):
+            cpu_net.load_state_dict({k: v.cpu() for k, v in gpu_net.state_dict().items()})
+        for gpu_net, cpu_net in zip(deep_cfr.strategy_networks, shared_strat_nets):
+            cpu_net.load_state_dict({k: v.cpu() for k, v in gpu_net.state_dict().items()})
+
+    def _build_work(it):
+        return [(player_idx, num_players, it)
+                for player_idx in range(num_players)
+                for _ in range(traversals)]
+
     try:
+        async_result = None   # pending traversal results (pipeline overlap)
+
         for iteration in range(start_iter, num_iterations):
             iter_num = iteration + 1
             t0 = time.time()
 
-            # Push latest trained weights into shared memory for workers.
-            for gpu_net, cpu_net in zip(deep_cfr.advantage_networks, shared_adv_nets):
-                cpu_net.load_state_dict({k: v.cpu() for k, v in gpu_net.state_dict().items()})
-            for gpu_net, cpu_net in zip(deep_cfr.strategy_networks, shared_strat_nets):
-                cpu_net.load_state_dict({k: v.cpu() for k, v in gpu_net.state_dict().items()})
-
-            # Build work items: each traversal specifies only (player_idx, num_players)
-            work = [(player_idx, num_players)
-                    for player_idx in range(num_players)
-                    for _ in range(traversals)]
-
-            print(f'Iter {iter_num:4d}  traversing...', end='\r', flush=True)
-            raw = pool.map(_traversal_worker, work, chunksize=16)
+            # ── Collect traversal results ────────────────────────────────────
+            if async_result is not None:
+                # Pipeline: traversals were launched during previous iter's training
+                raw = async_result.get()
+                async_result = None
+            else:
+                # First iteration: push weights and traverse synchronously
+                _push_weights()
+                print(f'Iter {iter_num:4d}  traversing...', end='\r', flush=True)
+                raw = pool.map(_traversal_worker, _build_work(iter_num), chunksize=16)
             t_trav = time.time() - t0
 
-            # Add all precomputed regrets to the replay buffer
-            print(f'Iter {iter_num:4d}  computing regrets...', end='\r', flush=True)
+            # ── Add all precomputed regrets to the replay buffer ─────────────
             for steps in raw:
                 for step in steps:
                     deep_cfr.replay_buffer.add(
                         step['obs'], step['action'], step['regret'],
                         step['strategy'], step['player'], iteration=iter_num
                     )
-            t_regret = time.time() - t0 - t_trav
 
-            # Train networks
+            # ── Pipeline: push weights & launch next traversals BEFORE training
+            # Workers use current trained weights. Training below updates GPU nets
+            # but not shared memory, so no race condition. Next iter's traversals
+            # are one training step behind — negligible for Deep CFR convergence.
+            if iteration + 1 < num_iterations:
+                _push_weights()
+                async_result = pool.map_async(
+                    _traversal_worker, _build_work(iter_num + 1), chunksize=16)
+
+            # ── Train networks (GPU) — overlaps with next traversals (CPU) ───
             print(f'Iter {iter_num:4d}  training...        ', end='\r', flush=True)
+            deep_cfr.replay_buffer.rebuild_indices()
             adv_losses, strat_losses = [], []
             for _ in range(train_passes):
                 adv_losses.append(deep_cfr.train_advantage_network(batch_size))
                 strat_losses.append(deep_cfr.train_strategy_network(batch_size))
+            deep_cfr.step_schedulers()
             deep_cfr.iteration = iter_num
-            t_train = time.time() - t0 - t_trav - t_regret
+            t_train = time.time() - t0 - t_trav
 
             adv   = np.mean(adv_losses)   if adv_losses   else 0.0
             strat = np.mean(strat_losses) if strat_losses else 0.0
@@ -443,6 +482,8 @@ def main():
                     writer.add_scalar('val/pass_rate',
                                       summary['passed'] / summary['total'], iter_num)
     finally:
+        if async_result is not None:
+            async_result.wait()
         pool.terminate()
         pool.join()
         writer.close()

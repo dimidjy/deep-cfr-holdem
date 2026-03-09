@@ -36,9 +36,8 @@ FOLD       = 0
 CALL       = 1   # also covers check
 RAISE_HALF = 2
 RAISE_FULL = 3
-RAISE_2X   = 4
-ALL_IN     = 5
-AGGRESSIVE = [RAISE_HALF, RAISE_FULL, RAISE_2X, ALL_IN]
+ALL_IN     = 4
+AGGRESSIVE = [RAISE_HALF, RAISE_FULL, ALL_IN]
 
 RANK_MAP = {'2':2,'3':3,'4':4,'5':5,'6':6,'7':7,'8':8,'9':9,
             'T':10,'J':11,'Q':12,'K':13,'A':14}
@@ -457,6 +456,7 @@ def main():
                 add_equity_features=True,
                 add_street_features=True,
                 add_game_state_features=True,
+                add_betting_history_features=True,
             )
             if test_eng.get_observation_space_size() == input_size:
                 num_players = p
@@ -474,6 +474,7 @@ def main():
         add_equity_features=True,
         add_street_features=True,
         add_game_state_features=True,
+        add_betting_history_features=True,
     )
 
     config_path = Path(__file__).parent.parent / 'configs/training_config.json'

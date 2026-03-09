@@ -83,37 +83,69 @@ class StrategyNetwork(nn.Module):
 
 class ReplayBuffer:
 
-    def __init__(self, capacity: int):
+    def __init__(self, capacity: int, num_players: int = 6):
         self.capacity = capacity
-        self.buffer = deque(maxlen=capacity)
+        self.num_players = num_players
+        self.buffer = []
+        self._pos = 0
+        # Per-player index: player_idx → list of buffer indices
+        self._player_indices = [[] for _ in range(num_players)]
+        self._dirty = True
 
     def add(self, state: np.ndarray, action: int, regret: float,
             strategy: np.ndarray, player: int, iteration: int = 1):
-        priority = abs(regret) + 1e-5
-        self.buffer.append({
+        entry = {
             'state': state,
             'action': action,
             'regret': regret,
             'strategy': strategy,
             'player': player,
             'iteration': max(iteration, 1),
-            'priority': priority,
-        })
+        }
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(entry)
+        else:
+            self.buffer[self._pos] = entry
+        self._pos = (self._pos + 1) % self.capacity
+        self._dirty = True
 
-    def sample(self, batch_size: int) -> List[Dict]:
-        n = len(self.buffer)
+    def rebuild_indices(self):
+        """Rebuild per-player indices. Call once per iteration before training."""
+        for p in range(self.num_players):
+            self._player_indices[p] = []
+        for i, entry in enumerate(self.buffer):
+            p = entry['player']
+            if p < self.num_players:
+                self._player_indices[p].append(i)
+        self._dirty = False
+
+    def sample_player(self, batch_size: int, player_idx: int) -> List[Dict]:
+        """Sample batch_size entries for a specific player with iteration weighting."""
+        if self._dirty:
+            self.rebuild_indices()
+
+        indices = self._player_indices[player_idx]
+        n = len(indices)
         if n == 0:
             return []
 
-        buf_list = list(self.buffer)
-        weights = np.array(
-            [e['iteration'] * e['priority'] for e in buf_list], dtype=np.float64
-        )
+        weights = np.array([self.buffer[i]['iteration'] for i in indices], dtype=np.float64)
         weights /= weights.sum()
 
         k = min(batch_size, n)
+        chosen = np.random.choice(n, size=k, replace=False, p=weights)
+        return [self.buffer[indices[c]] for c in chosen]
+
+    def sample(self, batch_size: int) -> List[Dict]:
+        """Sample from the full buffer (iteration-weighted)."""
+        n = len(self.buffer)
+        if n == 0:
+            return []
+        weights = np.array([e['iteration'] for e in self.buffer], dtype=np.float64)
+        weights /= weights.sum()
+        k = min(batch_size, n)
         indices = np.random.choice(n, size=k, replace=False, p=weights)
-        return [buf_list[i] for i in indices]
+        return [self.buffer[i] for i in indices]
 
     def __len__(self):
         return len(self.buffer)
@@ -170,7 +202,7 @@ class DeepCFR:
             self.advantage_schedulers.append(adv_sched)
             self.strategy_schedulers.append(strat_sched)
 
-        self.replay_buffer = ReplayBuffer(buffer_size)
+        self.replay_buffer = ReplayBuffer(buffer_size, num_players=num_players)
         self.iteration = 0
 
     def get_strategy(self, observation: np.ndarray, player_idx: int,
@@ -230,12 +262,11 @@ class DeepCFR:
         if len(self.replay_buffer) < batch_size:
             return 0.0
 
-        batch = self.replay_buffer.sample(batch_size)
         total_loss = 0.0
         count = 0
 
         for player_idx in range(self.num_players):
-            player_batch = [s for s in batch if s['player'] == player_idx]
+            player_batch = self.replay_buffer.sample_player(batch_size, player_idx)
 
             if not player_batch:
                 continue
@@ -266,7 +297,6 @@ class DeepCFR:
             )
 
             self.advantage_optimizers[player_idx].step()
-            self.advantage_schedulers[player_idx].step()
             total_loss += loss.item()
             count += 1
 
@@ -276,12 +306,11 @@ class DeepCFR:
         if len(self.replay_buffer) < batch_size:
             return 0.0
 
-        batch = self.replay_buffer.sample(batch_size)
         total_loss = 0.0
         count = 0
 
         for player_idx in range(self.num_players):
-            player_batch = [s for s in batch if s['player'] == player_idx]
+            player_batch = self.replay_buffer.sample_player(batch_size, player_idx)
 
             if not player_batch:
                 continue
@@ -309,11 +338,15 @@ class DeepCFR:
             )
 
             self.strategy_optimizers[player_idx].step()
-            self.strategy_schedulers[player_idx].step()
             total_loss += loss.item()
             count += 1
 
         return total_loss / count if count > 0 else 0.0
+
+    def step_schedulers(self):
+        """Step all LR schedulers once. Call once per iteration from the main loop."""
+        for sched in self.advantage_schedulers + self.strategy_schedulers:
+            sched.step()
 
     def save_models(self, filepath: str):
         checkpoint = {

@@ -65,8 +65,8 @@ class EnhancedPokerEngine(PokerEngine):
             size += 3  # players_alive_norm, call_amount_norm, aggression_level
 
         if self.add_betting_history_features:
-            size += 5  # raise_level, my_pot_share, not_raise_fraction,
-                       # facing_3bet_plus, pot_was_raised
+            size += 5  # my_pot_share, not_raise_fraction,
+                       # facing_3bet_plus, pot_was_raised, min_opp_stack_norm
 
         return size
 
@@ -108,10 +108,18 @@ class EnhancedPokerEngine(PokerEngine):
 
                 pot = sum(p.in_chips for p in game.players)
                 my_chips = player.remained_chips
+                total_chips = self.num_players * 100  # starting stacks
 
-                pot_normalized = min(pot / 100.0, 1.0)
-                stack_to_pot = min(my_chips / max(pot, 1), 2.0) / 2.0
-                pot_odds = pot / max(pot + my_chips, 1) if pot > 0 else 0.0
+                # Pot as fraction of all chips in play (6-player: 600 total)
+                pot_normalized = float(np.clip(pot / max(total_chips, 1), 0.0, 1.0))
+                # Stack-to-pot: log scale to handle wide range (1x to 50x)
+                import math
+                raw_stp = my_chips / max(pot, 1)
+                stack_to_pot = float(np.clip(math.log1p(raw_stp) / math.log1p(50), 0.0, 1.0))
+                # Pot odds: pot / (pot + call_amount), not stack
+                max_raised = max(game.round.raised) if game.round.raised else 0
+                call_amount = max(0, max_raised - player.in_chips)
+                pot_odds = float(pot / max(pot + call_amount, 1)) if call_amount > 0 else 0.0
 
                 return np.array([pot_normalized, stack_to_pot, pot_odds], dtype=np.float32)
         except Exception:
@@ -348,15 +356,15 @@ class EnhancedPokerEngine(PokerEngine):
 
     def _get_betting_history_features(self, current_agent: str) -> np.ndarray:
         """
-        5 features capturing the betting action context:
-          raise_level        – log-scale aggression capped at 4-bet (0=limp, 1=4bet+)
+        5 features capturing betting context and opponent stack info:
           my_pot_share       – fraction of pot I've personally put in [0,1]
           not_raise_fraction – fraction of players who haven't raised this round [0,1]
           facing_3bet_plus   – 1 if max_raised > 6×BB (3-bet or more)
           pot_was_raised     – 1 if any raise occurred this round (max_raised > BB)
+          min_opp_stack_norm – smallest remaining opponent stack / 100 (short stack pressure)
         """
         try:
-            import math
+            from rlcard.games.nolimitholdem.player import PlayerStatus
             game = self._get_game()
             if game:
                 agent_idx = self.agents.index(current_agent)
@@ -365,9 +373,6 @@ class EnhancedPokerEngine(PokerEngine):
                 big_blind = game.big_blind if hasattr(game, 'big_blind') else 2
                 max_raised = max(game.round.raised) if game.round.raised else 0
                 pot = max(sum(p.in_chips for p in game.players), 1)
-
-                ratio = max(max_raised, big_blind) / big_blind
-                raise_level = float(np.clip(math.log(ratio) / math.log(40), 0.0, 1.0))
 
                 my_pot_share = float(np.clip(player.in_chips / pot, 0.0, 1.0))
 
@@ -378,9 +383,17 @@ class EnhancedPokerEngine(PokerEngine):
                 facing_3bet_plus = 1.0 if max_raised > 6 * big_blind else 0.0
                 pot_was_raised   = 1.0 if max_raised > big_blind else 0.0
 
+                # Smallest active opponent stack (normalized by starting stack)
+                opp_stacks = [
+                    p.remained_chips for i, p in enumerate(game.players)
+                    if i != agent_idx and p.status != PlayerStatus.FOLDED
+                ]
+                min_opp_stack = min(opp_stacks) if opp_stacks else 0
+                min_opp_stack_norm = float(np.clip(min_opp_stack / 100.0, 0.0, 1.0))
+
                 return np.array(
-                    [raise_level, my_pot_share, not_raise_fraction,
-                     facing_3bet_plus, pot_was_raised],
+                    [my_pot_share, not_raise_fraction,
+                     facing_3bet_plus, pot_was_raised, min_opp_stack_norm],
                     dtype=np.float32
                 )
         except Exception:
