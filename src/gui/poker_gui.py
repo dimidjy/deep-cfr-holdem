@@ -126,14 +126,16 @@ class PokerGUI:
         n = len(self.engine.agents)
         cx, cy = self.WINDOW_WIDTH // 2, self.WINDOW_HEIGHT // 2
         # Positions for each seat count
+        # Positions must stay within the central play area: x=[310, 890], y=[80, 720]
+        # Side panels occupy x<300 (history) and x>900 (game info)
         positions_map = {
-            2: [(cx, self.WINDOW_HEIGHT - 200), (cx, 120)],
-            3: [(cx, self.WINDOW_HEIGHT - 200), (cx + 320, 200), (cx - 320, 200)],
-            4: [(cx, self.WINDOW_HEIGHT - 200), (cx + 380, cy), (cx, 120), (cx - 380, cy)],
-            5: [(cx, self.WINDOW_HEIGHT - 200), (cx + 350, self.WINDOW_HEIGHT - 350),
-                (cx + 350, 200), (cx - 350, 200), (cx - 350, self.WINDOW_HEIGHT - 350)],
-            6: [(cx, self.WINDOW_HEIGHT - 200), (cx + 380, self.WINDOW_HEIGHT - 350),
-                (cx + 380, 200), (cx, 120), (cx - 380, 200), (cx - 380, self.WINDOW_HEIGHT - 350)],
+            2: [(cx, self.WINDOW_HEIGHT - 200), (cx, 130)],
+            3: [(cx, self.WINDOW_HEIGHT - 200), (cx + 220, 200), (cx - 220, 200)],
+            4: [(cx, self.WINDOW_HEIGHT - 200), (cx + 240, cy), (cx, 130), (cx - 240, cy)],
+            5: [(cx, self.WINDOW_HEIGHT - 200), (cx + 230, self.WINDOW_HEIGHT - 340),
+                (cx + 230, 200), (cx - 230, 200), (cx - 230, self.WINDOW_HEIGHT - 340)],
+            6: [(cx, self.WINDOW_HEIGHT - 200), (cx + 230, self.WINDOW_HEIGHT - 340),
+                (cx + 230, 200), (cx, 130), (cx - 230, 200), (cx - 230, self.WINDOW_HEIGHT - 340)],
         }
         return positions_map.get(n, positions_map[6])
 
@@ -424,19 +426,10 @@ class PokerGUI:
             if self.ai_model:
                 observation = self.engine.get_observation()
                 legal_actions = self.state['legal_actions']
-                # Use advantage network + regret-matching (current strategy,
-                # not the historical average from strategy_network)
-                advantages = self.ai_model.compute_counterfactual_values(
+                # Use average strategy network (converged equilibrium)
+                strategy = self.ai_model.get_strategy(
                     observation, agent_idx, legal_actions
                 )
-                pos_adv = np.maximum(advantages, 0.0)
-                s = pos_adv.sum()
-                if s > 0:
-                    strategy = pos_adv / s
-                else:
-                    mask = np.zeros(self.ai_model.action_size)
-                    mask[legal_actions] = 1.0
-                    strategy = mask / mask.sum()
                 legal_strategy = strategy[legal_actions]
                 legal_strategy /= legal_strategy.sum()
                 ai_action = np.random.choice(legal_actions, p=legal_strategy)

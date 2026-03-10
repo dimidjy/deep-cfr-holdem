@@ -43,3 +43,4 @@ data/cache/
 *.swp
 *.swo
 models/*
+good_models/*
