@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from src.gui import PokerGUI
 from src.training import DeepCFR, ModelAdapter
 from src.engine import EnhancedPokerEngine
+from src.search import DepthLimitedSearch, PlaytimeStrategy
 import torch
 
 
@@ -99,7 +100,13 @@ def main():
     parser.add_argument('--model', type=str, help='Path to enhanced model file')
     parser.add_argument('--list', action='store_true', help='List available models')
     parser.add_argument('--players', type=int, default=6, help='Number of players fallback if auto-detect fails (default: 6)')
-    
+    parser.add_argument('--search', action='store_true', help='Enable depth-limited search for stronger AI play')
+    parser.add_argument('--search-depth', type=int, default=2, help='Search depth in traverser plies (default: 2)')
+    parser.add_argument('--search-iters', type=int, default=50, help='CFR iterations per search (default: 50)')
+    parser.add_argument('--search-rollouts', type=int, default=10, help='Rollouts per action branch (default: 10)')
+    parser.add_argument('--no-refine', action='store_true', help='Disable play-time strategy refinement (temperature + all-in penalty)')
+    parser.add_argument('--temperature', type=float, default=0.5, help='Strategy temperature (lower=sharper, default: 0.5)')
+
     args = parser.parse_args()
     
     if args.list:
@@ -127,8 +134,33 @@ def main():
         print("    python3 scripts/play_gui_vs_model.py --model", args.model)
         return
 
+    # Set up depth-limited search if requested
+    search = None
+    if args.search:
+        search = DepthLimitedSearch(
+            deep_cfr,
+            num_rollouts=args.search_rollouts,
+            cfr_iters=args.search_iters,
+            max_depth=args.search_depth,
+        )
+        print(f"\n  Search enabled: depth={args.search_depth}, "
+              f"iters={args.search_iters}, rollouts={args.search_rollouts}")
+
+    # Set up play-time strategy refinement (on by default)
+    refiner = None
+    if not args.no_refine:
+        refiner = PlaytimeStrategy(
+            deep_cfr,
+            num_players=trained_players,
+            temperature=args.temperature,
+            allin_penalty=True,
+        )
+        print(f"  Strategy refinement: temperature={args.temperature}, all-in penalty=ON")
+
     print("\n" + "="*60)
     print(f"Starting GUI - You vs {trained_players - 1} AI opponents ({trained_players}-player game)")
+    if search:
+        print("  (Depth-limited search ON — AI will think longer but play stronger)")
     print("="*60)
     print("Controls:")
     print("  - Click buttons to take actions")
@@ -137,7 +169,8 @@ def main():
     print("  - Q: Quit")
     print("="*60 + "\n")
 
-    gui = PokerGUI(num_players=trained_players, ai_model=deep_cfr)
+    gui = PokerGUI(num_players=trained_players, ai_model=deep_cfr,
+                   ai_search=search, ai_strategy_refiner=refiner)
     gui.engine = engine
     gui.engine.reset()
     gui.run()

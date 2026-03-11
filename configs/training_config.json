@@ -5,13 +5,13 @@
   "training": {
     "num_iterations": 4000,
     "batch_size": 32768,
-    "learning_rate": 0.0003,
-    "buffer_size": 2000000,
-    "traversals_per_iteration": 10000,
+    "learning_rate": 0.0001,
+    "buffer_size": 5000000,
+    "traversals_per_iteration": 6000,
     "checkpoint_interval": 50,
-    "train_passes": 25,
+    "train_passes": 15,
     "gradient_clip": 1.0,
-    "lr_scheduler_t_max": 4000
+    "lr_scheduler_t_max": 2000
   },
   "network": {
     "hidden_layers": [512, 512, 256],

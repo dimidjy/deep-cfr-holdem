@@ -192,8 +192,8 @@ class DeepCFR:
             adv_opt = optim.Adam(adv_net.parameters(), lr=learning_rate)
             strat_opt = optim.Adam(strat_net.parameters(), lr=learning_rate)
 
-            adv_sched = optim.lr_scheduler.CosineAnnealingLR(adv_opt, T_max=lr_scheduler_t_max)
-            strat_sched = optim.lr_scheduler.CosineAnnealingLR(strat_opt, T_max=lr_scheduler_t_max)
+            adv_sched = optim.lr_scheduler.LinearLR(adv_opt, start_factor=1.0, end_factor=0.1, total_iters=lr_scheduler_t_max)
+            strat_sched = optim.lr_scheduler.LinearLR(strat_opt, start_factor=1.0, end_factor=0.1, total_iters=lr_scheduler_t_max)
 
             self.advantage_networks.append(adv_net)
             self.strategy_networks.append(strat_net)

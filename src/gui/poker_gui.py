@@ -35,7 +35,8 @@ class PokerGUI:
     BUTTON_HOVER_COLOR = (100, 160, 210)
     HIGHLIGHT_COLOR = (255, 215, 0)
     
-    def __init__(self, num_players: int = 2, ai_model=None):
+    def __init__(self, num_players: int = 2, ai_model=None, ai_search=None,
+                 ai_strategy_refiner=None):
         pygame.init()
         self.screen = pygame.display.set_mode((self.WINDOW_WIDTH, self.WINDOW_HEIGHT))
         
@@ -67,7 +68,12 @@ class PokerGUI:
         self.result_counted = False
         
         self.ai_model = ai_model
-        self.ai_name = "Trained AI" if ai_model else "AI (Random)"
+        self.ai_search = ai_search
+        self.ai_strategy_refiner = ai_strategy_refiner
+        suffix = ""
+        if ai_search: suffix += " + Search"
+        if ai_strategy_refiner: suffix += " + Refined"
+        self.ai_name = ("Trained AI" + suffix) if ai_model else "AI (Random)"
         self.show_opponent_cards = False
         
     def reset_game(self):
@@ -424,12 +430,20 @@ class PokerGUI:
             agent_idx = self.engine.agents.index(current_agent)
 
             if self.ai_model:
-                observation = self.engine.get_observation()
                 legal_actions = self.state['legal_actions']
-                # Use average strategy network (converged equilibrium)
-                strategy = self.ai_model.get_strategy(
-                    observation, agent_idx, legal_actions
-                )
+                observation = self.engine.get_observation()
+                if self.ai_search:
+                    strategy = self.ai_search.search(
+                        self.engine, agent_idx, legal_actions
+                    )
+                elif self.ai_strategy_refiner:
+                    strategy = self.ai_strategy_refiner.get_strategy(
+                        observation, agent_idx, legal_actions
+                    )
+                else:
+                    strategy = self.ai_model.get_strategy(
+                        observation, agent_idx, legal_actions
+                    )
                 legal_strategy = strategy[legal_actions]
                 legal_strategy /= legal_strategy.sum()
                 ai_action = np.random.choice(legal_actions, p=legal_strategy)

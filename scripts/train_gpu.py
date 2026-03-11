@@ -166,14 +166,17 @@ def _traversal_worker(args):
         return eng
 
     def _branch_exact(history, legal_int, n_samples=5):
-        """Branch all legal actions, average n_samples rollouts to reduce variance."""
-        return {
-            ba: float(np.mean([
+        """Branch all legal actions, average n_samples rollouts to reduce variance.
+        All-in (action 4) gets 2x samples because its variance is much higher
+        (winning +3 or losing -98 vs fold which is always ~-1)."""
+        results = {}
+        for ba in legal_int:
+            n = n_samples * 2 if ba == 4 else n_samples  # all-in needs more samples
+            results[ba] = float(np.mean([
                 _run_to_terminal(_fresh_engine_at(history + [ba]))
-                for _ in range(n_samples)
+                for _ in range(n)
             ]))
-            for ba in legal_int
-        }
+        return results
 
     def _strategy_for(obs, legal_int):
         """Regret-matching strategy from advantage network."""
@@ -336,15 +339,30 @@ def main():
     )
 
     start_iter = 0
+    cfg_lr = config['training']['learning_rate']
+    cfg_t_max = config['training'].get('lr_scheduler_t_max', 2000)
     if args.resume:
         deep_cfr.load_models(args.resume)
         start_iter = deep_cfr.iteration
         print(f'Resumed from checkpoint — iteration {start_iter}')
-        if args.lr:
-            for opt in deep_cfr.advantage_optimizers + deep_cfr.strategy_optimizers:
-                for pg in opt.param_groups:
-                    pg['lr'] = args.lr
-            print(f'LR overridden to {args.lr}')
+
+        # Override LR: use --lr flag if given, otherwise use config value
+        new_lr = args.lr if args.lr else cfg_lr
+        for opt in deep_cfr.advantage_optimizers + deep_cfr.strategy_optimizers:
+            for pg in opt.param_groups:
+                pg['lr'] = new_lr
+
+        # Rebuild schedulers from config so new T_max / LR take effect
+        from torch.optim import lr_scheduler
+        deep_cfr.advantage_schedulers = [
+            lr_scheduler.LinearLR(opt, start_factor=1.0, end_factor=0.1, total_iters=cfg_t_max)
+            for opt in deep_cfr.advantage_optimizers
+        ]
+        deep_cfr.strategy_schedulers = [
+            lr_scheduler.LinearLR(opt, start_factor=1.0, end_factor=0.1, total_iters=cfg_t_max)
+            for opt in deep_cfr.strategy_optimizers
+        ]
+        print(f'LR set to {new_lr}, schedulers rebuilt (T_max={cfg_t_max})')
 
     # Shared-memory CPU copies so workers can read current network weights.
     shared_adv_nets = []
@@ -444,10 +462,23 @@ def main():
                     _traversal_worker, _build_work(iter_num + 1), chunksize=16)
 
             # ── Train networks (GPU) — overlaps with next traversals (CPU) ───
+            # Buffer warmup: after resume the buffer starts empty. Training on a
+            # tiny buffer causes catastrophic overfitting (network sees all data
+            # 15x per iteration). Scale train_passes by buffer fullness so we
+            # only do full training once the buffer has enough diverse samples.
+            # Minimum threshold: 10× batch_size (~320K entries, ~7 iterations).
+            buf_len = len(deep_cfr.replay_buffer)
+            min_buf = batch_size * 10
+            if buf_len < min_buf:
+                warmup_ratio = buf_len / min_buf
+                effective_passes = max(1, int(train_passes * warmup_ratio))
+            else:
+                effective_passes = train_passes
+
             print(f'Iter {iter_num:4d}  training...        ', end='\r', flush=True)
             deep_cfr.replay_buffer.rebuild_indices()
             adv_losses, strat_losses = [], []
-            for _ in range(train_passes):
+            for _ in range(effective_passes):
                 adv_losses.append(deep_cfr.train_advantage_network(batch_size))
                 strat_losses.append(deep_cfr.train_strategy_network(batch_size))
             deep_cfr.step_schedulers()
@@ -461,6 +492,7 @@ def main():
             _adv_hist.append(adv)
             _strat_hist.append(strat)
 
+            warmup_tag = f'  warmup={effective_passes}/{train_passes}' if effective_passes < train_passes else ''
             print(
                 f'Iter {iter_num:4d}/{num_iterations}'
                 f'  buf={len(deep_cfr.replay_buffer):>7d}'
@@ -469,6 +501,7 @@ def main():
                 f'  trav={t_trav:.1f}s'
                 f'  train={t_train:.1f}s'
                 f'  total={total:.1f}s'
+                f'{warmup_tag}'
             )
 
             # ── TensorBoard: per-iteration metrics ──────────────────────────

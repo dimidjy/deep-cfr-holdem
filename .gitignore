@@ -44,3 +44,4 @@ data/cache/
 *.swo
 models/*
 good_models/*
+data/*
