@@ -9,19 +9,23 @@ class PokerValidator:
         return action in legal_actions
     
     @staticmethod
-    def validate_observation(observation: Dict[str, Any]) -> bool:
-        required_keys = ['observation', 'action_mask']
-        
-        if not all(key in observation for key in required_keys):
-            return False
-        
-        if not isinstance(observation['observation'], np.ndarray):
-            return False
-        
-        if not isinstance(observation['action_mask'], np.ndarray):
-            return False
-        
-        return True
+    def validate_observation(observation) -> bool:
+        # Fast engine: observation is a numpy array or None
+        if isinstance(observation, np.ndarray):
+            return True
+        if observation is None:
+            return True
+        # Legacy PettingZoo format: dict with 'observation' and 'action_mask'
+        if isinstance(observation, dict):
+            required_keys = ['observation', 'action_mask']
+            if not all(key in observation for key in required_keys):
+                return False
+            if not isinstance(observation['observation'], np.ndarray):
+                return False
+            if not isinstance(observation['action_mask'], np.ndarray):
+                return False
+            return True
+        return False
     
     @staticmethod
     def validate_game_state(state: Dict[str, Any]) -> bool:

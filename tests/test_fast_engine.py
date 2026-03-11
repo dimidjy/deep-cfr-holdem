@@ -22,10 +22,11 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from src.engine import (
-    EnhancedPokerEngine,
     FastPokerEngine,
     FastEnhancedPokerEngine,
 )
+# Import legacy PettingZoo engine directly for comparison tests
+from src.engine.poker_engine_enhanced import EnhancedPokerEngine as LegacyEnhancedPokerEngine
 
 
 # ── 1. Basic game flow ──────────────────────────────────────────────────────
@@ -203,14 +204,14 @@ class TestFeatures:
 
     def test_obs_size_matches_old_engine(self):
         """Feature vector size should match between old and new engines."""
-        old = EnhancedPokerEngine(num_players=6)
+        old = LegacyEnhancedPokerEngine(num_players=6)
         new = FastEnhancedPokerEngine(num_players=6)
         assert old.get_observation_space_size() == new.get_observation_space_size(), \
             f"Size mismatch: old={old.get_observation_space_size()} vs new={new.get_observation_space_size()}"
         old.close()
 
     def test_obs_size_2_players(self):
-        old = EnhancedPokerEngine(num_players=2)
+        old = LegacyEnhancedPokerEngine(num_players=2)
         new = FastEnhancedPokerEngine(num_players=2)
         assert old.get_observation_space_size() == new.get_observation_space_size()
         old.close()
@@ -416,7 +417,7 @@ class TestPerformance:
         fast_time = time.time() - t0
 
         # PettingZoo engine
-        old = EnhancedPokerEngine(num_players=6)
+        old = LegacyEnhancedPokerEngine(num_players=6)
         from pettingzoo.classic import texas_holdem_no_limit_v6
         env = texas_holdem_no_limit_v6.env(num_players=6)
         t0 = time.time()
@@ -505,7 +506,7 @@ class TestFeatureParity:
 
     def test_feature_dimensions_match(self):
         """Both engines produce same number of features."""
-        old = EnhancedPokerEngine(num_players=6)
+        old = LegacyEnhancedPokerEngine(num_players=6)
         new = FastEnhancedPokerEngine(num_players=6)
         assert old.get_observation_space_size() == new.get_observation_space_size()
         old.close()
@@ -513,7 +514,7 @@ class TestFeatureParity:
     def test_feature_ranges_similar(self):
         """Feature min/max ranges should be similar between engines."""
         np.random.seed(123)
-        old_obs = self._collect_features(EnhancedPokerEngine, n_games=300)
+        old_obs = self._collect_features(LegacyEnhancedPokerEngine, n_games=300)
         np.random.seed(123)
         new_obs = self._collect_features(FastEnhancedPokerEngine, n_games=300)
 
@@ -537,7 +538,7 @@ class TestFeatureParity:
         We check that no feature is completely broken (always 0 in one, nonzero in other).
         """
         np.random.seed(456)
-        old_obs = self._collect_features(EnhancedPokerEngine, n_games=500)
+        old_obs = self._collect_features(LegacyEnhancedPokerEngine, n_games=500)
         np.random.seed(456)
         new_obs = self._collect_features(FastEnhancedPokerEngine, n_games=500)
 
@@ -658,7 +659,7 @@ class TestFeatureParity:
         """Reward distributions should be similar between engines."""
         np.random.seed(789)
         old_rewards = []
-        old_eng = EnhancedPokerEngine(num_players=6)
+        old_eng = LegacyEnhancedPokerEngine(num_players=6)
         for _ in range(500):
             old_eng.reset()
             while not old_eng.is_done():

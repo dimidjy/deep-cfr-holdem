@@ -44,7 +44,7 @@ class TestIntegration:
             steps = 0
             
             while not engine.is_done() and steps < 1000:
-                legal_actions = engine._get_legal_actions()
+                legal_actions = engine.get_legal_actions()
                 if not legal_actions:
                     break
                 
@@ -63,7 +63,7 @@ class TestIntegration:
         engine = PokerEngine(num_players=2)
         engine.reset()
         
-        legal_actions = engine._get_legal_actions()
+        legal_actions = engine.get_legal_actions()
         
         fold_action = None
         for action in legal_actions:
@@ -100,7 +100,7 @@ class TestIntegration:
         action_space_size = engine.get_action_space_size()
         
         for _ in range(10):
-            legal_actions = engine._get_legal_actions()
+            legal_actions = engine.get_legal_actions()
             if not legal_actions:
                 break
             

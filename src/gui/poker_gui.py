@@ -1,7 +1,7 @@
 import pygame
 import numpy as np
 from typing import Dict, List, Optional, Any
-from src.engine import PokerEngine
+from src.engine import FastPokerEngine
 
 
 class CardRenderer:
@@ -36,7 +36,7 @@ class PokerGUI:
     HIGHLIGHT_COLOR = (255, 215, 0)
     
     def __init__(self, num_players: int = 2, ai_model=None, ai_search=None,
-                 ai_strategy_refiner=None):
+                 ai_strategy_refiner=None, preflop_ranges=None):
         pygame.init()
         self.screen = pygame.display.set_mode((self.WINDOW_WIDTH, self.WINDOW_HEIGHT))
         
@@ -50,7 +50,7 @@ class PokerGUI:
         self.font_small = pygame.font.Font(None, 24)
         self.font_card = pygame.font.Font(None, 32)
         
-        self.engine = PokerEngine(num_players=num_players)
+        self.engine = FastPokerEngine(num_players=num_players)
         self.state = None
         self.running = True
         self.clock = pygame.time.Clock()
@@ -70,6 +70,7 @@ class PokerGUI:
         self.ai_model = ai_model
         self.ai_search = ai_search
         self.ai_strategy_refiner = ai_strategy_refiner
+        self.preflop_ranges = preflop_ranges
         suffix = ""
         if ai_search: suffix += " + Search"
         if ai_strategy_refiner: suffix += " + Refined"
@@ -432,18 +433,32 @@ class PokerGUI:
             if self.ai_model:
                 legal_actions = self.state['legal_actions']
                 observation = self.engine.get_observation()
-                if self.ai_search:
-                    strategy = self.ai_search.search(
-                        self.engine, agent_idx, legal_actions
-                    )
-                elif self.ai_strategy_refiner:
-                    strategy = self.ai_strategy_refiner.get_strategy(
-                        observation, agent_idx, legal_actions
-                    )
-                else:
-                    strategy = self.ai_model.get_strategy(
-                        observation, agent_idx, legal_actions
-                    )
+                # Preflop: use GTO range override if available
+                use_range = False
+                if self.preflop_ranges is not None and self.engine.get_stage() == 'Preflop':
+                    agent = self.engine.agents[agent_idx]
+                    cards = self.engine.get_player_cards(agent)
+                    if cards and len(cards) >= 2:
+                        button_idx = self.engine._button
+                        rel_pos = (agent_idx - button_idx) % len(self.engine.agents)
+                        pot_bb = self.engine.get_pot_size() / 2.0
+                        strategy = self.preflop_ranges.get_strategy(
+                            cards, rel_pos, pot_bb, legal_actions,
+                            self.engine.get_action_space_size())
+                        use_range = True
+                if not use_range:
+                    if self.ai_search:
+                        strategy = self.ai_search.search(
+                            self.engine, agent_idx, legal_actions
+                        )
+                    elif self.ai_strategy_refiner:
+                        strategy = self.ai_strategy_refiner.get_strategy(
+                            observation, agent_idx, legal_actions
+                        )
+                    else:
+                        strategy = self.ai_model.get_strategy(
+                            observation, agent_idx, legal_actions
+                        )
                 legal_strategy = strategy[legal_actions]
                 legal_strategy /= legal_strategy.sum()
                 ai_action = np.random.choice(legal_actions, p=legal_strategy)

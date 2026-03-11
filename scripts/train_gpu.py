@@ -27,7 +27,6 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from torch.utils.tensorboard import SummaryWriter
 
-from src.engine import EnhancedPokerEngine
 from src.training import DeepCFR
 from src.utils import load_config
 from validate_spots import run_validation, validation_summary_line
@@ -44,6 +43,9 @@ _REGRET_CLIP  = 1.0
 # Worker-local engine pool — reuse PettingZoo envs instead of recreating per branch
 _ENGINE_POOL = []
 
+# Preflop range override — loaded once per worker
+_PREFLOP_RANGES = None      # PreflopRanges instance (or None if disabled)
+
 
 def _get_engine(num_players):
     """Get engine from pool or create new one."""
@@ -58,11 +60,16 @@ def _return_engine(eng):
     _ENGINE_POOL.append(eng)
 
 
-def _worker_init(shared_adv, shared_strat, act_size):
-    global _SHARED_ADV_NETS, _SHARED_STRAT_NETS, _ACT_SIZE
+def _worker_init(shared_adv, shared_strat, act_size, use_preflop_ranges=False):
+    global _SHARED_ADV_NETS, _SHARED_STRAT_NETS, _ACT_SIZE, _PREFLOP_RANGES
     _SHARED_ADV_NETS  = shared_adv
     _SHARED_STRAT_NETS = shared_strat
     _ACT_SIZE          = act_size
+    if use_preflop_ranges:
+        from src.preflop_ranges import PreflopRanges
+        _PREFLOP_RANGES = PreflopRanges()
+    else:
+        _PREFLOP_RANGES = None
     warnings.filterwarnings('ignore')
     logging.disable(logging.WARNING)
     os.environ['GYMNASIUM_DISABLE_LOGGING'] = '1'
@@ -79,23 +86,7 @@ def _regret_match(adv, legal, epsilon=0.05):
     return strategy
 
 
-_USE_FAST_ENGINE = False   # set from main() based on --engine flag
-
-
 def _make_engine(num_players):
-    if _USE_FAST_ENGINE:
-        from src.engine import FastEnhancedPokerEngine
-        return FastEnhancedPokerEngine(
-            num_players=num_players,
-            add_position_features=True,
-            add_pot_odds_features=True,
-            add_hand_strength_features=True,
-            add_stack_features=True,
-            add_equity_features=True,
-            add_street_features=True,
-            add_game_state_features=True,
-            add_betting_history_features=True,
-        )
     from src.engine import EnhancedPokerEngine
     return EnhancedPokerEngine(
         num_players=num_players,
@@ -110,6 +101,21 @@ def _make_engine(num_players):
     )
 
 
+def _get_preflop_info(eng, player_idx, num_players):
+    """Extract hole cards, relative position, and pot in BB for preflop override."""
+    agent = eng.agents[player_idx]
+    cards = eng.get_player_cards(agent)  # e.g. ['As', 'Kh']
+
+    # Relative position
+    button_idx = eng._button
+    rel_pos = (player_idx - button_idx) % num_players
+
+    # Pot in BB (BB = 2 chips)
+    pot_bb = eng.get_pot_size() / 2.0
+
+    return cards, rel_pos, pot_bb
+
+
 def _traversal_worker(args):
     """
     External-sampling MCCFR with exact regrets at every traversal player decision.
@@ -121,13 +127,28 @@ def _traversal_worker(args):
 
     All branches replay the full action history from game start using the
     saved game.np_random + dealer_id for identical card deals every time.
+
+    If _PREFLOP_RANGES is set, preflop decisions use range charts instead
+    of the neural network. Regrets are still computed and stored so the
+    advantage network learns the correct preflop values over time.
     """
-    global _SHARED_ADV_NETS, _SHARED_STRAT_NETS, _ACT_SIZE
+    global _SHARED_ADV_NETS, _SHARED_STRAT_NETS, _ACT_SIZE, _PREFLOP_RANGES
     player_idx, num_players, current_iter = args
     # Decay exploration: 5% early → 1% by iter 2000
     epsilon = max(0.01, 0.05 * (1.0 - current_iter / 3000.0))
 
-    def _pick_opponent_action(ai, obs, legal):
+    def _pick_opponent_action(ai, obs, legal, eng=None, is_preflop=False):
+        # Preflop override for opponents too
+        if is_preflop and _PREFLOP_RANGES is not None and eng is not None:
+            cards, rel_pos, pot_bb = _get_preflop_info(eng, ai, num_players)
+            if cards and len(cards) >= 2:
+                strat = _PREFLOP_RANGES.get_strategy(
+                    cards, rel_pos, pot_bb, legal, _ACT_SIZE)
+                lp = strat[legal].copy()
+                s = lp.sum()
+                lp = lp / s if s > 0 else np.ones(len(legal)) / len(legal)
+                return int(np.random.choice(legal, p=lp))
+
         nets = _SHARED_STRAT_NETS
         if nets is not None:
             with torch.no_grad():
@@ -148,7 +169,8 @@ def _traversal_worker(args):
             legal = eng.get_legal_actions()
             if not legal:
                 break
-            eng.step(_pick_opponent_action(ai, obs, legal))
+            is_pf = (eng.get_stage() == 'Preflop') if _PREFLOP_RANGES else False
+            eng.step(_pick_opponent_action(ai, obs, legal, eng, is_pf))
         rw = eng.get_rewards()
         reward = float(rw[eng.agents[player_idx]])
         _return_engine(eng)
@@ -223,7 +245,8 @@ def _traversal_worker(args):
             break
         if ai == player_idx:
             break
-        action = _pick_opponent_action(ai, obs, legal)
+        is_pf = (engine.get_stage() == 'Preflop') if _PREFLOP_RANGES else False
+        action = _pick_opponent_action(ai, obs, legal, engine, is_pf)
         history.append(action)
         engine.step(action)
 
@@ -246,15 +269,31 @@ def _traversal_worker(args):
     # Then sample one action from strategy and advance.
     all_steps = []
 
-    # Preflop decision
+    # Preflop decision — use range override if available
     branch_rewards = _branch_exact(history, first_legal)
-    strategy       = _strategy_for(first_obs, first_legal)
-    all_steps     += _make_steps(first_obs, first_legal, branch_rewards, strategy)
+
+    if _PREFLOP_RANGES is not None:
+        # Use range chart for preflop strategy (both for action selection
+        # and as the strategy stored in the buffer for strategy network training)
+        # Need a fresh engine positioned at current state to read cards
+        probe_eng = _fresh_engine_at(history)
+        cards, rel_pos, pot_bb = _get_preflop_info(probe_eng, player_idx, num_players)
+        _return_engine(probe_eng)
+
+        if cards and len(cards) >= 2:
+            strategy = _PREFLOP_RANGES.get_strategy(
+                cards, rel_pos, pot_bb, first_legal, _ACT_SIZE)
+        else:
+            strategy = _strategy_for(first_obs, first_legal)
+    else:
+        strategy = _strategy_for(first_obs, first_legal)
+
+    all_steps += _make_steps(first_obs, first_legal, branch_rewards, strategy)
 
     lp = strategy[first_legal].copy(); lp /= lp.sum()
     history.append(int(np.random.choice(first_legal, p=lp)))
 
-    # Postflop decisions
+    # Remaining decisions (postflop, or additional preflop actions like re-raises)
     eng = _fresh_engine_at(history)
     while not eng.is_done():
         ca    = eng.current_agent
@@ -264,16 +303,29 @@ def _traversal_worker(args):
         if not legal:
             break
 
+        is_pf = (eng.get_stage() == 'Preflop') if _PREFLOP_RANGES else False
+
         if ai == player_idx:
             legal_int      = [int(a) for a in legal]
             branch_rewards = _branch_exact(history, legal_int)
-            strategy       = _strategy_for(obs.copy(), legal_int)
-            all_steps     += _make_steps(obs.copy(), legal_int, branch_rewards, strategy)
+
+            if is_pf:
+                # Still preflop (e.g. facing 3bet after our open) — use range override
+                cards, rel_pos, pot_bb = _get_preflop_info(eng, player_idx, num_players)
+                if cards and len(cards) >= 2:
+                    strategy = _PREFLOP_RANGES.get_strategy(
+                        cards, rel_pos, pot_bb, legal_int, _ACT_SIZE)
+                else:
+                    strategy = _strategy_for(obs.copy(), legal_int)
+            else:
+                strategy = _strategy_for(obs.copy(), legal_int)
+
+            all_steps += _make_steps(obs.copy(), legal_int, branch_rewards, strategy)
 
             lp = strategy[legal_int].copy(); lp /= lp.sum()
             action = int(np.random.choice(legal_int, p=lp))
         else:
-            action = _pick_opponent_action(ai, obs, legal)
+            action = _pick_opponent_action(ai, obs, legal, eng, is_pf)
 
         history.append(action)
         eng.step(action)
@@ -292,13 +344,14 @@ def main():
     parser.add_argument('--workers', type=int,   default=None, help='CPU worker count (default: cpu_count - 1)')
     parser.add_argument('--device',  type=str,   default=None, help='cuda | cpu (auto-detected if omitted)')
     parser.add_argument('--lr',      type=float, default=None, help='Override learning rate after resume')
-    parser.add_argument('--engine',  type=str,   default='pettingzoo',
-                        choices=['pettingzoo', 'fast'],
-                        help='Game engine backend: pettingzoo (default) or fast (Rust-backed, ~30x faster)')
+    parser.add_argument('--preflop-ranges', action='store_true', default=True,
+                        help='Lock preflop play to GTO ranges from configs/preflop_ranges.json (default: on)')
+    parser.add_argument('--no-preflop-ranges', action='store_true',
+                        help='Disable preflop range override, let neural net learn preflop')
     args = parser.parse_args()
 
-    global _USE_FAST_ENGINE
-    _USE_FAST_ENGINE = (args.engine == 'fast')
+    if args.no_preflop_ranges:
+        args.preflop_ranges = False
 
     config_path = Path(__file__).parent.parent / 'configs/training_config.json'
     config = load_config(str(config_path))
@@ -313,7 +366,8 @@ def main():
     print(f'  device   : {device}')
     if device == 'cuda':
         print(f'  GPU      : {torch.cuda.get_device_name(0)}')
-    print(f'  engine   : {"fast (Rust)" if _USE_FAST_ENGINE else "pettingzoo (RLCard)"}')
+    print(f'  engine   : fast (Rust)')
+    print(f'  preflop  : {"GTO ranges (locked)" if args.preflop_ranges else "neural net (learned)"}')
     print(f'  workers  : {num_workers}')
     print(f'  players  : {num_players}')
     print(f'  iters    : {config["training"]["num_iterations"]}')
@@ -395,7 +449,8 @@ def main():
     print(f'Spawning {num_workers} workers...')
 
     pool = Pool(processes=num_workers, initializer=_worker_init,
-                initargs=(shared_adv_nets, shared_strat_nets, act_size))
+                initargs=(shared_adv_nets, shared_strat_nets, act_size,
+                          args.preflop_ranges))
     print('Workers ready.\n')
 
     _adv_hist   = deque(maxlen=10)

@@ -24,7 +24,7 @@ class TestPokerEngine:
         engine = PokerEngine(num_players=2)
         engine.reset()
         
-        legal_actions = engine._get_legal_actions()
+        legal_actions = engine.get_legal_actions()
         assert len(legal_actions) > 0
         assert all(isinstance(action, int) for action in legal_actions)
     
@@ -32,7 +32,7 @@ class TestPokerEngine:
         engine = PokerEngine(num_players=2)
         engine.reset()
         
-        legal_actions = engine._get_legal_actions()
+        legal_actions = engine.get_legal_actions()
         action = legal_actions[0]
         
         result = engine.step(action)
@@ -50,7 +50,7 @@ class TestPokerEngine:
         steps = 0
         
         while not engine.is_done() and steps < max_steps:
-            legal_actions = engine._get_legal_actions()
+            legal_actions = engine.get_legal_actions()
             if not legal_actions:
                 break
             
@@ -67,7 +67,7 @@ class TestPokerEngine:
         obs1 = engine.get_observation()
         shape1 = obs1.shape
         
-        legal_actions = engine._get_legal_actions()
+        legal_actions = engine.get_legal_actions()
         if legal_actions:
             engine.step(legal_actions[0])
             obs2 = engine.get_observation()
@@ -104,7 +104,7 @@ class TestPokerEngine:
             engine.reset()
             
             while not engine.is_done():
-                legal_actions = engine._get_legal_actions()
+                legal_actions = engine.get_legal_actions()
                 if not legal_actions:
                     break
                 action = np.random.choice(legal_actions)

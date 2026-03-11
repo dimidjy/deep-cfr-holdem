@@ -6,9 +6,10 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from src.engine import PokerEngine
+from src.engine import FastEnhancedPokerEngine
 from src.training import DeepCFR
 from src.search import DepthLimitedSearch, PlaytimeStrategy
+from src.preflop_ranges import PreflopRanges
 
 
 MODEL_PATH = "models/final_model.pt"
@@ -20,6 +21,20 @@ ACTION_NAMES = {
     3: "Raise Full Pot",
     4: "All-In"
 }
+
+
+def _make_engine(num_players: int):
+    return FastEnhancedPokerEngine(
+        num_players=num_players,
+        add_position_features=True,
+        add_pot_odds_features=True,
+        add_hand_strength_features=True,
+        add_stack_features=True,
+        add_equity_features=True,
+        add_street_features=True,
+        add_game_state_features=True,
+        add_betting_history_features=True,
+    )
 
 
 def get_human_action(legal_actions):
@@ -39,16 +54,36 @@ def get_human_action(legal_actions):
             sys.exit(0)
 
 
+def _get_preflop_action(engine, agent_idx, legal_actions, preflop_ranges):
+    """Use GTO preflop ranges if on preflop street."""
+    if preflop_ranges is None or engine.get_stage() != 'Preflop':
+        return None
+    agent = engine.agents[agent_idx]
+    cards = engine.get_player_cards(agent)
+    if not cards or len(cards) < 2:
+        return None
+    button_idx = engine._button
+    rel_pos = (agent_idx - button_idx) % len(engine.agents)
+    pot_bb = engine.get_pot_size() / 2.0
+    strategy = preflop_ranges.get_strategy(
+        cards, rel_pos, pot_bb, legal_actions, engine.get_action_space_size())
+    return strategy
+
+
 def main():
     parser = argparse.ArgumentParser(description='Play poker against a trained AI (CLI)')
     parser.add_argument('--model', type=str, default=MODEL_PATH, help='Path to model file')
+    parser.add_argument('--players', type=int, default=2, help='Number of players (default: 2)')
     parser.add_argument('--search', action='store_true', help='Enable depth-limited search')
     parser.add_argument('--search-depth', type=int, default=2, help='Search depth (default: 2)')
     parser.add_argument('--search-iters', type=int, default=50, help='CFR iterations per search (default: 50)')
     parser.add_argument('--search-rollouts', type=int, default=10, help='Rollouts per action (default: 10)')
     parser.add_argument('--no-refine', action='store_true', help='Disable strategy refinement')
     parser.add_argument('--temperature', type=float, default=0.5, help='Strategy temperature (default: 0.5)')
+    parser.add_argument('--no-preflop-ranges', action='store_true', help='Disable GTO preflop range override')
     args = parser.parse_args()
+
+    num_players = args.players
 
     print("="*60)
     print("PLAY VS AI")
@@ -56,7 +91,7 @@ def main():
 
     model_path = Path(__file__).parent.parent / args.model
 
-    engine = PokerEngine(num_players=2)
+    engine = _make_engine(num_players)
 
     observation_size = engine.get_observation_space_size()
     action_size = engine.get_action_space_size()
@@ -64,7 +99,7 @@ def main():
     deep_cfr = DeepCFR(
         observation_size=observation_size,
         action_size=action_size,
-        num_players=2
+        num_players=num_players
     )
 
     if model_path.exists():
@@ -88,13 +123,17 @@ def main():
     if not args.no_refine and model_path.exists():
         refiner = PlaytimeStrategy(
             deep_cfr,
-            num_players=2,
+            num_players=num_players,
             temperature=args.temperature,
             allin_penalty=True,
         )
         print(f"  Strategy refinement: temperature={args.temperature}, all-in penalty=ON")
 
-    print("\nYou are Player 0, AI is Player 1")
+    preflop_ranges = None if args.no_preflop_ranges else PreflopRanges()
+    if preflop_ranges:
+        print(f"  Preflop: GTO ranges (locked)")
+
+    print(f"\nYou are Player 0, AI is Player 1")
     print("="*60)
 
     state = engine.reset()
@@ -114,14 +153,18 @@ def main():
             action = get_human_action(legal_actions)
         else:
             if model_path.exists():
-                if search:
-                    strategy = search.search(engine, agent_idx, legal_actions)
-                elif refiner:
-                    observation = engine.get_observation()
-                    strategy = refiner.get_strategy(observation, agent_idx, legal_actions)
-                else:
-                    observation = engine.get_observation()
-                    strategy = deep_cfr.get_strategy(observation, agent_idx, legal_actions)
+                # Try preflop range override first
+                strategy = _get_preflop_action(engine, agent_idx, legal_actions, preflop_ranges)
+                if strategy is None:
+                    # Postflop: use model
+                    if search:
+                        strategy = search.search(engine, agent_idx, legal_actions)
+                    elif refiner:
+                        observation = engine.get_observation()
+                        strategy = refiner.get_strategy(observation, agent_idx, legal_actions)
+                    else:
+                        observation = engine.get_observation()
+                        strategy = deep_cfr.get_strategy(observation, agent_idx, legal_actions)
                 legal_strategy = strategy[legal_actions]
                 legal_strategy /= legal_strategy.sum()
                 action = np.random.choice(legal_actions, p=legal_strategy)

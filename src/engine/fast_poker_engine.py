@@ -274,6 +274,14 @@ class FastPokerEngine:
     def is_done(self):
         return self._done
 
+    def get_state(self):
+        return {
+            'observation': self.get_observation(),
+            'current_player': self.current_agent,
+            'legal_actions': self.get_legal_actions(),
+            'agents': list(self.agents),
+        }
+
     def close(self):
         pass  # nothing to clean up
 

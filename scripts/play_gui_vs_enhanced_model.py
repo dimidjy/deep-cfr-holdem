@@ -7,13 +7,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from src.gui import PokerGUI
 from src.training import DeepCFR, ModelAdapter
-from src.engine import EnhancedPokerEngine
+from src.engine import FastEnhancedPokerEngine
 from src.search import DepthLimitedSearch, PlaytimeStrategy
+from src.preflop_ranges import PreflopRanges
 import torch
 
 
-def _make_engine(num_players: int) -> EnhancedPokerEngine:
-    return EnhancedPokerEngine(
+def _make_engine(num_players: int) -> FastEnhancedPokerEngine:
+    return FastEnhancedPokerEngine(
         num_players=num_players,
         add_position_features=True,
         add_pot_odds_features=True,
@@ -106,6 +107,7 @@ def main():
     parser.add_argument('--search-rollouts', type=int, default=10, help='Rollouts per action branch (default: 10)')
     parser.add_argument('--no-refine', action='store_true', help='Disable play-time strategy refinement (temperature + all-in penalty)')
     parser.add_argument('--temperature', type=float, default=0.5, help='Strategy temperature (lower=sharper, default: 0.5)')
+    parser.add_argument('--no-preflop-ranges', action='store_true', help='Disable GTO preflop range override')
 
     args = parser.parse_args()
     
@@ -169,8 +171,13 @@ def main():
     print("  - Q: Quit")
     print("="*60 + "\n")
 
+    preflop_ranges = None if args.no_preflop_ranges else PreflopRanges()
+    if preflop_ranges:
+        print(f"  Preflop: GTO ranges (locked)")
+
     gui = PokerGUI(num_players=trained_players, ai_model=deep_cfr,
-                   ai_search=search, ai_strategy_refiner=refiner)
+                   ai_search=search, ai_strategy_refiner=refiner,
+                   preflop_ranges=preflop_ranges)
     gui.engine = engine
     gui.engine.reset()
     gui.run()
