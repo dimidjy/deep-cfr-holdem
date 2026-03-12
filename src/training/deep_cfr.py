@@ -82,73 +82,120 @@ class StrategyNetwork(nn.Module):
 
 
 class ReplayBuffer:
+    """Columnar replay buffer using pre-allocated numpy arrays for fast sampling.
 
-    def __init__(self, capacity: int, num_players: int = 6):
+    Instead of a list of Python dicts, stores data in contiguous numpy arrays.
+    This eliminates per-sample Python overhead during batch sampling (the main
+    training bottleneck: 300 sample calls × 32768 items per iteration).
+    """
+
+    def __init__(self, capacity: int, num_players: int = 6,
+                 obs_size: int = 38, act_size: int = 5):
         self.capacity = capacity
         self.num_players = num_players
-        self.buffer = []
+        self._size = 0
         self._pos = 0
-        # Per-player index: player_idx → list of buffer indices
-        self._player_indices = [[] for _ in range(num_players)]
+
+        # Pre-allocated columnar storage
+        self.states = np.zeros((capacity, obs_size), dtype=np.float32)
+        self.actions = np.zeros(capacity, dtype=np.int64)
+        self.regrets = np.zeros(capacity, dtype=np.float32)
+        self.strategies = np.zeros((capacity, act_size), dtype=np.float32)
+        self.players = np.zeros(capacity, dtype=np.int32)
+        self.iterations = np.zeros(capacity, dtype=np.float64)
+
+        # Per-player index caches
+        self._player_indices = [None] * num_players
+        self._player_weights = [None] * num_players
         self._dirty = True
 
     def add(self, state: np.ndarray, action: int, regret: float,
             strategy: np.ndarray, player: int, iteration: int = 1):
-        entry = {
-            'state': state,
-            'action': action,
-            'regret': regret,
-            'strategy': strategy,
-            'player': player,
-            'iteration': max(iteration, 1),
-        }
-        if len(self.buffer) < self.capacity:
-            self.buffer.append(entry)
-        else:
-            self.buffer[self._pos] = entry
+        i = self._pos
+        self.states[i] = state
+        self.actions[i] = action
+        self.regrets[i] = regret
+        self.strategies[i] = strategy
+        self.players[i] = player
+        self.iterations[i] = max(iteration, 1)
+
         self._pos = (self._pos + 1) % self.capacity
+        if self._size < self.capacity:
+            self._size += 1
         self._dirty = True
 
     def rebuild_indices(self):
-        """Rebuild per-player indices. Call once per iteration before training."""
+        """Rebuild per-player indices and pre-compute weights."""
+        players_slice = self.players[:self._size]
+        iters_slice = self.iterations[:self._size]
         for p in range(self.num_players):
-            self._player_indices[p] = []
-        for i, entry in enumerate(self.buffer):
-            p = entry['player']
-            if p < self.num_players:
-                self._player_indices[p].append(i)
+            mask = players_slice == p
+            idx = np.nonzero(mask)[0]
+            self._player_indices[p] = idx
+            if len(idx) > 0:
+                w = iters_slice[idx].copy()
+                w /= w.sum()
+                self._player_weights[p] = w
+            else:
+                self._player_weights[p] = None
         self._dirty = False
 
-    def sample_player(self, batch_size: int, player_idx: int) -> List[Dict]:
-        """Sample batch_size entries for a specific player with iteration weighting."""
+    def sample_player_tensors(self, batch_size: int, player_idx: int, device):
+        """Sample batch and return GPU tensors directly (skips Python dicts)."""
         if self._dirty:
             self.rebuild_indices()
 
-        indices = self._player_indices[player_idx]
-        n = len(indices)
+        idx = self._player_indices[player_idx]
+        n = len(idx)
+        if n == 0:
+            return None
+
+        w = self._player_weights[player_idx]
+        k = min(batch_size, n)
+        chosen = np.random.choice(n, size=k, replace=False, p=w)
+        sel = idx[chosen]
+
+        states_t = torch.from_numpy(self.states[sel]).to(device, non_blocking=True)
+        actions_t = torch.from_numpy(self.actions[sel]).to(device, non_blocking=True)
+        regrets_t = torch.from_numpy(self.regrets[sel]).to(device, non_blocking=True)
+        strategies_t = torch.from_numpy(self.strategies[sel]).to(device, non_blocking=True)
+        return states_t, actions_t, regrets_t, strategies_t
+
+    def sample_player(self, batch_size: int, player_idx: int) -> List[Dict]:
+        """Legacy dict-based sampling (kept for compatibility)."""
+        if self._dirty:
+            self.rebuild_indices()
+
+        idx = self._player_indices[player_idx]
+        n = len(idx)
         if n == 0:
             return []
 
-        weights = np.array([self.buffer[i]['iteration'] for i in indices], dtype=np.float64)
-        weights /= weights.sum()
-
+        w = self._player_weights[player_idx]
         k = min(batch_size, n)
-        chosen = np.random.choice(n, size=k, replace=False, p=weights)
-        return [self.buffer[indices[c]] for c in chosen]
+        chosen = np.random.choice(n, size=k, replace=False, p=w)
+        sel = idx[chosen]
+        return [{'state': self.states[i], 'action': self.actions[i],
+                 'regret': self.regrets[i], 'strategy': self.strategies[i],
+                 'player': self.players[i], 'iteration': self.iterations[i]}
+                for i in sel]
 
     def sample(self, batch_size: int) -> List[Dict]:
         """Sample from the full buffer (iteration-weighted)."""
-        n = len(self.buffer)
+        n = self._size
         if n == 0:
             return []
-        weights = np.array([e['iteration'] for e in self.buffer], dtype=np.float64)
-        weights /= weights.sum()
+        w = self.iterations[:n].copy()
+        w /= w.sum()
         k = min(batch_size, n)
-        indices = np.random.choice(n, size=k, replace=False, p=weights)
-        return [self.buffer[i] for i in indices]
+        sel = np.random.choice(n, size=k, replace=False, p=w)
+        return [{'state': self.states[i], 'action': self.actions[i],
+                 'regret': self.regrets[i], 'strategy': self.strategies[i],
+                 'player': self.players[i], 'iteration': self.iterations[i]}
+                for i in sel]
 
     def __len__(self):
-        return len(self.buffer)
+        return self._size
 
 
 class DeepCFR:
@@ -202,8 +249,14 @@ class DeepCFR:
             self.advantage_schedulers.append(adv_sched)
             self.strategy_schedulers.append(strat_sched)
 
-        self.replay_buffer = ReplayBuffer(buffer_size, num_players=num_players)
+        self.replay_buffer = ReplayBuffer(
+            buffer_size, num_players=num_players,
+            obs_size=observation_size, act_size=action_size)
         self.iteration = 0
+
+        # AMP scaler for mixed-precision training
+        self._amp_enabled = self.device.type == 'cuda'
+        self._scaler = torch.cuda.amp.GradScaler(enabled=self._amp_enabled)
 
     def get_strategy(self, observation: np.ndarray, player_idx: int,
                      legal_actions: List[int]) -> np.ndarray:
@@ -266,37 +319,28 @@ class DeepCFR:
         count = 0
 
         for player_idx in range(self.num_players):
-            player_batch = self.replay_buffer.sample_player(batch_size, player_idx)
-
-            if not player_batch:
+            batch = self.replay_buffer.sample_player_tensors(
+                batch_size, player_idx, self.device)
+            if batch is None:
                 continue
-
-            states = torch.FloatTensor(
-                np.array([s['state'] for s in player_batch])
-            ).to(self.device)
-            actions = torch.LongTensor(
-                np.array([s['action'] for s in player_batch])
-            ).to(self.device)
-            regrets = torch.FloatTensor(
-                np.array([s['regret'] for s in player_batch])
-            ).to(self.device)
+            states, actions, regrets, _ = batch
 
             self.advantage_optimizers[player_idx].zero_grad()
 
-            predicted_advantages = self.advantage_networks[player_idx](states)
-            predicted_action_advantages = predicted_advantages.gather(
-                1, actions.unsqueeze(1)
-            ).squeeze(1)
+            with torch.cuda.amp.autocast(enabled=self._amp_enabled):
+                predicted = self.advantage_networks[player_idx](states)
+                pred_act = predicted.gather(1, actions.unsqueeze(1)).squeeze(1)
+                loss = nn.MSELoss()(pred_act, regrets)
 
-            loss = nn.MSELoss()(predicted_action_advantages, regrets)
-            loss.backward()
-
+            self._scaler.scale(loss).backward()
+            self._scaler.unscale_(self.advantage_optimizers[player_idx])
             torch.nn.utils.clip_grad_norm_(
                 self.advantage_networks[player_idx].parameters(),
                 max_norm=self.gradient_clip
             )
+            self._scaler.step(self.advantage_optimizers[player_idx])
+            self._scaler.update()
 
-            self.advantage_optimizers[player_idx].step()
             total_loss += loss.item()
             count += 1
 
@@ -310,34 +354,29 @@ class DeepCFR:
         count = 0
 
         for player_idx in range(self.num_players):
-            player_batch = self.replay_buffer.sample_player(batch_size, player_idx)
-
-            if not player_batch:
+            batch = self.replay_buffer.sample_player_tensors(
+                batch_size, player_idx, self.device)
+            if batch is None:
                 continue
-
-            states = torch.FloatTensor(
-                np.array([s['state'] for s in player_batch])
-            ).to(self.device)
-            target_strategies = torch.FloatTensor(
-                np.array([s['strategy'] for s in player_batch])
-            ).to(self.device)
+            states, _, _, target_strategies = batch
 
             self.strategy_optimizers[player_idx].zero_grad()
 
-            predicted_strategies = self.strategy_networks[player_idx](states)
+            with torch.cuda.amp.autocast(enabled=self._amp_enabled):
+                predicted = self.strategy_networks[player_idx](states)
+                loss = nn.KLDivLoss(reduction='batchmean')(
+                    torch.log(predicted + 1e-8), target_strategies
+                )
 
-            loss = nn.KLDivLoss(reduction='batchmean')(
-                torch.log(predicted_strategies + 1e-8),
-                target_strategies
-            )
-            loss.backward()
-
+            self._scaler.scale(loss).backward()
+            self._scaler.unscale_(self.strategy_optimizers[player_idx])
             torch.nn.utils.clip_grad_norm_(
                 self.strategy_networks[player_idx].parameters(),
                 max_norm=self.gradient_clip
             )
+            self._scaler.step(self.strategy_optimizers[player_idx])
+            self._scaler.update()
 
-            self.strategy_optimizers[player_idx].step()
             total_loss += loss.item()
             count += 1
 

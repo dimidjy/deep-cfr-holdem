@@ -6,6 +6,8 @@ Uses the Rust-backed `pokers` library (pip install pokers) for game logic.
 MCCFR branching: no RNG save/restore needed — just save the initial state.
 """
 
+import os
+import sys
 import numpy as np
 
 try:
@@ -14,6 +16,26 @@ except ImportError:
     raise ImportError(
         "pokers library required for FastPokerEngine. Install with: pip install pokers"
     )
+
+
+# ── Suppress C-level stdout from pokers Rust library permanently ─────────────
+# The Rust library prints "Winner id" / "Ranks" on showdown via C stdout (fd 1).
+# We redirect fd 1 to /dev/null once at import time, then re-point Python's
+# sys.stdout to a saved copy of the original fd so print() still works.
+
+_saved_stdout_fd = os.dup(1)                       # save original fd 1
+os.dup2(os.open(os.devnull, os.O_WRONLY), 1)       # fd 1 → /dev/null
+sys.stdout = os.fdopen(_saved_stdout_fd, 'w', 1)   # Python print → saved fd
+
+
+def _suppress_stdout():
+    """No-op — stdout is permanently redirected at import time."""
+    return None
+
+
+def _restore_stdout(_saved):
+    """No-op — stdout is permanently redirected at import time."""
+    pass
 
 
 # ── Card conversion helpers ──────────────────────────────────────────────────
@@ -247,7 +269,11 @@ class FastPokerEngine:
             return self._make_result()
 
         pkrs_action = self._map_action(action)
-        self._state = self._state.apply_action(pkrs_action)
+        saved = _suppress_stdout()
+        try:
+            self._state = self._state.apply_action(pkrs_action)
+        finally:
+            _restore_stdout(saved)
         self._action_history.append(action)
 
         if not self._state.legal_actions:
@@ -329,8 +355,12 @@ class FastPokerEngine:
     def _finish(self):
         """Mark hand as done and collect rewards."""
         self._done = True
-        for i, ps in enumerate(self._state.players_state):
-            self._rewards[self.agents[i]] = float(ps.reward)
+        saved = _suppress_stdout()
+        try:
+            for i, ps in enumerate(self._state.players_state):
+                self._rewards[self.agents[i]] = float(ps.reward)
+        finally:
+            _restore_stdout(saved)
 
     def _map_action(self, action: int):
         """Map our 5-action space to a pokers Action."""

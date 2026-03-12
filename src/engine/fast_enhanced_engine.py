@@ -144,10 +144,8 @@ class FastEnhancedPokerEngine(FastPokerEngine):
                 math.log1p(raw_stp) / math.log1p(50), 0.0, 1.0))
 
             max_bet = max(p.bet_chips for p in self._state.players_state)
-            # Match old engine: call = max(round.raised) - player.in_chips
-            # In pokers terms: max(bet_chips) - (pot_chips + bet_chips)
-            my_in_chips = ps.pot_chips + ps.bet_chips
-            call_amount = max(0, max_bet - my_in_chips)
+            # Call amount = difference in current round bets only
+            call_amount = max(0, max_bet - ps.bet_chips)
             pot_odds = float(pot / max(pot + call_amount, 1)) if call_amount > 0 else 0.0
 
             return np.array([pot_normalized, stack_to_pot, pot_odds], dtype=np.float32)
@@ -323,9 +321,8 @@ class FastEnhancedPokerEngine(FastPokerEngine):
 
             pot = self._state.pot
             max_bet = max(p.bet_chips for p in players)
-            # Match old engine: max(round.raised) - player.in_chips
-            my_in_chips = ps.pot_chips + ps.bet_chips
-            call_amount = max(0, max_bet - my_in_chips)
+            # Call amount = difference in current round bets only
+            call_amount = max(0, max_bet - ps.bet_chips)
             call_amount_norm = min(call_amount / max(pot, 1), 1.0)
 
             big_blind = 2
@@ -352,10 +349,15 @@ class FastEnhancedPokerEngine(FastPokerEngine):
             my_pot_share = float(np.clip(
                 (ps.pot_chips + ps.bet_chips) / pot, 0.0, 1.0))
 
-            # Approximate not_raise_fraction
-            active_count = max(sum(1 for p in players if p.active), 1)
+            # Raise count proxy: how many players have put in more than
+            # the minimum required bet this round (indicates raise/re-raise)
+            big_blind_amount = 2
+            raise_count = sum(
+                1 for p in players
+                if p.bet_chips > big_blind_amount and p.active
+            )
             not_raise_fraction = float(np.clip(
-                (active_count - 1) / max(self.num_players, 1), 0.0, 1.0))
+                raise_count / max(self.num_players, 1), 0.0, 1.0))
 
             facing_3bet_plus = 1.0 if max_bet > 6 * big_blind else 0.0
             pot_was_raised = 1.0 if max_bet > big_blind else 0.0

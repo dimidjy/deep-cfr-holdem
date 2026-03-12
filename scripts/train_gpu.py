@@ -73,6 +73,13 @@ def _worker_init(shared_adv, shared_strat, act_size, use_preflop_ranges=False):
     warnings.filterwarnings('ignore')
     logging.disable(logging.WARNING)
     os.environ['GYMNASIUM_DISABLE_LOGGING'] = '1'
+    # Permanently suppress C-level stdout in workers to silence Rust pokers
+    # library debug prints (Winner id / Ranks on showdown). Workers return
+    # results via IPC, so stdout is not needed.
+    sys.stdout.flush()
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 1)
+    os.close(devnull)
 
 
 def _regret_match(adv, legal, epsilon=0.05):
@@ -225,13 +232,14 @@ def _traversal_worker(args):
         } for a in legal_int]
 
     # ── Save game state for deterministic replay ────────────────────────────
-    # dealer_id (button position) is set from global np.random during engine
-    # creation and is NOT part of game.np_random — save both separately.
+    # With the fast (pokers) engine, game.np_random.get_state() returns the
+    # immutable State object.  We must save it AFTER reset() so branches
+    # replay the same dealt cards.  (Before reset returns the previous game.)
     engine = _get_engine(num_players)
-    game   = engine._get_game()
+    engine.reset()
+    game = engine._get_game()
     pre_reset_game_rng  = game.np_random.get_state()
     pre_reset_dealer_id = game.dealer_id
-    engine.reset()
 
     # ── Play opponent actions until traversal player's first decision ────────
     history = []   # grows throughout traversal; used for exact replay per branch
