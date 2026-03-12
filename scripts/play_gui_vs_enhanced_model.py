@@ -108,6 +108,7 @@ def main():
     parser.add_argument('--no-refine', action='store_true', help='Disable play-time strategy refinement (temperature + all-in penalty)')
     parser.add_argument('--temperature', type=float, default=0.5, help='Strategy temperature (lower=sharper, default: 0.5)')
     parser.add_argument('--no-preflop-ranges', action='store_true', help='Disable GTO preflop range override')
+    parser.add_argument('--exploit', type=float, default=0.0, help='Exploit factor 0.0-1.0 (0=GTO, 0.7=good vs fish)')
 
     args = parser.parse_args()
     
@@ -156,8 +157,10 @@ def main():
             num_players=trained_players,
             temperature=args.temperature,
             allin_penalty=True,
+            exploit_factor=args.exploit,
         )
-        print(f"  Strategy refinement: temperature={args.temperature}, all-in penalty=ON")
+        exploit_str = f", exploit={args.exploit}" if args.exploit > 0 else ""
+        print(f"  Strategy refinement: temperature={args.temperature}, all-in penalty=ON{exploit_str}")
 
     print("\n" + "="*60)
     print(f"Starting GUI - You vs {trained_players - 1} AI opponents ({trained_players}-player game)")

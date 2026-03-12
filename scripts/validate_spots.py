@@ -1,20 +1,17 @@
 """
-Poker spot validator — comprehensive model quality assessment.
+Poker spot validator — postflop model quality assessment.
 
-Tests:
-  1. Canonical spots (AA/KK/72o/set/air etc.)
-     - Legal-action-aware averaging: fold% correct even when check is available
-     - Context split: first-to-act vs facing a raise/bet
-  2. Both average-strategy network AND current advantage-based strategy
-  3. Standard poker stats: VPIP, PFR, 3-bet%
-  4. Position-stratified open-raise frequencies vs GTO targets
-  5. EV benchmark: model player vs random opponents (chips won/hand)
+Tests postflop decision quality across streets and bet contexts:
+  1. Made hands that should never/rarely fold (set, flush, straight, two pair, etc.)
+  2. Drawing hands (flush draw, OESD) — semi-bluff frequency
+  3. Air / weak hands — bluff frequency control
+  4. Split by street (flop / turn / river) and context (first-to-act vs facing bet)
+  5. Bet-size awareness: facing small bet vs facing big bet
 
 Usage:
-  python3 scripts/validate_spots.py --model models/final_model_enhanced.pt
+  python3 scripts/validate_spots.py --model models/checkpoint_iter_500.pt
   python3 scripts/validate_spots.py --model models/checkpoint_iter_500.pt --samples 2000
-  python3 scripts/validate_spots.py --model models/final_model_enhanced.pt --strategy both
-  python3 scripts/validate_spots.py --model models/final_model_enhanced.pt --ev-games 500
+  python3 scripts/validate_spots.py --model models/checkpoint_iter_500.pt --strategy both
 """
 import sys
 import os
@@ -107,22 +104,31 @@ def _game_context(engine, agent):
 
         max_raised   = max(game.round.raised) if game.round.raised else 0
         call_amount  = max(0, max_raised - player.in_chips)
+        pot_size     = engine.get_pot_size()
+        bet_to_pot   = call_amount / max(pot_size, 1)
 
         return {
             'rel_pos':               rel_pos,
             'pos_label':             pos_label,
             'call_amount':           call_amount,
+            'pot_size':              pot_size,
+            'bet_to_pot':            bet_to_pot,
             # Preflop: someone raised above BB (> 2 chips)
             'facing_preflop_raise':  call_amount > 2,
             # Postflop: someone bet (any call_amount > 0)
-            'facing_postflop_bet':   call_amount > 0,
+            'facing_bet':            call_amount > 0,
+            # Bet size buckets (relative to pot)
+            'facing_small_bet':      0 < bet_to_pot <= 0.5,
+            'facing_big_bet':        bet_to_pot > 0.5,
         }
     except Exception:
         return {}
 
 
+
+
 # ---------------------------------------------------------------------------
-# Preflop hand classifier
+# Preflop hand classifier (exported for validate_vs_hh.py)
 # ---------------------------------------------------------------------------
 
 def classify_preflop(cards):
@@ -150,6 +156,14 @@ def classify_preflop(cards):
     if hi <= 8 and (hi - lo) >= 3 and not is_suited:
         return 'trash_offsuit'
     return None
+
+
+# ---------------------------------------------------------------------------
+# GTO reference targets (exported for validate_vs_hh.py)
+# ---------------------------------------------------------------------------
+GTO_OPEN = {'UTG': 0.15, 'MP': 0.22, 'CO': 0.35, 'BTN': 0.45, 'SB': 0.35}
+GTO_VPIP = {'UTG': 0.22, 'MP': 0.30, 'CO': 0.45, 'BTN': 0.55, 'SB': 0.50, 'BB': 0.60}
+GTO_3BET = {'UTG': 0.04, 'MP': 0.05, 'CO': 0.07, 'BTN': 0.09, 'SB': 0.08, 'BB': 0.07}
 
 
 # ---------------------------------------------------------------------------
@@ -197,21 +211,18 @@ def classify_postflop(hole_cards, community_cards):
     hole_suits   = [s1, s2]
     is_pair      = r1 == r2
     is_suited    = s1 == s2
+    max_board    = max(board_ranks)
 
     # 1. Monster: quads or full house
     if is_pair:
         cnt = board_ranks.count(r1)
         if cnt >= 2:
-            return 'monster'   # quads (3+ of same rank on board)
+            return 'monster'   # quads
         if cnt == 1:
             other = [r for r in board_ranks if r != r1]
-            # set + board pair = full house; otherwise trips (set)
-            return 'monster' if len(other) > len(set(other)) else 'set'
-        # cnt == 0: pocket pair doesn't appear on board
-        # Check if board carries a pair → pocket pair + board pair = two pair
-        board_pair = len(board_ranks) > len(set(board_ranks))
-        if board_pair:
-            return 'two_pair'  # e.g. AA hole + KK2 board
+            if len(other) > len(set(other)):
+                return 'monster'  # full house
+            return 'set'
 
     # 2. Made flush (5 cards same suit)
     if is_suited and board_suits.count(s1) >= 3:
@@ -221,25 +232,40 @@ def classify_postflop(hole_cards, community_cards):
     if _has_straight(hole_ranks, board_ranks):
         return 'straight'
 
-    # 4. Two pair (both unpaired hole cards pair different board cards)
+    # 4. Set from non-pair (trips: one hole card matches board pair)
+    for r in hole_ranks:
+        if board_ranks.count(r) >= 2:
+            return 'trips'
+
+    # 5. Two pair (both unpaired hole cards pair different board cards)
     if r1 != r2 and r1 in board_ranks and r2 in board_ranks:
         return 'two_pair'
 
-    # 5. Top pair (hole card equals the highest board card, not a pocket pair)
-    max_board = max(board_ranks)
+    # 6. Overpair (pocket pair above all board cards)
+    if is_pair and r1 > max_board:
+        return 'overpair'
+
+    # 7. Top pair (hole card equals the highest board card)
     if max_board in hole_ranks and not is_pair:
         return 'top_pair'
 
-    # 6. Flush draw (4 to flush, not already a made flush)
+    # 8. Middle/bottom pair (hole card matches non-top board card)
+    sorted_board = sorted(set(board_ranks), reverse=True)
+    if not is_pair:
+        for r in hole_ranks:
+            if r in board_ranks and r != max_board:
+                return 'mid_low_pair'
+
+    # 9. Flush draw (4 to flush, not already a made flush)
     if _has_flush_draw(hole_suits, board_suits):
         return 'flush_draw'
 
-    # 7. OESD / gutshot (pure draw, no pair)
+    # 10. OESD / straight draw (pure draw, no pair)
     if (not is_pair and r1 not in board_ranks and r2 not in board_ranks
             and _has_oesd(hole_ranks, board_ranks)):
         return 'oesd'
 
-    # 8. Complete air: no pair, no draw, weak high card
+    # 11. Complete air: no pair, no draw, weak high card
     if (r1 not in board_ranks and r2 not in board_ranks
             and not is_pair and max(r1, r2) <= 9
             and board_suits.count(s1) < 2
@@ -256,48 +282,51 @@ def classify_postflop(hole_cards, community_cards):
 #   max_fold, min_fold, min_aggr, max_aggr  (all optional)
 # ---------------------------------------------------------------------------
 SPOTS = [
-    # ── Preflop: premium hands ──────────────────────────────────────────────
-    {'category': 'AA',        'street': 'preflop', 'label': 'AA preflop',
-     'hint': 'fold<10%  aggr>60%', 'max_fold': 0.10, 'min_aggr': 0.60},
-    {'category': 'KK',        'street': 'preflop', 'label': 'KK preflop',
-     'hint': 'fold<10%  aggr>50%', 'max_fold': 0.10, 'min_aggr': 0.50},
-    {'category': 'QQ',        'street': 'preflop', 'label': 'QQ preflop',
-     'hint': 'fold<15%  aggr>35%', 'max_fold': 0.15, 'min_aggr': 0.35},
-    {'category': 'JJ-TT',    'street': 'preflop', 'label': 'JJ-TT preflop',
-     'hint': 'fold<20%',           'max_fold': 0.20},
-    {'category': 'AKo',       'street': 'preflop', 'label': 'AKo preflop',
-     'hint': 'fold<15%  aggr>40%', 'max_fold': 0.15, 'min_aggr': 0.40},
-    {'category': 'AKs',       'street': 'preflop', 'label': 'AKs preflop',
-     'hint': 'fold<10%  aggr>50%', 'max_fold': 0.10, 'min_aggr': 0.50},
-    {'category': 'AQo-AJo',  'street': 'preflop', 'label': 'AQo-AJo preflop',
-     'hint': 'fold<20%',           'max_fold': 0.20},
-    # ── Preflop: trash ──────────────────────────────────────────────────────
-    {'category': '72o',         'street': 'preflop', 'label': '7-2 offsuit (worst hand)',
-     'hint': 'fold>30%',           'min_fold': 0.30},
-    {'category': 'trash_offsuit','street': 'preflop', 'label': 'Trash offsuit (hi≤8, gap≥3)',
-     'hint': 'fold>25%',           'min_fold': 0.25},
-    # ── Post-flop: made hands ───────────────────────────────────────────────
-    {'category': 'monster',   'street': 'postflop', 'label': 'Full house / quads',
-     'hint': 'fold<3%  aggr>35%',  'max_fold': 0.03, 'min_aggr': 0.35},
-    {'category': 'flush',     'street': 'postflop', 'label': 'Made flush',
-     'hint': 'fold<5%  aggr>25%',  'max_fold': 0.05, 'min_aggr': 0.25},
-    {'category': 'straight',  'street': 'postflop', 'label': 'Made straight',
+    # ── NEVER FOLD: strongest made hands ────────────────────────────────────
+    {'category': 'monster',   'label': 'Full house / quads',
+     'hint': 'fold<2%  aggr>40%',  'max_fold': 0.02, 'min_aggr': 0.40},
+    {'category': 'flush',     'label': 'Made flush',
+     'hint': 'fold<3%  aggr>25%',  'max_fold': 0.03, 'min_aggr': 0.25},
+    {'category': 'straight',  'label': 'Made straight',
      'hint': 'fold<5%  aggr>20%',  'max_fold': 0.05, 'min_aggr': 0.20},
-    {'category': 'set',       'street': 'postflop', 'label': 'Set (trips with pocket pair)',
-     'hint': 'fold<5%  aggr>30%',  'max_fold': 0.05, 'min_aggr': 0.30},
-    {'category': 'two_pair',  'street': 'postflop', 'label': 'Two pair (both hole cards hit)',
+    {'category': 'set',       'label': 'Set (pocket pair hit board)',
+     'hint': 'fold<3%  aggr>30%',  'max_fold': 0.03, 'min_aggr': 0.30},
+    {'category': 'trips',     'label': 'Trips (hole card + board pair)',
+     'hint': 'fold<5%  aggr>20%',  'max_fold': 0.05, 'min_aggr': 0.20},
+    # ── RARELY FOLD: strong hands ───────────────────────────────────────────
+    {'category': 'two_pair',  'label': 'Two pair',
      'hint': 'fold<10%  aggr>20%', 'max_fold': 0.10, 'min_aggr': 0.20},
-    {'category': 'top_pair',  'street': 'postflop', 'label': 'Top pair',
+    {'category': 'overpair',  'label': 'Overpair (pair > board)',
+     'hint': 'fold<10%  aggr>25%', 'max_fold': 0.10, 'min_aggr': 0.25},
+    {'category': 'top_pair',  'label': 'Top pair',
      'hint': 'fold<15%  aggr>15%', 'max_fold': 0.15, 'min_aggr': 0.15},
-    # ── Post-flop: draws (should semi-bluff occasionally) ───────────────────
-    {'category': 'flush_draw','street': 'postflop', 'label': 'Flush draw (4 to flush)',
-     'hint': 'aggr>10%',           'min_aggr': 0.10},
-    {'category': 'oesd',      'street': 'postflop', 'label': 'Open-ended straight draw',
-     'hint': 'aggr>10%',           'min_aggr': 0.10},
-    # ── Post-flop: air ──────────────────────────────────────────────────────
-    {'category': 'air',       'street': 'postflop', 'label': 'Complete air (no pair/draw, hi≤9)',
-     'hint': 'aggr<35%',           'max_aggr': 0.35},
+    # ── MARGINAL: can fold sometimes ────────────────────────────────────────
+    {'category': 'mid_low_pair', 'label': 'Middle / bottom pair',
+     'hint': 'fold<50%',          'max_fold': 0.50},
+    # ── DRAWS: semi-bluff ───────────────────────────────────────────────────
+    {'category': 'flush_draw','label': 'Flush draw (4 to flush)',
+     'hint': 'fold<40%  aggr>10%', 'max_fold': 0.40, 'min_aggr': 0.10},
+    {'category': 'oesd',      'label': 'Open-ended straight draw',
+     'hint': 'fold<45%  aggr>10%', 'max_fold': 0.45, 'min_aggr': 0.10},
+    # ── AIR: should fold facing bets, limited bluffs ────────────────────────
+    {'category': 'air',       'label': 'Complete air (no pair/draw, hi<=9)',
+     'hint': 'aggr<45%',          'max_aggr': 0.45},
 ]
+
+# Context-specific thresholds (applied to sub-splits)
+CONTEXT_THRESHOLDS = {
+    # Strong hands should NEVER fold facing a small bet
+    'monster':    {'facing_small': {'max_fold': 0.01}, 'facing_big': {'max_fold': 0.03}},
+    'flush':      {'facing_small': {'max_fold': 0.02}, 'facing_big': {'max_fold': 0.05}},
+    'straight':   {'facing_small': {'max_fold': 0.03}, 'facing_big': {'max_fold': 0.08}},
+    'set':        {'facing_small': {'max_fold': 0.02}, 'facing_big': {'max_fold': 0.05}},
+    'trips':      {'facing_small': {'max_fold': 0.03}, 'facing_big': {'max_fold': 0.08}},
+    'two_pair':   {'facing_small': {'max_fold': 0.05}, 'facing_big': {'max_fold': 0.15}},
+    'overpair':   {'facing_small': {'max_fold': 0.05}, 'facing_big': {'max_fold': 0.15}},
+    'top_pair':   {'facing_small': {'max_fold': 0.08}, 'facing_big': {'max_fold': 0.25}},
+    # Air facing bet should fold often
+    'air':        {'facing_small': {'min_fold': 0.40}, 'facing_big': {'min_fold': 0.60}},
+}
 
 
 def _spot_passes(spot, fold_pct, aggr_pct):
@@ -311,19 +340,6 @@ def _spot_passes(spot, fold_pct, aggr_pct):
         return False
     return True
 
-
-# ---------------------------------------------------------------------------
-# GTO reference targets (6-max, approximate)
-# ---------------------------------------------------------------------------
-GTO_OPEN = {   # open-raise % when first to act
-    'UTG': 0.15, 'MP': 0.22, 'CO': 0.35, 'BTN': 0.45, 'SB': 0.35,
-}
-GTO_VPIP = {   # voluntary put-in %
-    'UTG': 0.22, 'MP': 0.30, 'CO': 0.45, 'BTN': 0.55, 'SB': 0.50, 'BB': 0.60,
-}
-GTO_3BET = {   # 3-bet %
-    'UTG': 0.04, 'MP': 0.05, 'CO': 0.07, 'BTN': 0.09, 'SB': 0.08, 'BB': 0.07,
-}
 
 
 # ---------------------------------------------------------------------------
@@ -354,12 +370,20 @@ def _compute_spot_stats(cat_samples):
     }
 
 
-def _split_context(cat_samples, street):
-    """Split samples into (not-facing-raise, facing-raise)."""
-    key = 'facing_preflop_raise' if street == 'preflop' else 'facing_postflop_bet'
-    facing     = [(s, L, ctx) for s, L, ctx in cat_samples if ctx.get(key)]
-    not_facing = [(s, L, ctx) for s, L, ctx in cat_samples if not ctx.get(key)]
-    return not_facing, facing
+def _split_context(cat_samples):
+    """Split samples into (first-to-act, facing-small-bet, facing-big-bet)."""
+    first_act  = [(s, L, ctx) for s, L, ctx in cat_samples if not ctx.get('facing_bet')]
+    small_bet  = [(s, L, ctx) for s, L, ctx in cat_samples if ctx.get('facing_small_bet')]
+    big_bet    = [(s, L, ctx) for s, L, ctx in cat_samples if ctx.get('facing_big_bet')]
+    return first_act, small_bet, big_bet
+
+
+def _split_by_street(cat_samples):
+    """Split samples by street."""
+    flop  = [(s, L, ctx) for s, L, ctx in cat_samples if ctx.get('street') == 'Flop']
+    turn  = [(s, L, ctx) for s, L, ctx in cat_samples if ctx.get('street') == 'Turn']
+    river = [(s, L, ctx) for s, L, ctx in cat_samples if ctx.get('street') == 'River']
+    return flop, turn, river
 
 
 # ---------------------------------------------------------------------------
@@ -368,23 +392,15 @@ def _split_context(cat_samples, street):
 
 def collect_samples(deep_cfr, engine, num_games, strategy_fn):
     """
-    Run num_games hands and record model strategy at every decision point.
+    Run num_games hands and record model strategy at every postflop decision.
 
     Returns:
-      samples   – dict[category → list of (strategy, legal_set, ctx)]
-      pos_stats – dict[pos_label → {hands, vpip, pfr, three_bet, three_bet_opp,
-                                     open_raise, open_opp}]
+      samples – dict[category → list of (strategy, legal_set, ctx)]
     """
-    samples   = defaultdict(list)
-    pos_stats = defaultdict(lambda: {
-        'hands': 0, 'vpip': 0.0, 'pfr': 0.0,
-        'three_bet': 0.0, 'three_bet_opp': 0,
-        'open_raise': 0.0, 'open_opp': 0,
-    })
+    samples = defaultdict(list)
 
     for _ in range(num_games):
         engine.reset()
-        acted_preflop = set()   # players who already had their first preflop action
 
         while not engine.is_done():
             agent = engine.current_agent
@@ -398,49 +414,17 @@ def collect_samples(deep_cfr, engine, num_games, strategy_fn):
             stage     = engine.get_stage()
             obs       = engine.get_observation()
             ctx       = _game_context(engine, agent)
-
-            cards     = engine.get_player_cards(agent)
-            community = engine.get_community_cards()
-
-            # Classify current spot
-            cat = (classify_preflop(cards)
-                   if stage == 'Preflop'
-                   else classify_postflop(cards, community))
+            ctx['street'] = stage  # 'Preflop', 'Flop', 'Turn', 'River'
 
             strategy = strategy_fn(obs, agent_idx, legal)
 
-            if cat is not None:
-                samples[cat].append((strategy.copy(), set(legal), ctx))
-
-            # ── Track VPIP / PFR / 3-bet per position (first preflop action) ──
-            if stage == 'Preflop' and agent not in acted_preflop and ctx:
-                pos = ctx.get('pos_label', 'UNK')
-                pos_stats[pos]['hands'] += 1
-                acted_preflop.add(agent)
-
-                fold_p  = float(strategy[FOLD]) if FOLD in legal else 0.0
-                raise_p = sum(float(strategy[a]) for a in AGGRESSIVE if a in legal)
-                ca      = ctx.get('call_amount', 0)
-                facing  = ctx.get('facing_preflop_raise', False)
-
-                # VPIP: probability of voluntarily putting chips in
-                # BB with call_amount==0 (free check) is excluded
-                is_bb_free = (pos == 'BB' and ca == 0)
-                if not is_bb_free:
-                    pos_stats[pos]['vpip'] += (1.0 - fold_p)
-
-                # PFR: probability of raising
-                pos_stats[pos]['pfr'] += raise_p
-
-                # 3-bet: raised facing a prior raise
-                if facing:
-                    pos_stats[pos]['three_bet_opp'] += 1
-                    pos_stats[pos]['three_bet']     += raise_p
-
-                # Open-raise: raised when no prior raise (not from BB)
-                if not facing and pos != 'BB':
-                    pos_stats[pos]['open_opp']   += 1
-                    pos_stats[pos]['open_raise'] += raise_p
+            # Only classify and record postflop decisions
+            if stage != 'Preflop':
+                cards     = engine.get_player_cards(agent)
+                community = engine.get_community_cards()
+                cat = classify_postflop(cards, community)
+                if cat is not None:
+                    samples[cat].append((strategy.copy(), set(legal), ctx))
 
             # Sample action and advance
             probs  = strategy[legal].copy()
@@ -448,7 +432,7 @@ def collect_samples(deep_cfr, engine, num_games, strategy_fn):
             action = int(np.random.choice(legal, p=probs))
             engine.step(action)
 
-    return samples, pos_stats
+    return samples
 
 
 # ---------------------------------------------------------------------------
@@ -521,7 +505,7 @@ def run_validation(deep_cfr, engine, num_games: int = 1000,
                    verbose: bool = True, strategy_mode: str = 'avg',
                    ev_games: int = 0) -> dict:
     """
-    Run validation and return a results dict.
+    Run postflop validation and return a results dict.
     Backward-compatible with train_gpu.py usage:
         run_validation(deep_cfr, engine, num_games=500, verbose=False)
 
@@ -541,12 +525,11 @@ def run_validation(deep_cfr, engine, num_games: int = 1000,
     all_mode_results = {}
     for mode in modes:
         sfn = _make_strategy_fn(mode)
-        samples, pos_stats = collect_samples(deep_cfr, engine, num_games, sfn)
-        all_mode_results[mode] = (samples, pos_stats)
+        samples = collect_samples(deep_cfr, engine, num_games, sfn)
+        all_mode_results[mode] = samples
 
-    # Use the first mode as the canonical result for backward compat
-    primary_mode             = modes[0]
-    samples, pos_stats       = all_mode_results[primary_mode]
+    primary_mode = modes[0]
+    samples      = all_mode_results[primary_mode]
 
     results = {}
     passed  = 0
@@ -554,58 +537,68 @@ def run_validation(deep_cfr, engine, num_games: int = 1000,
 
     if verbose:
         print()
-        print('=' * 80)
-        print(f'  SPOT VALIDATION  ({num_games} games, iter {deep_cfr.iteration}, '
+        print('=' * 90)
+        print(f'  POSTFLOP SPOT VALIDATION  ({num_games} games, iter {deep_cfr.iteration}, '
               f'strategy={strategy_mode})')
-        print('=' * 80)
-
-    current_street = None
-    hdr = (f"  {'Spot':<38} {'N':>5}  {'fold%':>6}  {'call%':>6}"
-           f"  {'aggr%':>6}  Status")
-    sep = '  ' + '-' * 74
+        print('=' * 90)
+        hdr = (f"  {'Spot':<35} {'N':>5}  {'fold%':>6}  {'call%':>6}"
+               f"  {'aggr%':>6}  Status")
+        sep = '  ' + '-' * 84
+        print(hdr)
+        print(sep)
 
     for spot in SPOTS:
-        cat    = spot['category']
-        street = spot['street']
-        label  = spot['label']
+        cat   = spot['category']
+        label = spot['label']
 
-        if verbose and street != current_street:
-            current_street = street
-            section = {'preflop': '── PREFLOP ──', 'postflop': '── POST-FLOP ──'}.get(street, '')
-            print(f'\n  {section}')
-            print(hdr)
-            print(sep)
-
-        # ── Primary mode spot ──
         cat_samples = samples.get(cat, [])
         stats       = _compute_spot_stats(cat_samples)
 
         if verbose:
-            result = _print_spot_row(label, stats, spot)
-        else:
-            result = None
+            _print_spot_row(label, stats, spot)
 
-        # ── Context split (preflop: first-to-act vs facing raise) ──
+        # ── Context splits: first-to-act / facing small / facing big ──
         if verbose and cat_samples:
-            not_facing, facing = _split_context(cat_samples, street)
-            for sub_label, sub_samples in [
-                    ('  ├─ first to act', not_facing),
-                    ('  └─ facing raise/bet', facing)]:
+            first_act, small_bet, big_bet = _split_context(cat_samples)
+            ctx_thresholds = CONTEXT_THRESHOLDS.get(cat, {})
+
+            sub_items = [
+                ('first to act',     first_act,  {}),
+                ('facing small bet', small_bet,  ctx_thresholds.get('facing_small', {})),
+                ('facing big bet',   big_bet,    ctx_thresholds.get('facing_big', {})),
+            ]
+            for i, (sub_label, sub_samples, sub_thresh) in enumerate(sub_items):
                 sub_stats = _compute_spot_stats(sub_samples)
                 if sub_stats and sub_stats['n'] >= 5:
-                    _print_spot_row(sub_label, sub_stats, spot,
+                    is_last = (i == len(sub_items) - 1) or all(
+                        _compute_spot_stats(sub_items[j][1]) is None
+                        or _compute_spot_stats(sub_items[j][1])['n'] < 5
+                        for j in range(i + 1, len(sub_items))
+                    )
+                    prefix = '  └─' if is_last else '  ├─'
+                    # Use context-specific thresholds if available
+                    ctx_spot = dict(spot)
+                    ctx_spot.update(sub_thresh)
+                    if sub_thresh:
+                        ctx_spot['hint'] = '  '.join(
+                            f"{k.replace('_', '')}{v:.0%}"
+                            for k, v in sub_thresh.items()
+                        )
+                    _print_spot_row(f'{prefix} {sub_label}', sub_stats, ctx_spot,
                                     low_n_thresh=10, indent='    ')
 
-        # ── Secondary mode comparison (if 'both') ──
-        if verbose and strategy_mode == 'both' and len(modes) > 1:
-            other_mode    = modes[1]
-            other_samples = all_mode_results[other_mode][0].get(cat, [])
-            other_stats   = _compute_spot_stats(other_samples)
-            if other_stats and other_stats['n'] >= 5:
-                _print_spot_row(f'  [current] {label}', other_stats, spot,
-                                indent='    ')
+            # ── Street breakdown ──
+            flop, turn, river = _split_by_street(cat_samples)
+            street_items = [('flop', flop), ('turn', turn), ('river', river)]
+            street_parts = []
+            for sname, ssamples in street_items:
+                ss = _compute_spot_stats(ssamples)
+                if ss and ss['n'] >= 3:
+                    street_parts.append(f"{sname}:{ss['n']}x f={ss['fold_pct']:.0%}")
+            if street_parts:
+                print(f"      [{' | '.join(street_parts)}]")
 
-        # Accumulate pass/fail (primary mode, exclude low-N postflop)
+        # Accumulate pass/fail
         if stats:
             n        = stats['n']
             low_n    = n < 20
@@ -628,55 +621,6 @@ def run_validation(deep_cfr, engine, num_games: int = 1000,
         else:
             results[cat] = {'n': 0, 'passed': None}
 
-    # ── Position-stratified stats ────────────────────────────────────────────
-    if verbose and pos_stats:
-        print(f'\n  ── POSITION STATS (preflop, all players using model strategy) ──')
-        pos_hdr  = (f"  {'Pos':<6} {'Hands':>6}  {'VPIP':>6}  {'PFR':>6}"
-                    f"  {'Open%':>6}  {'3-bet%':>7}  Open-GTO  VPIP-GTO")
-        pos_sep  = '  ' + '-' * 70
-        print(pos_hdr)
-        print(pos_sep)
-
-        pos_order = ['UTG', 'MP', 'CO', 'BTN', 'SB', 'BB']
-        for pos in pos_order:
-            if pos not in pos_stats:
-                continue
-            ps    = pos_stats[pos]
-            hands = ps['hands']
-            if hands < 5:
-                continue
-
-            vpip_pct  = ps['vpip']  / hands
-            pfr_pct   = ps['pfr']   / hands
-            open_pct  = (ps['open_raise'] / ps['open_opp']
-                         if ps['open_opp'] > 0 else float('nan'))
-            tbet_pct  = (ps['three_bet'] / ps['three_bet_opp']
-                         if ps['three_bet_opp'] > 0 else float('nan'))
-
-            gto_open = GTO_OPEN.get(pos, float('nan'))
-            gto_vpip = GTO_VPIP.get(pos, float('nan'))
-
-            open_str = f'{open_pct:6.1%}' if not np.isnan(open_pct) else '  n/a '
-            tbet_str = f'{tbet_pct:7.1%}' if not np.isnan(tbet_pct) else '   n/a '
-            gopen    = f'{gto_open:>8.0%}' if not np.isnan(gto_open) else '     n/a'
-            gvpip    = f'{gto_vpip:>9.0%}' if not np.isnan(gto_vpip) else '      n/a'
-
-            print(f"  {pos:<6} {hands:>6}  {vpip_pct:>6.1%}  {pfr_pct:>6.1%}"
-                  f"  {open_str}  {tbet_str}  {gopen}  {gvpip}")
-
-        # ── Aggregate VPIP/PFR/3-bet across all positions ──
-        total_hands = sum(ps['hands'] for ps in pos_stats.values())
-        if total_hands > 0:
-            agg_vpip = sum(ps['vpip'] for ps in pos_stats.values()) / total_hands
-            agg_pfr  = sum(ps['pfr']  for ps in pos_stats.values()) / total_hands
-            tot_3opp = sum(ps['three_bet_opp'] for ps in pos_stats.values())
-            agg_3bet = (sum(ps['three_bet'] for ps in pos_stats.values()) / tot_3opp
-                        if tot_3opp > 0 else 0.0)
-            print(pos_sep)
-            print(f"  {'ALL':<6} {total_hands:>6}  {agg_vpip:>6.1%}  {agg_pfr:>6.1%}"
-                  f"              (GTO 6-max: VPIP≈23%, PFR≈17%, 3-bet≈8%)")
-            print(f"  3-bet (all positions): {agg_3bet:.1%}")
-
     # ── EV test ─────────────────────────────────────────────────────────────
     if ev_games > 0:
         if verbose:
@@ -692,12 +636,12 @@ def run_validation(deep_cfr, engine, num_games: int = 1000,
     # ── Summary ──────────────────────────────────────────────────────────────
     if verbose:
         print()
-        print('  ' + '-' * 74)
-        verdict = ('Model shows basic poker understanding'
-                   if total > 0 and passed >= total * 0.6
-                   else 'Model needs more training')
+        print('  ' + '-' * 84)
+        verdict = ('Postflop play looks solid'
+                   if total > 0 and passed >= total * 0.7
+                   else 'Postflop needs improvement')
         print(f"  Result: {passed}/{total} spots passed (low-N excluded)  —  {verdict}")
-        print('=' * 80)
+        print('=' * 90)
         print()
 
     results['_summary'] = {'passed': passed, 'total': total}
@@ -718,14 +662,14 @@ def validation_summary_line(results: dict) -> str:
             if r.get('low_n'):
                 tag += '?'
             parts.append(
-                f"{cat}:fold={r['fold_pct']:.0%}"
-                f",call={r['call_pct']:.0%}"
-                f",raise={r['aggr_pct']:.0%}({tag})"
+                f"{cat}:f={r['fold_pct']:.0%}"
+                f",c={r['call_pct']:.0%}"
+                f",r={r['aggr_pct']:.0%}({tag})"
             )
     s = results.get('_summary', {})
     ev = results.get('_ev')
     ev_str = f" EV={ev:+.1f}" if ev is not None else ''
-    return f"[spots {s.get('passed',0)}/{s.get('total',0)}{ev_str}] " + '  '.join(parts)
+    return f"[postflop {s.get('passed',0)}/{s.get('total',0)}{ev_str}] " + '  '.join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -774,174 +718,6 @@ def _autodetect_players(model_path: Path, default: int = 6) -> int:
     return default
 
 
-# ---------------------------------------------------------------------------
-# Comparison runner
-# ---------------------------------------------------------------------------
-
-def run_comparison(model_a: 'DeepCFR', model_b: 'DeepCFR', engine,
-                   num_games: int = 1000, strategy_mode: str = 'avg') -> None:
-    """
-    Side-by-side comparison of two checkpoints.
-    Prints a diff table for every spot and the position stats.
-    """
-    for m in (model_a, model_b):
-        for net in m.advantage_networks + m.strategy_networks:
-            net.eval()
-
-    def _sfn(model, mode):
-        if mode == 'current':
-            return lambda obs, idx, lg: _current_strategy(model, obs, idx, lg)
-        return lambda obs, idx, lg: _avg_strategy(model, obs, idx, lg)
-
-    print(f'\nCollecting samples for model A (iter {model_a.iteration})...')
-    samp_a, pos_a = collect_samples(model_a, engine, num_games, _sfn(model_a, strategy_mode))
-    print(f'Collecting samples for model B (iter {model_b.iteration})...')
-    samp_b, pos_b = collect_samples(model_b, engine, num_games, _sfn(model_b, strategy_mode))
-
-    tag_a = f'iter_{model_a.iteration}'
-    tag_b = f'iter_{model_b.iteration}'
-
-    W = 80
-    print()
-    print('=' * W)
-    print(f'  COMPARISON:  {tag_a}  vs  {tag_b}  '
-          f'({num_games} games each, strategy={strategy_mode})')
-    print('=' * W)
-
-    # Column layout:
-    # Spot(30) | N_a(5) fold_a(6) aggr_a(6) pass_a(6) | N_b(5) fold_b(6) aggr_b(6) pass_b(6) | Δfold Δaggr
-    hdr1 = (f"  {'Spot':<30}  "
-            f"{'── ' + tag_a + ' ──':^24}  "
-            f"{'── ' + tag_b + ' ──':^24}  "
-            f"{'Δfold':>6} {'Δaggr':>6}")
-    hdr2 = (f"  {'':<30}  "
-            f"{'N':>5} {'fold%':>6} {'aggr%':>6} {'ok?':>5}  "
-            f"{'N':>5} {'fold%':>6} {'aggr%':>6} {'ok?':>5}  "
-            f"{'':>6} {'':>6}")
-    sep  = '  ' + '-' * (W - 2)
-
-    current_street = None
-    pass_a_total = pass_b_total = 0
-    spots_counted = 0
-
-    for spot in SPOTS:
-        cat    = spot['category']
-        street = spot['street']
-        label  = spot['label'][:30]
-
-        if street != current_street:
-            current_street = street
-            section = {'preflop': '── PREFLOP ──', 'postflop': '── POST-FLOP ──'}.get(street, '')
-            print(f'\n  {section}')
-            print(hdr1)
-            print(hdr2)
-            print(sep)
-
-        sa = _compute_spot_stats(samp_a.get(cat, []))
-        sb = _compute_spot_stats(samp_b.get(cat, []))
-
-        def _fmt(stats, s):
-            if stats is None or stats['n'] == 0:
-                return f"{'—':>5} {'—':>6} {'—':>6} {'—':>5}"
-            p = _spot_passes(s, stats['fold_pct'], stats['aggr_pct'])
-            ok = 'PASS' if p else 'FAIL'
-            if stats['n'] < 20:
-                ok = ok[:2] + '?'
-            return (f"{stats['n']:>5} {stats['fold_pct']:>6.1%}"
-                    f" {stats['aggr_pct']:>6.1%} {ok:>5}")
-
-        row_a = _fmt(sa, spot)
-        row_b = _fmt(sb, spot)
-
-        # Delta columns
-        if sa and sb and sa['n'] > 0 and sb['n'] > 0:
-            df = sb['fold_pct'] - sa['fold_pct']
-            da = sb['aggr_pct'] - sa['aggr_pct']
-            arrow_f = ('↑' if df > 0.02 else '↓' if df < -0.02 else ' ')
-            arrow_a = ('↑' if da > 0.02 else '↓' if da < -0.02 else ' ')
-            delta = (f"{arrow_f}{df:>+5.1%} {arrow_a}{da:>+5.1%}")
-
-            # Count passes (exclude low-N)
-            low_n = (sa['n'] < 20 or sb['n'] < 20)
-            if not low_n:
-                spots_counted += 1
-                if _spot_passes(spot, sa['fold_pct'], sa['aggr_pct']):
-                    pass_a_total += 1
-                if _spot_passes(spot, sb['fold_pct'], sb['aggr_pct']):
-                    pass_b_total += 1
-        else:
-            delta = f"{'—':>7} {'—':>7}"
-
-        print(f"  {label:<30}  {row_a}  {row_b}  {delta}")
-
-    # ── Position stats comparison ────────────────────────────────────────────
-    print(f'\n  ── POSITION STATS ──')
-    pos_hdr = (f"  {'Pos':<5}  "
-               f"{'── ' + tag_a + ' ──':^28}  "
-               f"{'── ' + tag_b + ' ──':^28}  "
-               f"{'ΔVPIP':>6} {'Δ3bet':>6}")
-    pos_hdr2 = (f"  {'':<5}  "
-                f"{'VPIP':>6} {'PFR':>6} {'Open%':>6} {'3bet%':>6}  "
-                f"{'VPIP':>6} {'PFR':>6} {'Open%':>6} {'3bet%':>6}  "
-                f"{'':>6} {'':>6}")
-    print(pos_hdr)
-    print(pos_hdr2)
-    print('  ' + '-' * (W - 2))
-
-    def _pos_row(ps, pos):
-        if pos not in ps or ps[pos]['hands'] < 5:
-            return f"{'—':>6} {'—':>6} {'—':>6} {'—':>6}"
-        p     = ps[pos]
-        h     = p['hands']
-        vpip  = p['vpip'] / h
-        pfr   = p['pfr']  / h
-        opn   = p['open_raise'] / p['open_opp'] if p['open_opp'] > 0 else float('nan')
-        tbet  = p['three_bet']  / p['three_bet_opp'] if p['three_bet_opp'] > 0 else float('nan')
-        opn_s = f'{opn:6.1%}' if not np.isnan(opn) else '  n/a '
-        tbt_s = f'{tbet:6.1%}' if not np.isnan(tbet) else '  n/a '
-        return f"{vpip:>6.1%} {pfr:>6.1%} {opn_s} {tbt_s}"
-
-    for pos in ['UTG', 'MP', 'CO', 'BTN', 'SB', 'BB']:
-        ra = _pos_row(pos_a, pos)
-        rb = _pos_row(pos_b, pos)
-        # Compute deltas
-        if pos in pos_a and pos in pos_b:
-            ha, hb = pos_a[pos]['hands'], pos_b[pos]['hands']
-            if ha >= 5 and hb >= 5:
-                dv = pos_b[pos]['vpip']/hb - pos_a[pos]['vpip']/ha
-                oa = pos_a[pos]['three_bet_opp']
-                ob = pos_b[pos]['three_bet_opp']
-                dt = ((pos_b[pos]['three_bet']/ob if ob > 0 else 0)
-                      - (pos_a[pos]['three_bet']/oa if oa > 0 else 0))
-                av = '↑' if dv > 0.01 else '↓' if dv < -0.01 else ' '
-                at = '↑' if dt > 0.005 else '↓' if dt < -0.005 else ' '
-                delta = f"{av}{dv:>+5.1%} {at}{dt:>+5.1%}"
-            else:
-                delta = f"{'—':>7} {'—':>7}"
-        else:
-            delta = f"{'—':>7} {'—':>7}"
-        print(f"  {pos:<5}  {ra}  {rb}  {delta}")
-
-    # Aggregate 3-bet
-    def _agg_3bet(ps):
-        opp = sum(p['three_bet_opp'] for p in ps.values())
-        return (sum(p['three_bet'] for p in ps.values()) / opp if opp > 0 else 0.0)
-
-    d3 = _agg_3bet(pos_b) - _agg_3bet(pos_a)
-    print('  ' + '-' * (W - 2))
-    print(f"  Aggregate 3-bet:  {tag_a}={_agg_3bet(pos_a):.1%}  "
-          f"{tag_b}={_agg_3bet(pos_b):.1%}  Δ={d3:+.1%}  (GTO≈8%)")
-
-    # ── Summary ──────────────────────────────────────────────────────────────
-    print()
-    print('  ' + '-' * (W - 2))
-    diff = pass_b_total - pass_a_total
-    sign = f'+{diff}' if diff > 0 else str(diff)
-    print(f"  Spots passed (low-N excluded):  "
-          f"{tag_a}: {pass_a_total}/{spots_counted}   "
-          f"{tag_b}: {pass_b_total}/{spots_counted}  ({sign})")
-    print('=' * W)
-    print()
 
 
 # ---------------------------------------------------------------------------
@@ -950,12 +726,10 @@ def run_comparison(model_a: 'DeepCFR', model_b: 'DeepCFR', engine,
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Validate model strategy on canonical spots across all streets'
+        description='Validate postflop model strategy on key spots'
     )
     parser.add_argument('--model',    type=str, required=True,
                         help='Path to .pt checkpoint file')
-    parser.add_argument('--compare',  type=str, default=None,
-                        help='Second checkpoint to compare against --model side-by-side')
     parser.add_argument('--samples',  type=int, default=1000,
                         help='Number of games to sample (default: 1000)')
     parser.add_argument('--strategy', type=str, default='avg',
@@ -978,24 +752,8 @@ def main():
     engine = _make_engine(num_players)
 
     deep_cfr = _load_model(model_path, config, engine)
-    print(f'Loaded A: {model_path.name}  (iteration {deep_cfr.iteration})')
+    print(f'Loaded: {model_path.name}  (iteration {deep_cfr.iteration})')
 
-    # ── Comparison mode ──────────────────────────────────────────────────────
-    if args.compare:
-        compare_path = Path(args.compare)
-        if not compare_path.exists():
-            print(f'Compare model not found: {compare_path}')
-            sys.exit(1)
-        deep_cfr_b = _load_model(compare_path, config, engine)
-        print(f'Loaded B: {compare_path.name}  (iteration {deep_cfr_b.iteration})')
-        run_comparison(
-            deep_cfr, deep_cfr_b, engine,
-            num_games=args.samples,
-            strategy_mode=args.strategy if args.strategy != 'both' else 'avg',
-        )
-        return
-
-    # ── Single model validation ──────────────────────────────────────────────
     run_validation(
         deep_cfr, engine,
         num_games=args.samples,

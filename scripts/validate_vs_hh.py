@@ -31,6 +31,7 @@ from src.engine import EnhancedPokerEngine
 from src.training import DeepCFR
 from src.utils import load_config
 from src.hand_history import parse_directory, ObservationBuilder, DecisionPoint
+from src.search import PlaytimeStrategy
 
 # Import classifiers and GTO targets from validate_spots
 from validate_spots import (
@@ -870,6 +871,8 @@ def main():
                         help='Limit showdown hands for model comparison (0=all)')
     parser.add_argument('--no-cache', action='store_true',
                         help='Force re-parse, ignore cached data')
+    parser.add_argument('--exploit', type=float, default=0.0,
+                        help='Exploit factor 0.0-1.0 (0=GTO, 1=max exploit vs fish)')
     args = parser.parse_args()
 
     model_path = Path(args.model)
@@ -934,8 +937,17 @@ def main():
         sys.exit(1)
 
     # Run analysis
-    print(f'\nAnalyzing model strategy (mode={args.strategy})...')
-    if args.strategy == 'current':
+    exploit_str = f', exploit={args.exploit}' if args.exploit > 0 else ''
+    print(f'\nAnalyzing model strategy (mode={args.strategy}{exploit_str})...')
+
+    if args.exploit > 0:
+        refiner = PlaytimeStrategy(
+            deep_cfr, num_players=num_players,
+            temperature=1.0, allin_penalty=False,
+            exploit_factor=args.exploit,
+        )
+        sfn = lambda obs, idx, lg: refiner.get_strategy(obs, idx, lg)
+    elif args.strategy == 'current':
         sfn = lambda obs, idx, lg: _current_strategy(deep_cfr, obs, idx, lg)
     else:
         sfn = lambda obs, idx, lg: _avg_strategy(deep_cfr, obs, idx, lg)

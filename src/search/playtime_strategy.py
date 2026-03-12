@@ -1,7 +1,7 @@
 """
-Play-time strategy refinement for reducing all-in bias.
+Play-time strategy refinement with GTO base + exploitative adjustments.
 
-Two techniques applied on top of the raw strategy network output:
+Three layers applied on top of the raw strategy network output:
 
 1. **Temperature sharpening** — raises strategy probabilities to a power
    (1/T) then re-normalizes. T < 1 sharpens the distribution, suppressing
@@ -14,34 +14,51 @@ Two techniques applied on top of the raw strategy network output:
    - Postflop: penalizes shoving when hand strength is low AND the bet
      is a massive overbet relative to the pot (risking 100 to win 5).
 
+3. **Exploit layer** — adjusts bluff/aggression frequencies against weak
+   opponent pools (calling stations). Controlled by exploit_factor:
+     0.0 = pure GTO (no adjustment)
+     1.0 = full exploit (max bluff reduction against stations)
+   The layer dampens raises with weak hands and boosts value bets with
+   strong hands, since fish overcall and under-fold.
+
 Usage:
+    # Pure GTO
     refiner = PlaytimeStrategy(deep_cfr, num_players=6, temperature=0.5)
-    strategy = refiner.get_strategy(obs, player_idx, legal_actions)
+
+    # Exploitative vs fish
+    refiner = PlaytimeStrategy(deep_cfr, num_players=6, temperature=0.5,
+                               exploit_factor=0.7)
 """
 
 import numpy as np
 from typing import List
 
-ALL_IN = 4
+FOLD = 0
+CALL = 1
+RAISE_HALF = 2
 RAISE_FULL = 3
+ALL_IN = 4
 
 
 class PlaytimeStrategy:
 
     def __init__(self, deep_cfr, num_players: int = 6,
                  temperature: float = 0.5,
-                 allin_penalty: bool = True):
+                 allin_penalty: bool = True,
+                 exploit_factor: float = 0.0):
         """
         Args:
-            deep_cfr:      trained DeepCFR instance
-            num_players:   number of players (for observation layout)
-            temperature:   < 1.0 sharpens, 1.0 = no change, > 1.0 softens
-            allin_penalty: if True, apply hand-strength-based all-in penalty
+            deep_cfr:       trained DeepCFR instance
+            num_players:    number of players (for observation layout)
+            temperature:    < 1.0 sharpens, 1.0 = no change, > 1.0 softens
+            allin_penalty:  if True, apply hand-strength-based all-in penalty
+            exploit_factor: 0.0 = pure GTO, 1.0 = max exploit vs calling stations
         """
         self.deep_cfr = deep_cfr
         self.num_players = num_players
         self.temperature = temperature
         self.allin_penalty = allin_penalty
+        self.exploit_factor = max(0.0, min(1.0, exploit_factor))
 
         # Observation layout indices (depend on num_players N):
         #   Position:       N+2 dims  [0 .. N+1]
@@ -76,6 +93,7 @@ class PlaytimeStrategy:
         self._idx_street_flop    = N + 21
         self._idx_street_turn    = N + 22
         self._idx_street_river   = N + 23
+        self._idx_aggression     = N + 26  # aggression_level from GameState
 
     def get_strategy(self, observation: np.ndarray, player_idx: int,
                      legal_actions: List[int]) -> np.ndarray:
@@ -89,6 +107,10 @@ class PlaytimeStrategy:
         # --- All-in penalty ---
         if self.allin_penalty and ALL_IN in legal_actions:
             strategy = self._apply_allin_penalty(strategy, observation, legal_actions)
+
+        # --- Exploit layer (bluff dampening vs calling stations) ---
+        if self.exploit_factor > 0:
+            strategy = self._apply_exploit(strategy, observation, legal_actions)
 
         return strategy
 
@@ -240,3 +262,117 @@ class PlaytimeStrategy:
             penalty = max(0.02, hand_strength * 0.1)
 
         return min(penalty, 1.0)
+
+    # ------------------------------------------------------------------
+    # Exploit layer — adjust strategy against weak/stationy opponents
+    # ------------------------------------------------------------------
+
+    def _apply_exploit(self, strategy: np.ndarray,
+                       observation: np.ndarray,
+                       legal_actions: List[int]) -> np.ndarray:
+        """
+        Exploitative adjustments against calling stations (fish).
+
+        Uses three levers per hand tier:
+        - aggr_mult: scale raise/all-in (>1 = bet more, <1 = bet less)
+        - fold_mult: scale fold (<1 = fold less, >1 = fold more)
+        - call_mult: scale call/check (>1 = call more) — critical for
+          medium hands where we want to call down, not raise or fold
+
+        Core principles vs fish:
+        1. They overcall → value bet big hands, don't bluff
+        2. They're passive → when they bet they have it, but they also
+           overvalue weak hands, so call down with medium+ strength
+        3. Draws have implied odds (fish pay off) → call, don't semi-bluff
+        4. Busted draws / air on river → give up completely
+
+        The exploit_factor (0-1) controls deviation strength from GTO.
+        """
+        if len(observation) <= self._idx_aggression:
+            return strategy
+
+        hand_strength = observation[self._idx_equity]
+        made_hand_cat = observation[self._idx_made_hand_cat]
+        has_flush_draw = observation[self._idx_has_flush_draw] > 0.5
+        has_str_draw = observation[self._idx_has_str_draw] > 0.5
+        top_pair = observation[self._idx_top_pair] > 0.5
+        is_preflop = observation[self._idx_street_preflop] > 0.5
+        is_river = observation[self._idx_street_river] > 0.5
+
+        if is_preflop:
+            return strategy
+
+        ef = self.exploit_factor
+        has_draw = has_flush_draw or has_str_draw
+        call_mult = 1.0  # default: no call adjustment
+
+        if made_hand_cat >= 0.375:
+            # Trips+ — max value, never fold. Fish pay off.
+            aggr_mult = 1.0 + 0.4 * ef
+            fold_mult = max(0.0, 1.0 - 0.95 * ef)
+
+        elif made_hand_cat >= 0.25:
+            # Two pair — strong value, almost never fold
+            aggr_mult = 1.0 + 0.3 * ef
+            fold_mult = max(0.05, 1.0 - 0.85 * ef)
+
+        elif top_pair and hand_strength >= 0.5:
+            # Good top pair — the key battleground vs fish
+            # They bet with worse (weak pairs, draws), so CALL more
+            # Don't raise as much (they fold worse, call better)
+            aggr_mult = 1.0 + 0.1 * ef
+            fold_mult = max(0.1, 1.0 - 0.6 * ef)
+            call_mult = 1.0 + 0.4 * ef  # big call boost
+
+        elif made_hand_cat >= 0.125:
+            # Weak/middle pair — call down more vs fish
+            # They overvalue their hands, our pair often holds up
+            aggr_mult = 1.0
+            fold_mult = max(0.35, 1.0 - 0.3 * ef)
+            call_mult = 1.0 + 0.3 * ef  # call boost
+
+        elif has_draw and not is_river:
+            # Live draws — great implied odds vs fish who pay off
+            # Don't semi-bluff (they don't fold), just call cheaply
+            aggr_mult = max(0.35, 1.0 - 0.5 * ef)
+            fold_mult = max(0.35, 1.0 - 0.4 * ef)
+            call_mult = 1.0 + 0.35 * ef  # prefer calling to raising
+
+        elif has_draw and is_river:
+            # Missed draw on river = busted, zero equity
+            aggr_mult = max(0.05, 1.0 - 0.9 * ef)
+            fold_mult = 1.0 + 0.5 * ef
+
+        else:
+            # Air — no equity, no draw
+            if is_river:
+                # River air vs stations = pure punt, never bluff
+                aggr_mult = max(0.05, 1.0 - 0.9 * ef)
+                fold_mult = 1.0 + 0.5 * ef
+            else:
+                # Flop/turn air — mostly give up, small chance to improve
+                aggr_mult = max(0.15, 1.0 - 0.7 * ef)
+                fold_mult = 1.0 + 0.25 * ef
+
+        strategy = strategy.copy()
+
+        # Apply multipliers
+        for a in [RAISE_HALF, RAISE_FULL, ALL_IN]:
+            if a in legal_actions:
+                strategy[a] *= aggr_mult
+        if FOLD in legal_actions:
+            strategy[FOLD] *= fold_mult
+        if CALL in legal_actions:
+            strategy[CALL] *= call_mult
+
+        # Re-normalize over legal actions
+        legal_mask = np.zeros_like(strategy)
+        legal_mask[legal_actions] = 1.0
+        strategy *= legal_mask
+        total = strategy.sum()
+        if total > 0:
+            strategy /= total
+        else:
+            strategy = legal_mask / legal_mask.sum()
+
+        return strategy
