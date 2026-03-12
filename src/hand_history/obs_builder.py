@@ -60,8 +60,15 @@ class ObservationBuilder:
     def __init__(self, num_players: int = 6):
         self.num_players = num_players
 
-    def build_decision_points(self, hand: ParsedHand) -> List[DecisionPoint]:
-        """Replay a hand and build DecisionPoint at each non-blind decision."""
+    def build_decision_points(self, hand: ParsedHand,
+                              allow_unknown_cards: bool = False) -> List[DecisionPoint]:
+        """Replay a hand and build DecisionPoint at each non-blind decision.
+
+        Args:
+            allow_unknown_cards: If True, build observations even for players
+                without known hole cards (using neutral card features).
+                Useful for supervised learning to include fold examples.
+        """
         active_players = hand.active_players
         if len(active_players) != self.num_players:
             return []
@@ -139,9 +146,11 @@ class ObservationBuilder:
                 button_idx=button_idx,
                 street=current_street,
                 community_cards=community_cards,
+                allow_unknown_cards=allow_unknown_cards,
             )
 
-            if obs is not None and player.hole_cards:
+            has_cards = bool(player.hole_cards)
+            if obs is not None and (has_cards or allow_unknown_cards):
                 rel_pos = (pidx - button_idx) % self.num_players
                 pos_label = _POS_LABELS_6.get(rel_pos, 'MP')
 
@@ -222,21 +231,35 @@ class ObservationBuilder:
     def _build_observation(self, players: List[_PlayerState],
                            player_idx: int, button_idx: int,
                            street: str,
-                           community_cards: List[str]) -> Optional[np.ndarray]:
+                           community_cards: List[str],
+                           allow_unknown_cards: bool = False) -> Optional[np.ndarray]:
         """Build the 38-dim observation vector.
 
         Mirrors FastEnhancedPokerEngine.get_observation() exactly.
+        If allow_unknown_cards is True and hole cards are missing,
+        uses neutral/average values for card-dependent features.
         """
         player = players[player_idx]
-        if not player.hole_cards:
+        if not player.hole_cards and not allow_unknown_cards:
             return None
 
         features = []
         features.append(self._position_features(player_idx, button_idx))
         features.append(self._pot_odds_features(players, player_idx))
-        features.append(self._hand_strength_features(player.hole_cards))
-        features.append(self._stack_features(players, player_idx))
-        features.append(self._equity_features(player.hole_cards, community_cards))
+
+        hole = player.hole_cards
+        if hole:
+            features.append(self._hand_strength_features(hole))
+            features.append(self._stack_features(players, player_idx))
+            features.append(self._equity_features(hole, community_cards))
+        else:
+            # Neutral card features for unknown hands
+            features.append(np.array([0.5, 0.5, 0.5, 0.5, 0.2],
+                                     dtype=np.float32))  # avg hand
+            features.append(self._stack_features(players, player_idx))
+            features.append(np.array([0.45, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                                     dtype=np.float32))  # avg equity
+
         features.append(self._street_features(street))
         features.append(self._game_state_features(players, player_idx))
         features.append(self._betting_history_features(players, player_idx))
