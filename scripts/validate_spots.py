@@ -32,6 +32,7 @@ logging.disable(logging.WARNING)
 from src.engine import EnhancedPokerEngine
 from src.training import DeepCFR
 from src.utils import load_config
+from src.preflop_ranges import PreflopRanges
 
 # ---------------------------------------------------------------------------
 # Action indices (texas_holdem_no_limit_v6)
@@ -390,7 +391,8 @@ def _split_by_street(cat_samples):
 # Core collection loop
 # ---------------------------------------------------------------------------
 
-def collect_samples(deep_cfr, engine, num_games, strategy_fn):
+def collect_samples(deep_cfr, engine, num_games, strategy_fn,
+                    preflop_ranges=None):
     """
     Run num_games hands and record model strategy at every postflop decision.
 
@@ -398,6 +400,7 @@ def collect_samples(deep_cfr, engine, num_games, strategy_fn):
       samples – dict[category → list of (strategy, legal_set, ctx)]
     """
     samples = defaultdict(list)
+    num_players = engine.num_players
 
     for _ in range(num_games):
         engine.reset()
@@ -416,7 +419,16 @@ def collect_samples(deep_cfr, engine, num_games, strategy_fn):
             ctx       = _game_context(engine, agent)
             ctx['street'] = stage  # 'Preflop', 'Flop', 'Turn', 'River'
 
-            strategy = strategy_fn(obs, agent_idx, legal)
+            # Use preflop ranges if available
+            if stage == 'Preflop' and preflop_ranges is not None:
+                cards = engine.get_player_cards(agent)
+                button_idx = engine._button
+                rel_pos = (agent_idx - button_idx) % num_players
+                pot_bb = engine.get_pot_size() / 2.0
+                strategy = preflop_ranges.get_strategy(
+                    cards, rel_pos, pot_bb, legal, deep_cfr.action_size)
+            else:
+                strategy = strategy_fn(obs, agent_idx, legal)
 
             # Only classify and record postflop decisions
             if stage != 'Preflop':
@@ -439,11 +451,13 @@ def collect_samples(deep_cfr, engine, num_games, strategy_fn):
 # EV test: model player vs random opponents
 # ---------------------------------------------------------------------------
 
-def run_ev_test(deep_cfr, engine, num_games, strategy_fn):
+def run_ev_test(deep_cfr, engine, num_games, strategy_fn,
+                preflop_ranges=None):
     """Run model (player_0) vs random agents for num_games hands.
     Returns average chips won per hand (positive = profitable)."""
     model_agent  = 'player_0'
     total_reward = 0.0
+    num_players  = engine.num_players
 
     for _ in range(num_games):
         engine.reset()
@@ -458,7 +472,18 @@ def run_ev_test(deep_cfr, engine, num_games, strategy_fn):
             if agent == model_agent:
                 obs      = engine.get_observation()
                 idx      = engine.agents.index(agent)
-                strategy = strategy_fn(obs, idx, legal)
+                stage    = engine.get_stage()
+
+                if stage == 'Preflop' and preflop_ranges is not None:
+                    cards = engine.get_player_cards(agent)
+                    button_idx = engine._button
+                    rel_pos = (idx - button_idx) % num_players
+                    pot_bb = engine.get_pot_size() / 2.0
+                    strategy = preflop_ranges.get_strategy(
+                        cards, rel_pos, pot_bb, legal, deep_cfr.action_size)
+                else:
+                    strategy = strategy_fn(obs, idx, legal)
+
                 probs    = strategy[legal].copy()
                 probs   /= probs.sum()
                 action   = int(np.random.choice(legal, p=probs))
@@ -503,7 +528,7 @@ def _print_spot_row(label, stats, spot, low_n_thresh=20, indent='  '):
 
 def run_validation(deep_cfr, engine, num_games: int = 1000,
                    verbose: bool = True, strategy_mode: str = 'avg',
-                   ev_games: int = 0) -> dict:
+                   ev_games: int = 0, preflop_ranges=None) -> dict:
     """
     Run postflop validation and return a results dict.
     Backward-compatible with train_gpu.py usage:
@@ -525,7 +550,8 @@ def run_validation(deep_cfr, engine, num_games: int = 1000,
     all_mode_results = {}
     for mode in modes:
         sfn = _make_strategy_fn(mode)
-        samples = collect_samples(deep_cfr, engine, num_games, sfn)
+        samples = collect_samples(deep_cfr, engine, num_games, sfn,
+                                  preflop_ranges=preflop_ranges)
         all_mode_results[mode] = samples
 
     primary_mode = modes[0]
@@ -626,7 +652,8 @@ def run_validation(deep_cfr, engine, num_games: int = 1000,
         if verbose:
             print(f'\n  ── EV TEST (model player_0 vs random, {ev_games} hands) ──')
         sfn    = _make_strategy_fn(primary_mode)
-        ev_per_hand = run_ev_test(deep_cfr, engine, ev_games, sfn)
+        ev_per_hand = run_ev_test(deep_cfr, engine, ev_games, sfn,
+                                  preflop_ranges=preflop_ranges)
         results['_ev'] = ev_per_hand
         if verbose:
             sign = '+' if ev_per_hand >= 0 else ''
@@ -737,6 +764,8 @@ def main():
                         help='Strategy to evaluate: avg (default), current, or both')
     parser.add_argument('--ev-games', type=int, default=0,
                         help='If > 0, run EV test vs random agents for this many hands')
+    parser.add_argument('--no-preflop-ranges', action='store_true',
+                        help='Disable preflop range override (default: ranges enabled)')
     args = parser.parse_args()
 
     model_path = Path(args.model)
@@ -754,11 +783,16 @@ def main():
     deep_cfr = _load_model(model_path, config, engine)
     print(f'Loaded: {model_path.name}  (iteration {deep_cfr.iteration})')
 
+    pf_ranges = None if args.no_preflop_ranges else PreflopRanges()
+    if pf_ranges:
+        print('Preflop: GTO ranges (locked)')
+
     run_validation(
         deep_cfr, engine,
         num_games=args.samples,
         strategy_mode=args.strategy,
         ev_games=args.ev_games,
+        preflop_ranges=pf_ranges,
     )
 
 

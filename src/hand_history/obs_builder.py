@@ -1,4 +1,4 @@
-"""Reconstruct 38-dim observation vectors from parsed hand histories.
+"""Reconstruct 41-dim observation vectors from parsed hand histories.
 
 Replicates the exact feature computation from FastEnhancedPokerEngine
 (src/engine/fast_enhanced_engine.py) using game state reconstructed
@@ -53,7 +53,7 @@ class _PlayerState:
 class ObservationBuilder:
     """Build observation vectors from parsed hand histories.
 
-    Produces the same 38-dim (for 6-player) feature vector as
+    Produces the same 41-dim (for 6-player) feature vector as
     FastEnhancedPokerEngine.
     """
 
@@ -233,7 +233,7 @@ class ObservationBuilder:
                            street: str,
                            community_cards: List[str],
                            allow_unknown_cards: bool = False) -> Optional[np.ndarray]:
-        """Build the 38-dim observation vector.
+        """Build the 41-dim observation vector.
 
         Mirrors FastEnhancedPokerEngine.get_observation() exactly.
         If allow_unknown_cards is True and hole cards are missing,
@@ -432,7 +432,8 @@ class ObservationBuilder:
 
     def _game_state_features(self, players: List[_PlayerState],
                              player_idx: int) -> np.ndarray:
-        """3 dims: players_alive_norm, call_amount_norm, aggression_level."""
+        """6 dims: players_alive_norm, call_amount_norm, aggression_level,
+           facing_bet, bet_to_pot, can_raise."""
         player = players[player_idx]
 
         # alive = active or all-in (stake==0 but not folded)
@@ -450,8 +451,20 @@ class ObservationBuilder:
         aggression_level = float(np.clip(
             math.log(ratio) / math.log(20), 0.0, 1.0))
 
+        # New facing-bet features
+        facing_bet = 1.0 if call_amount > 0 else 0.0
+        bet_to_pot = float(np.clip(
+            call_amount / max(pot - call_amount, 1), 0.0, 2.0)) / 2.0
+
+        # Can we raise? Check if stack covers more than the call
+        # min_bet approximation: use big_blind as min raise increment
+        min_raise = big_blind
+        can_raise = 1.0 if (player.stake > call_amount and
+                            min_raise <= player.stake - call_amount) else 0.0
+
         return np.array(
-            [players_alive_norm, call_amount_norm, aggression_level],
+            [players_alive_norm, call_amount_norm, aggression_level,
+             facing_bet, bet_to_pot, can_raise],
             dtype=np.float32)
 
     def _betting_history_features(self, players: List[_PlayerState],

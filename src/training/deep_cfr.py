@@ -74,10 +74,10 @@ class StrategyNetwork(nn.Module):
             prev_size = hidden_size
 
         layers.append(nn.Linear(prev_size, output_size))
-        layers.append(nn.Softmax(dim=-1))
         self.network = nn.Sequential(*layers)
 
     def forward(self, x):
+        """Returns raw logits (not probabilities). Apply masked softmax externally."""
         return self.network(x)
 
 
@@ -101,6 +101,7 @@ class ReplayBuffer:
         self.actions = np.zeros(capacity, dtype=np.int64)
         self.regrets = np.zeros(capacity, dtype=np.float32)
         self.strategies = np.zeros((capacity, act_size), dtype=np.float32)
+        self.legal_masks = np.zeros((capacity, act_size), dtype=np.float32)
         self.players = np.zeros(capacity, dtype=np.int32)
         self.iterations = np.zeros(capacity, dtype=np.float64)
 
@@ -110,12 +111,18 @@ class ReplayBuffer:
         self._dirty = True
 
     def add(self, state: np.ndarray, action: int, regret: float,
-            strategy: np.ndarray, player: int, iteration: int = 1):
+            strategy: np.ndarray, player: int, iteration: int = 1,
+            legal_mask: np.ndarray = None):
         i = self._pos
         self.states[i] = state
         self.actions[i] = action
         self.regrets[i] = regret
         self.strategies[i] = strategy
+        if legal_mask is not None:
+            self.legal_masks[i] = legal_mask
+        else:
+            # Fallback: infer from strategy (non-zero = legal)
+            self.legal_masks[i] = (strategy > 0).astype(np.float32)
         self.players[i] = player
         self.iterations[i] = max(iteration, 1)
 
@@ -159,7 +166,8 @@ class ReplayBuffer:
         actions_t = torch.from_numpy(self.actions[sel]).to(device, non_blocking=True)
         regrets_t = torch.from_numpy(self.regrets[sel]).to(device, non_blocking=True)
         strategies_t = torch.from_numpy(self.strategies[sel]).to(device, non_blocking=True)
-        return states_t, actions_t, regrets_t, strategies_t
+        legal_masks_t = torch.from_numpy(self.legal_masks[sel]).to(device, non_blocking=True)
+        return states_t, actions_t, regrets_t, strategies_t, legal_masks_t
 
     def sample_player(self, batch_size: int, player_idx: int) -> List[Dict]:
         """Legacy dict-based sampling (kept for compatibility)."""
@@ -264,15 +272,25 @@ class DeepCFR:
         obs_tensor = torch.FloatTensor(observation).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
-            strategy = self.strategy_networks[player_idx](obs_tensor).cpu().numpy()[0]
+            logits = self.strategy_networks[player_idx](obs_tensor).cpu().numpy()[0]
 
-        legal_mask = np.zeros(self.action_size)
-        legal_mask[legal_actions] = 1
+        # Masked softmax: set illegal actions to -inf, then softmax
+        strategy = np.full(self.action_size, -1e9, dtype=np.float32)
+        for a in legal_actions:
+            strategy[a] = logits[a]
+
+        # Numerically stable softmax over legal actions
+        strategy -= strategy.max()
+        exp_s = np.exp(strategy)
+        strategy = exp_s / exp_s.sum()
+
+        # Zero out any residual mass on illegal actions (from exp(-1e9) ≈ 0)
+        legal_mask = np.zeros(self.action_size, dtype=np.float32)
+        legal_mask[legal_actions] = 1.0
         strategy = strategy * legal_mask
-
-        strategy_sum = strategy.sum()
-        if strategy_sum > 0:
-            strategy = strategy / strategy_sum
+        s = strategy.sum()
+        if s > 0:
+            strategy /= s
         else:
             strategy = legal_mask / legal_mask.sum()
 
@@ -323,7 +341,7 @@ class DeepCFR:
                 batch_size, player_idx, self.device)
             if batch is None:
                 continue
-            states, actions, regrets, _ = batch
+            states, actions, regrets, _, _ = batch
 
             self.advantage_optimizers[player_idx].zero_grad()
 
@@ -358,15 +376,31 @@ class DeepCFR:
                 batch_size, player_idx, self.device)
             if batch is None:
                 continue
-            states, _, _, target_strategies = batch
+            states, _, _, target_strategies, legal_masks = batch
 
             self.strategy_optimizers[player_idx].zero_grad()
 
             with torch.cuda.amp.autocast(enabled=self._amp_enabled):
-                predicted = self.strategy_networks[player_idx](states)
-                loss = nn.KLDivLoss(reduction='batchmean')(
-                    torch.log(predicted + 1e-8), target_strategies
+                logits = self.strategy_networks[player_idx](states)
+
+                # Mask illegal actions to -inf before log_softmax
+                logits = logits + (1.0 - legal_masks) * (-1e9)
+                log_probs = torch.log_softmax(logits, dim=-1)
+
+                # Renormalize targets to legal actions only (safety)
+                masked_targets = target_strategies * legal_masks
+                target_sums = masked_targets.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+                masked_targets = masked_targets / target_sums
+
+                # KL divergence only on legal actions
+                # KL = sum(target * (log(target) - log_pred))
+                # Only compute where legal_masks == 1
+                kl_per_action = masked_targets * (
+                    torch.log(masked_targets + 1e-8) - log_probs
                 )
+                # Zero out illegal actions
+                kl_per_action = kl_per_action * legal_masks
+                loss = kl_per_action.sum(dim=-1).mean()
 
             self._scaler.scale(loss).backward()
             self._scaler.unscale_(self.strategy_optimizers[player_idx])

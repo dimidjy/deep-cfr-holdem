@@ -308,6 +308,23 @@ class FastPokerEngine:
             'agents': list(self.agents),
         }
 
+    def __deepcopy__(self, memo):
+        """Custom deepcopy — pokers State objects are immutable, so shallow-copy them."""
+        import copy as _copy
+        cls = self.__class__
+        new = cls.__new__(cls)
+        memo[id(self)] = new
+        for k, v in self.__dict__.items():
+            if k in ('_state', '_initial_state', '_pending_state'):
+                # Immutable Rust objects — safe to share references
+                setattr(new, k, v)
+            elif k == '_proxy':
+                # Rebuild proxy pointing to new engine
+                setattr(new, k, _GameProxy(new))
+            else:
+                setattr(new, k, _copy.deepcopy(v, memo))
+        return new
+
     def close(self):
         pass  # nothing to clean up
 

@@ -66,7 +66,7 @@ class FastEnhancedPokerEngine(FastPokerEngine):
         if self.add_street_features:
             size += 4
         if self.add_game_state_features:
-            size += 3
+            size += 6
         if self.add_betting_history_features:
             size += 5
         return size
@@ -330,11 +330,22 @@ class FastEnhancedPokerEngine(FastPokerEngine):
             aggression_level = float(np.clip(
                 math.log(ratio) / math.log(20), 0.0, 1.0))
 
+            # New facing-bet features
+            facing_bet = 1.0 if call_amount > 0 else 0.0
+            bet_to_pot = float(np.clip(
+                call_amount / max(pot - call_amount, 1), 0.0, 2.0)) / 2.0
+
+            # Can we raise? Check if stack covers more than the call
+            my_stake = ps.stake
+            can_raise = 1.0 if (my_stake > call_amount and
+                                self._state.min_bet <= my_stake - call_amount) else 0.0
+
             return np.array(
-                [players_alive_norm, call_amount_norm, aggression_level],
+                [players_alive_norm, call_amount_norm, aggression_level,
+                 facing_bet, bet_to_pot, can_raise],
                 dtype=np.float32)
         except Exception:
-            return np.array([1.0, 0.0, 0.0], dtype=np.float32)
+            return np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
     def _get_betting_history_features(self) -> np.ndarray:
         try:

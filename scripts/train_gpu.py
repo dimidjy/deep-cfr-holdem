@@ -221,6 +221,8 @@ def _traversal_worker(args):
     def _make_steps(obs, legal_int, branch_rewards, strategy):
         """Turn branch rewards + strategy into buffer-ready step dicts."""
         ev = sum(strategy[a] * branch_rewards[a] / _REWARD_SCALE for a in legal_int)
+        legal_mask = np.zeros(_ACT_SIZE, dtype=np.float32)
+        legal_mask[legal_int] = 1.0
         return [{
             'player':   player_idx,
             'obs':      obs,
@@ -229,6 +231,7 @@ def _traversal_worker(args):
             'regret':   float(np.clip(branch_rewards[a] / _REWARD_SCALE - ev,
                                       -_REGRET_CLIP, _REGRET_CLIP)),
             'strategy': strategy,
+            'legal_mask': legal_mask,
         } for a in legal_int]
 
     # ── Save game state for deterministic replay ────────────────────────────
@@ -512,7 +515,8 @@ def main():
                 for step in steps:
                     deep_cfr.replay_buffer.add(
                         step['obs'], step['action'], step['regret'],
-                        step['strategy'], step['player'], iteration=iter_num
+                        step['strategy'], step['player'], iteration=iter_num,
+                        legal_mask=step.get('legal_mask')
                     )
 
             # ── Pipeline: push weights & launch next traversals BEFORE training

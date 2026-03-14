@@ -32,6 +32,7 @@ from src.training import DeepCFR
 from src.utils import load_config
 from src.hand_history import parse_directory, ObservationBuilder, DecisionPoint
 from src.search import PlaytimeStrategy
+from src.preflop_ranges import PreflopRanges
 
 # Import classifiers and GTO targets from validate_spots
 from validate_spots import (
@@ -108,7 +109,8 @@ def _load_model(model_path: Path, config: dict, num_players: int) -> 'DeepCFR':
 # ──────────────────────────────────────────────────────────────────────────────
 
 def analyze_decision_points(deep_cfr, decision_points: list,
-                            strategy_fn, num_players: int):
+                            strategy_fn, num_players: int,
+                            preflop_ranges=None):
     """Analyze model strategy at each decision point from hand histories.
 
     Returns dicts of metrics for reporting.
@@ -136,6 +138,9 @@ def analyze_decision_points(deep_cfr, decision_points: list,
     # Track which (hand, player) combos we've counted for position stats
     seen_preflop = set()
 
+    # Position label → relative position for preflop ranges
+    _POS_TO_REL = {'BTN': 0, 'SB': 1, 'BB': 2, 'UTG': 3, 'MP': 4, 'CO': 5}
+
     for dp in decision_points:
         legal = dp.legal_actions
         if not legal:
@@ -143,7 +148,18 @@ def analyze_decision_points(deep_cfr, decision_points: list,
 
         # Use relative position as player_idx for model query
         rel_pos = _pos_to_idx(dp.position_label, num_players)
-        model_strategy = strategy_fn(dp.observation, rel_pos, legal)
+
+        # Preflop range override
+        if (dp.street == 'preflop' and preflop_ranges is not None
+                and dp.hole_cards and len(dp.hole_cards) >= 2):
+            pf_rel = _POS_TO_REL.get(dp.position_label, 0)
+            # Estimate pot_bb from context: no raise=1.5BB, single raise~5BB,
+            # 3bet~15BB, 4bet+~45BB. Use fold legality as proxy.
+            pot_bb = 1.5 if FOLD not in legal else 5.0
+            model_strategy = preflop_ranges.get_strategy(
+                dp.hole_cards, pf_rel, pot_bb, legal, deep_cfr.action_size)
+        else:
+            model_strategy = strategy_fn(dp.observation, rel_pos, legal)
 
         actual = dp.actual_action
         street = dp.street
@@ -339,7 +355,8 @@ def compute_nl5_population_stats(all_6p_hands: list, num_players: int = 6):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def compute_showdown_ev(showdown_hands: list, all_decision_points: list,
-                        strategy_fn, deep_cfr, num_players: int):
+                        strategy_fn, deep_cfr, num_players: int,
+                        preflop_ranges=None):
     """Estimate model's EV advantage vs NL5 players at showdown hands.
 
     For each showdown player with known hole cards:
@@ -402,7 +419,20 @@ def compute_showdown_ev(showdown_hands: list, all_decision_points: list,
                     hand, player_name, dp.action_index)
 
                 rel_pos = _pos_to_idx(dp.position_label, num_players)
-                model_strategy = strategy_fn(dp.observation, rel_pos, legal)
+
+                # Preflop range override
+                if (dp.street == 'preflop' and preflop_ranges is not None
+                        and dp.hole_cards and len(dp.hole_cards) >= 2):
+                    _POS_TO_REL_EV = {'BTN': 0, 'SB': 1, 'BB': 2,
+                                      'UTG': 3, 'MP': 4, 'CO': 5}
+                    pf_rel = _POS_TO_REL_EV.get(dp.position_label, 0)
+                    pot_bb = 1.5 if FOLD not in legal else 5.0
+                    model_strategy = preflop_ranges.get_strategy(
+                        dp.hole_cards, pf_rel, pot_bb, legal,
+                        deep_cfr.action_size)
+                else:
+                    model_strategy = strategy_fn(dp.observation, rel_pos, legal)
+
                 model_top = int(np.argmax(model_strategy))
 
                 if model_top == FOLD and FOLD in legal:
@@ -568,17 +598,14 @@ def print_report(metrics: dict, parse_stats: dict, deep_cfr, num_dp: int):
     model_samples = metrics['model_samples']
     nl5_samples = metrics['nl5_samples']
 
+    # All SPOTS are postflop categories
+    print(f"\n  ── POST-FLOP ──")
+    print(hdr)
+    print(sep)
+
     for spot in SPOTS:
         cat = spot['category']
-        street = spot['street']
         label = spot['label'][:30]
-
-        if street != current_street:
-            current_street = street
-            section = {'preflop': 'PREFLOP', 'postflop': 'POST-FLOP'}.get(street, '')
-            print(f"\n  ── {section} ──")
-            print(hdr)
-            print(sep)
 
         m_stats = _compute_spot_stats(model_samples.get(cat, []))
         n_stats = _compute_spot_stats(nl5_samples.get(cat, []))
@@ -873,6 +900,8 @@ def main():
                         help='Force re-parse, ignore cached data')
     parser.add_argument('--exploit', type=float, default=0.0,
                         help='Exploit factor 0.0-1.0 (0=GTO, 1=max exploit vs fish)')
+    parser.add_argument('--no-preflop-ranges', action='store_true',
+                        help='Disable preflop range override (default: ranges enabled)')
     args = parser.parse_args()
 
     model_path = Path(args.model)
@@ -936,6 +965,11 @@ def main():
         print('No decision points extracted. Check parser/obs_builder.')
         sys.exit(1)
 
+    # Load preflop ranges
+    pf_ranges = None if args.no_preflop_ranges else PreflopRanges()
+    if pf_ranges:
+        print('Preflop: GTO ranges (locked)')
+
     # Run analysis
     exploit_str = f', exploit={args.exploit}' if args.exploit > 0 else ''
     print(f'\nAnalyzing model strategy (mode={args.strategy}{exploit_str})...')
@@ -953,7 +987,8 @@ def main():
         sfn = lambda obs, idx, lg: _avg_strategy(deep_cfr, obs, idx, lg)
 
     metrics = analyze_decision_points(
-        deep_cfr, all_decision_points, sfn, num_players)
+        deep_cfr, all_decision_points, sfn, num_players,
+        preflop_ranges=pf_ranges)
 
     # Override NL5 position stats with population-level data
     metrics['nl5_pos'] = nl5_pop_pos
@@ -961,7 +996,8 @@ def main():
     # Showdown EV analysis
     print(f'Computing showdown EV analysis...')
     ev_data = compute_showdown_ev(
-        showdown, all_decision_points, sfn, deep_cfr, num_players)
+        showdown, all_decision_points, sfn, deep_cfr, num_players,
+        preflop_ranges=pf_ranges)
     metrics['showdown_ev'] = ev_data
 
     parse_stats = {
