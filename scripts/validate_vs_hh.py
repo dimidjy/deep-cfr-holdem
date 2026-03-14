@@ -902,6 +902,8 @@ def main():
                         help='Exploit factor 0.0-1.0 (0=GTO, 1=max exploit vs fish)')
     parser.add_argument('--no-preflop-ranges', action='store_true',
                         help='Disable preflop range override (default: ranges enabled)')
+    parser.add_argument('--supervised', action='store_true',
+                        help='Load as supervised model (StrategyNetwork) instead of Deep CFR')
     args = parser.parse_args()
 
     model_path = Path(args.model)
@@ -918,13 +920,32 @@ def main():
     config_path = Path(__file__).parent.parent / 'configs/training_config.json'
     config = load_config(str(config_path))
 
-    num_players = _autodetect_players(model_path)
-    print(f'Auto-detected: {num_players} players')
+    if args.supervised:
+        # Load supervised model (StrategyNetwork checkpoint)
+        from src.training.deep_cfr import StrategyNetwork
+        from train_supervised import SupervisedModelWrapper
+        ckpt = torch.load(str(model_path), map_location='cpu')
+        num_players = ckpt.get('num_players', 6)
+        obs_size = ckpt['obs_size']
+        action_size = ckpt['action_size']
+        hidden_layers = ckpt['hidden_layers']
+        dropout = ckpt.get('dropout', 0.1)
+        model = StrategyNetwork(obs_size, action_size, hidden_layers, dropout)
+        model.load_state_dict(ckpt['model_state_dict'])
+        model.eval()
+        deep_cfr = SupervisedModelWrapper(
+            model, obs_size, action_size, num_players, 'cpu',
+            iteration=ckpt.get('epoch', 0))
+        print(f'Auto-detected: {num_players} players')
+        print(f'Loaded supervised model: {model_path.name}  (epoch {deep_cfr.iteration})')
+    else:
+        num_players = _autodetect_players(model_path)
+        print(f'Auto-detected: {num_players} players')
 
-    deep_cfr = _load_model(model_path, config, num_players)
-    for net in deep_cfr.advantage_networks + deep_cfr.strategy_networks:
-        net.eval()
-    print(f'Loaded model: {model_path.name}  (iteration {deep_cfr.iteration})')
+        deep_cfr = _load_model(model_path, config, num_players)
+        for net in deep_cfr.advantage_networks + deep_cfr.strategy_networks:
+            net.eval()
+        print(f'Loaded model: {model_path.name}  (iteration {deep_cfr.iteration})')
 
     # Parse hand histories (incremental with early stopping)
     print(f'\nParsing hand histories from {hh_dir} (recursive)...')

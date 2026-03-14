@@ -352,6 +352,8 @@ def _traversal_worker(args):
 def main():
     parser = argparse.ArgumentParser(description='Deep CFR — multi-core CPU traversal + GPU training')
     parser.add_argument('--resume',  type=str,   default=None, help='Checkpoint to resume from')
+    parser.add_argument('--warm-start', type=str, default=None,
+                        help='Supervised model (.pt) to warm-start strategy networks from')
     parser.add_argument('--workers', type=int,   default=None, help='CPU worker count (default: cpu_count - 1)')
     parser.add_argument('--device',  type=str,   default=None, help='cuda | cpu (auto-detected if omitted)')
     parser.add_argument('--lr',      type=float, default=None, help='Override learning rate after resume')
@@ -379,6 +381,8 @@ def main():
         print(f'  GPU      : {torch.cuda.get_device_name(0)}')
     print(f'  engine   : fast (Rust)')
     print(f'  preflop  : {"GTO ranges (locked)" if args.preflop_ranges else "neural net (learned)"}')
+    if args.warm_start:
+        print(f'  warm-start: {Path(args.warm_start).name}')
     print(f'  workers  : {num_workers}')
     print(f'  players  : {num_players}')
     print(f'  iters    : {config["training"]["num_iterations"]}')
@@ -428,6 +432,22 @@ def main():
             for opt in deep_cfr.strategy_optimizers
         ]
         print(f'LR set to {new_lr}, schedulers rebuilt (T_max={cfg_t_max})')
+
+    if args.warm_start and not args.resume:
+        ws_path = Path(args.warm_start)
+        if not ws_path.exists():
+            print(f'Warm-start file not found: {ws_path}')
+            sys.exit(1)
+        ckpt = torch.load(str(ws_path), map_location=device)
+        if 'model_state_dict' not in ckpt:
+            print(f'Warning: no model_state_dict in {ws_path.name}, skipping warm-start')
+        else:
+            state = ckpt['model_state_dict']
+            for i, net in enumerate(deep_cfr.strategy_networks):
+                net.load_state_dict(state)
+            print(f'Warm-start: loaded supervised model into all {num_players} strategy networks')
+            print(f'  source: {ws_path.name}  epoch={ckpt.get("epoch", "?")}  '
+                  f'val_acc={ckpt.get("val_acc", 0):.1%}')
 
     # Shared-memory CPU copies so workers can read current network weights.
     shared_adv_nets = []
