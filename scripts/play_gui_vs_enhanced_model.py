@@ -7,9 +7,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from src.gui import PokerGUI
 from src.training import DeepCFR, ModelAdapter
+from src.training.deep_cfr import StrategyNetwork
 from src.engine import FastEnhancedPokerEngine
 from src.search import DepthLimitedSearch, PlaytimeStrategy
 from src.preflop_ranges import PreflopRanges
+from src.blended_model import BlendedModel
+import numpy as np
 import torch
 
 
@@ -27,12 +30,54 @@ def _make_engine(num_players: int) -> FastEnhancedPokerEngine:
     )
 
 
+class _SupervisedWrapper:
+    """Wraps a supervised StrategyNetwork to look like DeepCFR for the GUI."""
+
+    def __init__(self, model, obs_size, action_size, num_players, iteration=0):
+        self.action_size = action_size
+        self.num_players = num_players
+        self.device = torch.device('cpu')
+        self.iteration = iteration
+        self.strategy_networks = [model] * num_players
+        self.advantage_networks = [model] * num_players
+
+    def get_strategy(self, observation, player_idx, legal_actions):
+        obs_t = torch.FloatTensor(observation).unsqueeze(0)
+        with torch.no_grad():
+            logits = self.strategy_networks[player_idx](obs_t).numpy()[0]
+        masked = np.full(self.action_size, -1e9, dtype=np.float32)
+        for a in legal_actions:
+            masked[a] = logits[a]
+        masked -= masked.max()
+        exp_s = np.exp(masked)
+        return exp_s / exp_s.sum()
+
+
 def load_model(model_path: str, num_players: int = 6):
     print(f"\nLoading ENHANCED model from: {model_path}")
 
     # Auto-detect player count from checkpoint input size
     try:
         checkpoint = torch.load(model_path, map_location='cpu')
+
+        # Supervised model (from train_supervised.py)
+        if 'model_state_dict' in checkpoint and 'advantage_networks' not in checkpoint:
+            num_players = checkpoint.get('num_players', num_players)
+            print(f"  Supervised model detected ({num_players} players)")
+            engine = _make_engine(num_players)
+            obs_size = checkpoint.get('obs_size', engine.get_observation_space_size())
+            action_size = checkpoint.get('action_size', engine.get_action_space_size())
+            hidden = checkpoint.get('hidden_layers', [512, 512, 256])
+            dropout = checkpoint.get('dropout', 0.1)
+            model = StrategyNetwork(obs_size, action_size, hidden, dropout)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            model.eval()
+            wrapper = _SupervisedWrapper(model, obs_size, action_size,
+                                         num_players, checkpoint.get('epoch', 0))
+            print(f"✓ Supervised model loaded (epoch {checkpoint.get('epoch', '?')})")
+            return wrapper, engine, num_players
+
+        # Deep CFR model
         if 'advantage_networks' in checkpoint and len(checkpoint['advantage_networks']) > 0:
             first_layer_weight = checkpoint['advantage_networks'][0]['network.0.weight']
             model_input_size = first_layer_weight.shape[1]
@@ -109,6 +154,8 @@ def main():
     parser.add_argument('--temperature', type=float, default=0.5, help='Strategy temperature (lower=sharper, default: 0.5)')
     parser.add_argument('--no-preflop-ranges', action='store_true', help='Disable GTO preflop range override')
     parser.add_argument('--exploit', type=float, default=0.0, help='Exploit factor 0.0-1.0 (0=GTO, 0.7=good vs fish)')
+    parser.add_argument('--blend', type=str, default=None, help='Deep CFR model for fold decisions (blended mode: fold from CFR, call/raise from --model)')
+    parser.add_argument('--fold-blend', type=float, default=1.0, help='Fold blend factor 0.0-1.0 (default: 1.0)')
 
     args = parser.parse_args()
     
@@ -131,11 +178,28 @@ def main():
         print("\nUse --list to see available models")
         return
     
-    deep_cfr, engine, trained_players = load_model(str(model_path), args.players)
-    if deep_cfr is None or engine is None:
-        print("\n⚠️  If you're trying to load a BASE model, use:")
-        print("    python3 scripts/play_gui_vs_model.py --model", args.model)
-        return
+    # Blended mode: supervised + CFR
+    if args.blend:
+        blend_path = Path(args.blend)
+        if not blend_path.exists():
+            print(f"❌ Blend model not found: {blend_path}")
+            return
+        config = load_config()
+        deep_cfr = BlendedModel(
+            supervised_path=str(model_path),
+            cfr_path=str(blend_path),
+            config=config,
+            num_players=args.players,
+            fold_blend=args.fold_blend,
+        )
+        engine = _make_engine(args.players)
+        trained_players = args.players
+    else:
+        deep_cfr, engine, trained_players = load_model(str(model_path), args.players)
+        if deep_cfr is None or engine is None:
+            print("\n⚠️  If you're trying to load a BASE model, use:")
+            print("    python3 scripts/play_gui_vs_model.py --model", args.model)
+            return
 
     # Set up depth-limited search if requested
     search = None

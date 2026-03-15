@@ -106,3 +106,7 @@ class DecisionPoint:
     player_idx: int = 0              # index in active player list
     hand_id: str = ''                # hand ID for grouping
     action_index: int = 0            # index of this action for the player in the hand
+    pot_dollars: float = 0.0         # pot size in dollars at decision time
+    source_file: str = ''            # source HH file path (for file-based splits)
+    player_net_dollars: float = 0.0  # player's net profit/loss for this hand
+    is_last_action: bool = False     # True if this is the player's final action in the hand

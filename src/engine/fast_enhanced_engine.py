@@ -22,6 +22,22 @@ try:
 except ImportError:
     _TREYS_AVAILABLE = False
 
+try:
+    import eval7 as _eval7
+    _RANKS = '23456789TJQKA'
+    _all_combos = []
+    for _i, _r1 in enumerate(_RANKS):
+        for _j, _r2 in enumerate(_RANKS):
+            if _i < _j:
+                _all_combos.append(f'{_r2}{_r1}s')
+                _all_combos.append(f'{_r2}{_r1}o')
+            elif _i == _j:
+                _all_combos.append(f'{_r1}{_r2}')
+    _EVAL7_RANDOM_RANGE = _eval7.HandRange(','.join(_all_combos))
+    _EVAL7_AVAILABLE = True
+except ImportError:
+    _EVAL7_AVAILABLE = False
+
 
 class FastEnhancedPokerEngine(FastPokerEngine):
     """
@@ -37,7 +53,8 @@ class FastEnhancedPokerEngine(FastPokerEngine):
                  add_equity_features: bool = True,
                  add_street_features: bool = True,
                  add_game_state_features: bool = True,
-                 add_betting_history_features: bool = True):
+                 add_betting_history_features: bool = True,
+                 legacy_game_state: bool = False):
         self.add_position_features = add_position_features
         self.add_pot_odds_features = add_pot_odds_features
         self.add_hand_strength_features = add_hand_strength_features
@@ -46,6 +63,7 @@ class FastEnhancedPokerEngine(FastPokerEngine):
         self.add_street_features = add_street_features
         self.add_game_state_features = add_game_state_features
         self.add_betting_history_features = add_betting_history_features
+        self.legacy_game_state = legacy_game_state  # 3 dims instead of 6
 
         self.num_players = num_players
         self.enhanced_obs_size = self._calculate_enhanced_size()
@@ -66,7 +84,7 @@ class FastEnhancedPokerEngine(FastPokerEngine):
         if self.add_street_features:
             size += 4
         if self.add_game_state_features:
-            size += 6
+            size += 3 if self.legacy_game_state else 6
         if self.add_betting_history_features:
             size += 5
         return size
@@ -205,24 +223,27 @@ class FastEnhancedPokerEngine(FastPokerEngine):
             r1 = self._rank_to_value(_pkrs_card_rank(hole[0]))
             r2 = self._rank_to_value(_pkrs_card_rank(hole[1]))
             hi, lo = max(r1, r2), min(r1, r2)
-            is_pair = (r1 == r2)
-            is_suited = (_pkrs_card_suit(hole[0]) == _pkrs_card_suit(hole[1]))
+
+            # Monte Carlo equity vs random range (eval7)
+            def _to_card_str(c):
+                return _pkrs_card_rank(c) + _pkrs_card_suit(c).lower()
+
+            if _EVAL7_AVAILABLE:
+                try:
+                    e7_hole = [_eval7.Card(_to_card_str(c)) for c in hole[:2]]
+                    e7_board = [_eval7.Card(_to_card_str(c)) for c in board_pkrs] if board_pkrs else []
+                    n_samples = 1000 if not board_pkrs else 300
+                    hand_strength = _eval7.py_hand_vs_range_monte_carlo(
+                        e7_hole, _EVAL7_RANDOM_RANGE, e7_board, n_samples)
+                except Exception:
+                    hand_strength = self._approx_preflop_equity(hole)
+            else:
+                hand_strength = self._approx_preflop_equity(hole)
 
             if not board_pkrs:
-                # Preflop equity approximation
-                if is_pair:
-                    hs = 0.53 + (hi - 2) / 12.0 * 0.32
-                else:
-                    gap_penalty = max(0, hi - lo - 1) * 0.01
-                    suited_bonus = 0.03 if is_suited else 0.0
-                    hs = (0.36
-                          + (hi - 2) / 12.0 * 0.15
-                          + (lo - 2) / 12.0 * 0.08
-                          + suited_bonus - gap_penalty)
-                hs = float(np.clip(hs, 0.0, 1.0))
-                return np.array([hs, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
+                return np.array([hand_strength, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
 
-            # Postflop: treys evaluation
+            # Postflop: treys for made hand category + texture features
             def _to_treys(c):
                 return TreysCard.new(
                     _pkrs_card_rank(c) + _pkrs_card_suit(c).lower())
@@ -231,8 +252,6 @@ class FastEnhancedPokerEngine(FastPokerEngine):
             treys_board = [_to_treys(c) for c in board_pkrs]
 
             rank_int = _TREYS_EVALUATOR.evaluate(treys_board, treys_hole)
-            hand_strength = (7462 - rank_int) / 7462.0
-
             rank_class = _TREYS_EVALUATOR.get_rank_class(rank_int)
             made_hand_cat = (9 - rank_class) / 8.0
 
@@ -292,6 +311,23 @@ class FastEnhancedPokerEngine(FastPokerEngine):
         except Exception:
             return np.zeros(8, dtype=np.float32)
 
+    def _approx_preflop_equity(self, hole) -> float:
+        """Fallback preflop equity when eval7 is unavailable."""
+        r1 = self._rank_to_value(_pkrs_card_rank(hole[0]))
+        r2 = self._rank_to_value(_pkrs_card_rank(hole[1]))
+        hi, lo = max(r1, r2), min(r1, r2)
+        is_pair = (r1 == r2)
+        is_suited = (_pkrs_card_suit(hole[0]) == _pkrs_card_suit(hole[1]))
+        if is_pair:
+            hs = 0.53 + (hi - 2) / 12.0 * 0.32
+        else:
+            gap_penalty = max(0, hi - lo - 1) * 0.01
+            suited_bonus = 0.03 if is_suited else 0.0
+            hs = (0.36 + (hi - 2) / 12.0 * 0.15
+                  + (lo - 2) / 12.0 * 0.08
+                  + suited_bonus - gap_penalty)
+        return float(np.clip(hs, 0.0, 1.0))
+
     def _get_street_features(self) -> np.ndarray:
         try:
             s = str(self._state.stage)
@@ -340,11 +376,17 @@ class FastEnhancedPokerEngine(FastPokerEngine):
             can_raise = 1.0 if (my_stake > call_amount and
                                 self._state.min_bet <= my_stake - call_amount) else 0.0
 
+            if self.legacy_game_state:
+                return np.array(
+                    [players_alive_norm, call_amount_norm, aggression_level],
+                    dtype=np.float32)
             return np.array(
                 [players_alive_norm, call_amount_norm, aggression_level,
                  facing_bet, bet_to_pot, can_raise],
                 dtype=np.float32)
         except Exception:
+            if self.legacy_game_state:
+                return np.array([1.0, 0.0, 0.0], dtype=np.float32)
             return np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
     def _get_betting_history_features(self) -> np.ndarray:

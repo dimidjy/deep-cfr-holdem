@@ -2,20 +2,25 @@
 Supervised learning (behavioral cloning) from winning player hand histories.
 
 Trains a StrategyNetwork to predict postflop actions of profitable players.
-Preflop play is locked to GTO ranges (same as train_gpu.py), model only learns postflop.
+Preflop play is locked to GTO ranges, model only learns postflop.
+
+Features:
+  - Counterfactual folds: synthetic fold labels from losers' last postflop actions
+  - Reward weighting: winners boosted, losers' non-fold actions reduced
+  - Label smoothing with action cost matrix
+  - Pot-size weighting (bigger pots matter more)
+  - Cosine annealing LR scheduler
+  - File-based train/val split (no session leakage)
 
 Usage:
-  # Train on good players (one name per line in .txt file)
-  python3 scripts/train_supervised.py --good-players data/good_players.txt
+  # Train on all showdown players
+  python3 scripts/train_supervised.py --epochs 50 --output models/supervised_v3.pt --no-cache
 
-  # All showdown players (no filter)
-  python3 scripts/train_supervised.py --max-hands 100000
-
-  # Include preflop decisions too (not recommended)
-  python3 scripts/train_supervised.py --no-preflop-ranges --all-streets
+  # Train on good players only
+  python3 scripts/train_supervised.py --good-players data/good_players.txt --output models/supervised_v3.pt --no-cache
 
   # Resume from a previous checkpoint
-  python3 scripts/train_supervised.py --good-players data/good_players.txt --resume models/supervised_best.pt
+  python3 scripts/train_supervised.py --resume models/supervised_v3.pt --output models/supervised_v3.pt
 """
 import sys
 import os
@@ -237,9 +242,40 @@ def _parse_single_file(file_path):
         if not target_known:
             continue
 
-        dps = builder.build_decision_points(hand, allow_unknown_cards=False)
+        dps = builder.build_decision_points(hand, allow_unknown_cards=False,
+                                               source_file=str(file_path))
         if not dps:
             continue
+
+        # Compute player net profit from hand result
+        # net = winnings - total_invested (stack_before - stack_after is equivalent)
+        player_winnings = {}
+        for w in hand.result.winners:
+            name = w['name']
+            player_winnings[name] = player_winnings.get(name, 0) + w['amount_dollars']
+
+        player_invested = {}
+        for action in hand.actions:
+            if action.is_blind or action.action_type in ('bet', 'raise', 'call'):
+                name = action.player_name
+                player_invested[name] = player_invested.get(name, 0) + action.amount_dollars
+
+        player_net = {}
+        for p in hand.active_players:
+            won = player_winnings.get(p.name, 0.0)
+            invested = player_invested.get(p.name, 0.0)
+            player_net[p.name] = won - invested
+
+        # Set net profit on each dp
+        for dp in dps:
+            dp.player_net_dollars = player_net.get(dp.player_name, 0.0)
+
+        # Mark last action per player
+        last_dp_per_player = {}
+        for dp in dps:
+            last_dp_per_player[dp.player_name] = dp
+        for dp in last_dp_per_player.values():
+            dp.is_last_action = True
 
         file_used += 1
         for dp in dps:
@@ -247,6 +283,7 @@ def _parse_single_file(file_path):
                 continue
 
             if dp.player_name in target_known:
+                # Good player's own actions (call, raise, fold, etc.)
                 file_dps.append(dp)
                 player_counts[dp.player_name] += 1
 
@@ -351,8 +388,78 @@ def collect_decision_points(hh_dir: str, num_players: int,
     return all_dps
 
 
+def apply_counterfactual_folds(decision_points: list) -> list:
+    """Generate synthetic fold labels from losing players' last actions.
+
+    For each showdown loser whose last postflop action was call/raise,
+    create a copy of that decision point with action=fold.
+    This teaches the model "you should have folded here" using real
+    observations with known outcomes.
+
+    Only applies to postflop actions (preflop is handled by GTO ranges).
+    Only creates folds when the player actually lost money.
+    """
+    FOLD = 0
+    synthetic_folds = []
+    # Equity feature is at index 18 in the 41-dim observation
+    # (Position8 + PotOdds3 + HandStrength5 + Stack2 = 18)
+    EQUITY_IDX = 18
+
+    for dp in decision_points:
+        # Only relabel last actions of losing players
+        if not dp.is_last_action:
+            continue
+        if dp.player_net_dollars >= 0:
+            continue  # winner or break-even — don't relabel
+        if dp.actual_action == FOLD:
+            continue  # already a fold
+        if dp.street == 'preflop':
+            continue  # preflop handled by GTO ranges
+        if FOLD not in dp.legal_actions:
+            continue  # fold wasn't legal
+
+        # Only create fold labels when equity was low — player was likely beat
+        # Skip strong hands (two pair+, good draws) that just got unlucky
+        equity = dp.observation[EQUITY_IDX] if len(dp.observation) > EQUITY_IDX else 0.5
+        if equity > 0.5:
+            continue  # hand had >50% equity — don't teach to fold strong hands
+
+        # Create synthetic fold — copy of same observation but action=fold
+        import copy
+        fold_dp = copy.copy(dp)
+        fold_dp.actual_action = FOLD
+        synthetic_folds.append(fold_dp)
+
+    print(f'  Counterfactual folds: {len(synthetic_folds)} synthetic fold labels '
+          f'from losing players\' last actions')
+
+    return decision_points + synthetic_folds
+
+
+def apply_reward_weighting(decision_points: list) -> list:
+    """Set sample weights based on hand outcomes.
+
+    - Winners' actions get high weight (learn to do what winners do)
+    - Losers' actions get low weight (de-emphasize losing play)
+    - Counterfactual folds (losers relabeled as fold) keep high weight
+
+    The weight is stored in player_net_dollars and used later in build_dataset.
+    This doesn't modify dp weights directly — build_dataset reads player_net_dollars.
+    """
+    winners = sum(1 for dp in decision_points if dp.player_net_dollars > 0)
+    losers = sum(1 for dp in decision_points if dp.player_net_dollars < 0)
+    neutral = len(decision_points) - winners - losers
+
+    print(f'  Reward weighting: {winners} winner dps, {losers} loser dps, '
+          f'{neutral} neutral')
+
+    return decision_points
+
+
 def build_dataset(decision_points: list, action_size: int = 5,
-                  weight_by_street: bool = True):
+                  weight_by_street: bool = True,
+                  weight_by_pot: bool = True,
+                  reward_weight: bool = False):
     """Convert decision points to training tensors."""
     n = len(decision_points)
     obs_size = decision_points[0].observation.shape[0]
@@ -370,13 +477,41 @@ def build_dataset(decision_points: list, action_size: int = 5,
         'river': 4.0,
     }
 
+    FOLD = 0
+    bb = 0.05  # big blind in dollars
+
     for i, dp in enumerate(decision_points):
         observations[i] = dp.observation
         actions[i] = dp.actual_action
         for a in dp.legal_actions:
             legal_masks[i, a] = 1.0
+
+        w = 1.0
         if weight_by_street:
-            weights[i] = street_weights.get(dp.street, 1.0)
+            w *= street_weights.get(dp.street, 1.0)
+        if weight_by_pot and dp.pot_dollars > 0:
+            # log(1 + pot/$0.05) so small pots ~1x, $1 pot ~3x, $5 pot ~4.6x
+            w *= np.log1p(dp.pot_dollars / 0.05)
+
+        if reward_weight and dp.player_net_dollars != 0:
+            net_bb = dp.player_net_dollars / bb
+            if dp.actual_action == FOLD:
+                # Counterfactual fold: weight by how much was lost (saved by folding)
+                # net is negative for the original hand, fold "saves" that loss
+                w *= min(abs(net_bb) / 10.0, 3.0)  # cap at 3x
+            elif dp.player_net_dollars > 0:
+                # Winner: boost weight (learn from winning play)
+                w *= min(1.0 + net_bb / 20.0, 3.0)  # +1BB→1.05x, +20BB→2x, cap 3x
+            else:
+                # Loser (non-fold action): reduce weight
+                w *= max(0.2, 1.0 / (1.0 + abs(net_bb) / 10.0))  # -10BB→0.5x, floor 0.2x
+
+        weights[i] = w
+
+    # Normalize weights to mean=1 so loss scale doesn't change
+    mean_w = weights.mean()
+    if mean_w > 0:
+        weights /= mean_w
 
     return observations, actions, legal_masks, weights
 
@@ -385,20 +520,73 @@ def build_dataset(decision_points: list, action_size: int = 5,
 # Training
 # ──────────────────────────────────────────────────────────────────────────────
 
-def masked_cross_entropy(logits, targets, legal_masks, weights):
-    """Cross-entropy loss masked to legal actions only.
+# Action cost matrix: confusing similar actions is less bad than opposite ones.
+# Rows = target action, Cols = predicted action
+# 0=Fold, 1=Call, 2=RaiseHalf, 3=RaisePot, 4=AllIn
+# Soft labels: when target is "call", distribute some mass to nearby actions.
+_ACTION_SIMILARITY = torch.tensor([
+    # fold   call   r_half r_pot  all_in
+    [1.00,  0.00,  0.00,  0.00,  0.00],  # fold — unique, no bleed
+    [0.00,  1.00,  0.15,  0.05,  0.00],  # call — some bleed to small raise
+    [0.00,  0.15,  1.00,  0.20,  0.05],  # raise_half — bleed to call/raise_pot
+    [0.00,  0.05,  0.20,  1.00,  0.15],  # raise_pot — bleed to raise_half/allin
+    [0.00,  0.00,  0.05,  0.15,  1.00],  # all_in — bleed to raise_pot
+], dtype=torch.float32)
 
-    StrategyNetwork outputs raw logits. We mask illegal actions to -inf
-    so softmax (inside cross_entropy) gives them zero probability.
+# Normalize each row to sum to 1
+_ACTION_SIMILARITY = _ACTION_SIMILARITY / _ACTION_SIMILARITY.sum(dim=1, keepdim=True)
+
+
+def masked_cross_entropy(logits, targets, legal_masks, weights,
+                         label_smoothing=0.1, use_action_costs=True):
+    """Cross-entropy loss with label smoothing, action cost matrix, and legal masking.
+
+    - Label smoothing: prevents overconfidence (poker is mixed-strategy)
+    - Action cost matrix: confusing call/raise is penalized less than call/fold
+    - Legal masking: illegal actions get zero probability
     """
+    device = logits.device
+
     # Use -1e4 (not -1e9) to stay safe with float16 AMP
     masked_logits = logits + (1.0 - legal_masks) * (-1e4)
-    nll = F.cross_entropy(masked_logits, targets, reduction='none')
+
+    if use_action_costs and label_smoothing > 0:
+        # Build soft targets from action similarity matrix
+        sim = _ACTION_SIMILARITY.to(device)
+        # soft_targets[i] = sim[targets[i]]  — shape (batch, action_size)
+        soft_targets = sim[targets]
+
+        # Zero out illegal actions and renormalize
+        soft_targets = soft_targets * legal_masks
+        row_sums = soft_targets.sum(dim=1, keepdim=True).clamp(min=1e-8)
+        soft_targets = soft_targets / row_sums
+
+        # Blend with uniform over legal actions (label smoothing)
+        n_legal = legal_masks.sum(dim=1, keepdim=True).clamp(min=1)
+        uniform = legal_masks / n_legal
+        blended = (1.0 - label_smoothing) * soft_targets + label_smoothing * uniform
+
+        # KL divergence loss (equivalent to cross-entropy with soft targets)
+        log_probs = F.log_softmax(masked_logits, dim=-1)
+        nll = -(blended * log_probs).sum(dim=-1)
+    elif label_smoothing > 0:
+        # Simple label smoothing without action costs
+        n_legal = legal_masks.sum(dim=1, keepdim=True).clamp(min=1)
+        uniform = legal_masks / n_legal
+        one_hot = F.one_hot(targets, logits.size(-1)).float() * legal_masks
+        blended = (1.0 - label_smoothing) * one_hot + label_smoothing * uniform
+
+        log_probs = F.log_softmax(masked_logits, dim=-1)
+        nll = -(blended * log_probs).sum(dim=-1)
+    else:
+        nll = F.cross_entropy(masked_logits, targets, reduction='none')
+
     weighted_loss = (nll * weights).mean()
     return weighted_loss
 
 
-def train_epoch(model, dataloader, optimizer, device, scaler):
+def train_epoch(model, dataloader, optimizer, device, scaler,
+                label_smoothing=0.1, use_action_costs=True):
     """Train one epoch, return avg loss and accuracy."""
     model.train()
     total_loss = 0.0
@@ -415,7 +603,8 @@ def train_epoch(model, dataloader, optimizer, device, scaler):
 
         with torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
             logits = model(obs)
-            loss = masked_cross_entropy(logits, acts, masks, wts)
+            loss = masked_cross_entropy(logits, acts, masks, wts,
+                                        label_smoothing, use_action_costs)
 
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -440,7 +629,8 @@ def train_epoch(model, dataloader, optimizer, device, scaler):
 
 
 @torch.no_grad()
-def eval_epoch(model, dataloader, device):
+def eval_epoch(model, dataloader, device,
+               label_smoothing=0.1, use_action_costs=True):
     """Evaluate on validation set, return loss and accuracy."""
     model.eval()
     total_loss = 0.0
@@ -455,7 +645,8 @@ def eval_epoch(model, dataloader, device):
 
         with torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
             logits = model(obs)
-            loss = masked_cross_entropy(logits, acts, masks, wts)
+            loss = masked_cross_entropy(logits, acts, masks, wts,
+                                        label_smoothing, use_action_costs)
 
         total_loss += loss.item() * obs.size(0)
 
@@ -481,12 +672,6 @@ def main():
                         help='Path to .txt file with winning player names (one per line)')
     parser.add_argument('--max-hands', type=int, default=0,
                         help='Max showdown hands to use (0=all)')
-    parser.add_argument('--all-streets', action='store_true',
-                        help='Train on all streets including preflop (default: postflop only)')
-    parser.add_argument('--preflop-ranges', action='store_true', default=True,
-                        help='Use GTO preflop ranges during validation (default: on)')
-    parser.add_argument('--no-preflop-ranges', action='store_true',
-                        help='Disable GTO preflop ranges during validation')
     parser.add_argument('--no-cache', action='store_true',
                         help='Force re-parse HH files')
 
@@ -503,10 +688,22 @@ def main():
                         help='Dropout rate')
     parser.add_argument('--val-split', type=float, default=0.1,
                         help='Validation split ratio')
-    parser.add_argument('--weight-streets', action='store_true', default=True,
-                        help='Weight postflop decisions higher')
-    parser.add_argument('--no-weight-streets', action='store_true',
-                        help='Equal weight for all streets')
+    parser.add_argument('--weight-pot', action='store_true', default=True,
+                        help='Weight decisions by pot size (bigger pots matter more)')
+    parser.add_argument('--no-weight-pot', action='store_true',
+                        help='Disable pot-size weighting')
+    parser.add_argument('--label-smoothing', type=float, default=0.1,
+                        help='Label smoothing factor (0=off, 0.1=default)')
+    parser.add_argument('--no-action-costs', action='store_true',
+                        help='Disable action cost matrix (treat all misclassifications equally)')
+    parser.add_argument('--counterfactual-folds', action='store_true', default=True,
+                        help='Generate synthetic fold labels from losers\' last actions (default: on)')
+    parser.add_argument('--no-counterfactual-folds', action='store_true',
+                        help='Disable counterfactual fold generation')
+    parser.add_argument('--reward-weight', action='store_true', default=True,
+                        help='Weight samples by hand outcome (winners up, losers down) (default: on)')
+    parser.add_argument('--no-reward-weight', action='store_true',
+                        help='Disable reward-based sample weighting')
 
     # Validation
     parser.add_argument('--val-interval', type=int, default=5,
@@ -524,11 +721,11 @@ def main():
 
     args = parser.parse_args()
 
-    if args.no_preflop_ranges:
-        args.preflop_ranges = False
-
-    postflop_only = not args.all_streets
-    weight_streets = args.weight_streets and not args.no_weight_streets
+    postflop_only = True
+    weight_pot = args.weight_pot and not args.no_weight_pot
+    use_action_costs = not args.no_action_costs
+    use_counterfactual = args.counterfactual_folds and not args.no_counterfactual_folds
+    use_reward_weight = args.reward_weight and not args.no_reward_weight
 
     # Load player list
     good_players = set()
@@ -565,8 +762,13 @@ def main():
     print(f'  lr       : {args.lr}')
     print(f'  layers   : {hidden_layers}')
     print(f'  dropout  : {args.dropout}')
-    print(f'  preflop  : {"GTO ranges (locked)" if args.preflop_ranges else "neural net (learned)"}')
-    print(f'  training : {"postflop only" if postflop_only else "all streets"}')
+    print(f'  label_sm : {args.label_smoothing}')
+    print(f'  act_costs: {use_action_costs}')
+    print(f'  pot_wt   : {weight_pot}')
+    print(f'  cf_folds : {use_counterfactual}')
+    print(f'  reward_wt: {use_reward_weight}')
+    print(f'  preflop  : GTO ranges (locked)')
+    print(f'  training : postflop only')
     print(f'  val_int  : {args.val_interval} epochs')
     print('=' * 60)
 
@@ -585,11 +787,19 @@ def main():
         print(f'Not enough data: {len(decision_points)} decision points. Need at least 100.')
         sys.exit(1)
 
+    # ── Counterfactual fold labels ─────────────────────────────────────────
+    if use_counterfactual:
+        decision_points = apply_counterfactual_folds(decision_points)
+
+    # ── Reward weighting info ─────────────────────────────────────────────
+    if use_reward_weight:
+        decision_points = apply_reward_weighting(decision_points)
+
     # ── Build dataset ────────────────────────────────────────────────────
     print(f'Building dataset...')
     obs_size = decision_points[0].observation.shape[0]
     observations, actions, legal_masks, weights = build_dataset(
-        decision_points, action_size, weight_streets)
+        decision_points, action_size, True, weight_pot, use_reward_weight)
 
     # Street distribution
     street_counts = defaultdict(int)
@@ -610,14 +820,38 @@ def main():
         c = action_counts.get(a, 0)
         print(f'    {action_names[a]:<12} {c:>8}  ({c/len(observations)*100:.1f}%)')
 
-    # ── Train/val split ──────────────────────────────────────────────────
-    n = len(observations)
-    indices = np.random.permutation(n)
-    val_n = int(n * args.val_split)
-    train_n = n - val_n
+    # ── File-based train/val split (no data leakage between sessions) ───
+    # Group decision points by source file, then split files into train/val
+    file_to_indices = defaultdict(list)
+    for i, dp in enumerate(decision_points):
+        file_to_indices[dp.source_file or f'unknown_{i}'].append(i)
 
-    train_idx = indices[:train_n]
-    val_idx = indices[train_n:]
+    unique_files = sorted(file_to_indices.keys())
+    rng = np.random.RandomState(42)
+    rng.shuffle(unique_files)
+
+    val_target = int(len(observations) * args.val_split)
+    val_indices = []
+    train_indices = []
+    val_count = 0
+
+    for f in unique_files:
+        idxs = file_to_indices[f]
+        if val_count < val_target:
+            val_indices.extend(idxs)
+            val_count += len(idxs)
+        else:
+            train_indices.extend(idxs)
+
+    train_idx = np.array(train_indices)
+    val_idx = np.array(val_indices)
+    train_n = len(train_idx)
+    val_n = len(val_idx)
+
+    n_val_files = sum(1 for f in unique_files
+                      if any(i in set(val_indices) for i in file_to_indices[f][:1]))
+    print(f'\n  File-based split: {len(unique_files)} files total, '
+          f'~{n_val_files} val files')
 
     train_dataset = PokerActionDataset(
         observations[train_idx], actions[train_idx],
@@ -633,7 +867,7 @@ def main():
                             shuffle=False, num_workers=12, pin_memory=True,
                             persistent_workers=True)
 
-    print(f'\n  Train samples: {train_n}')
+    print(f'  Train samples: {train_n}')
     print(f'  Val samples:   {val_n}')
 
     # ── Model ────────────────────────────────────────────────────────────
@@ -658,19 +892,17 @@ def main():
     print(f'  Model params: {total_params:,}')
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.LinearLR(
-        optimizer, start_factor=1.0, end_factor=0.1, total_iters=args.epochs)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=args.lr * 0.01)
 
     scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
 
     # ── Validation engine + preflop ranges ───────────────────────────────
     engine = _make_engine(num_players)
 
-    preflop_ranges = None
-    if args.preflop_ranges:
-        from src.preflop_ranges import PreflopRanges
-        preflop_ranges = PreflopRanges()
-        print(f'  Preflop ranges loaded (GTO locked)')
+    from src.preflop_ranges import PreflopRanges
+    preflop_ranges = PreflopRanges()
+    print(f'  Preflop ranges loaded (GTO locked)')
 
     # ── TensorBoard ──────────────────────────────────────────────────────
     logs_dir = Path('data/logs') / 'tensorboard_supervised'
@@ -686,7 +918,7 @@ def main():
     best_val_loss = float('inf')
     best_val_acc = 0.0
     best_epoch = 0
-    patience = 10
+    patience = 20
     patience_counter = 0
 
     output_path = Path(args.output)
@@ -698,8 +930,11 @@ def main():
         t0 = time.time()
 
         train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, device, scaler)
-        val_loss, val_acc = eval_epoch(model, val_loader, device)
+            model, train_loader, optimizer, device, scaler,
+            args.label_smoothing, use_action_costs)
+        val_loss, val_acc = eval_epoch(
+            model, val_loader, device,
+            args.label_smoothing, use_action_costs)
 
         scheduler.step()
         lr = optimizer.param_groups[0]['lr']
@@ -735,7 +970,11 @@ def main():
                 'train_samples': train_n,
                 'good_players': list(good_players),
                 'postflop_only': postflop_only,
-                'preflop_ranges': args.preflop_ranges,
+                'preflop_ranges': True,
+                'label_smoothing': args.label_smoothing,
+                'use_action_costs': use_action_costs,
+                'counterfactual_folds': use_counterfactual,
+                'reward_weight': use_reward_weight,
             }
             torch.save(save_dict, str(output_path))
 
@@ -753,7 +992,7 @@ def main():
                 'lr': args.lr,
                 'batch_size': args.batch_size,
                 'postflop_only': postflop_only,
-                'preflop_ranges': args.preflop_ranges,
+                'preflop_ranges': True,
             }
             meta_path = str(output_path).replace('.pt', '_metadata.json')
             with open(meta_path, 'w') as f:

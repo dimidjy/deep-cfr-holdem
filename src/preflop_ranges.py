@@ -109,15 +109,15 @@ class PreflopRanges:
 
         # Determine scenario based on pot size (in BB)
         # pot_bb < 4: no raise yet → check RFI range
-        # pot_bb < 9: facing single raise → check 3bet / call range
-        # pot_bb < 30-40: facing 3bet → check 4bet / call range
-        # pot_bb > 40: facing 4bet+ → check all-in range
+        # pot_bb < 18: facing single raise (may include callers) → 3bet / call
+        # pot_bb < 50: facing 3bet → check 4bet / call range
+        # pot_bb >= 50: facing 4bet+ → check all-in range
 
         if pot_bb < 4:
             return self._rfi_decision(combo, pos_key, legal_actions)
-        elif pot_bb < 9:
+        elif pot_bb < 18:
             return self._facing_raise_decision(combo, pos_key, legal_actions)
-        elif pot_bb < 40:
+        elif pot_bb < 50:
             return self._facing_3bet_decision(combo, pos_key, legal_actions)
         else:
             return self._facing_4bet_decision(combo, pos_key, legal_actions)

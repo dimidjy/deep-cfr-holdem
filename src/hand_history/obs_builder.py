@@ -21,6 +21,23 @@ try:
 except ImportError:
     _TREYS_AVAILABLE = False
 
+try:
+    import eval7 as _eval7
+    # Build full random range once at import time
+    _RANKS = '23456789TJQKA'
+    _all_combos = []
+    for _i, _r1 in enumerate(_RANKS):
+        for _j, _r2 in enumerate(_RANKS):
+            if _i < _j:
+                _all_combos.append(f'{_r2}{_r1}s')
+                _all_combos.append(f'{_r2}{_r1}o')
+            elif _i == _j:
+                _all_combos.append(f'{_r1}{_r2}')
+    _EVAL7_RANDOM_RANGE = _eval7.HandRange(','.join(_all_combos))
+    _EVAL7_AVAILABLE = True
+except ImportError:
+    _EVAL7_AVAILABLE = False
+
 
 _RANK_MAP = {
     '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7, '8': 8,
@@ -57,11 +74,13 @@ class ObservationBuilder:
     FastEnhancedPokerEngine.
     """
 
-    def __init__(self, num_players: int = 6):
+    def __init__(self, num_players: int = 6, legacy_game_state: bool = False):
         self.num_players = num_players
+        self.legacy_game_state = legacy_game_state
 
     def build_decision_points(self, hand: ParsedHand,
-                              allow_unknown_cards: bool = False) -> List[DecisionPoint]:
+                              allow_unknown_cards: bool = False,
+                              source_file: str = '') -> List[DecisionPoint]:
         """Replay a hand and build DecisionPoint at each non-blind decision.
 
         Args:
@@ -154,6 +173,9 @@ class ObservationBuilder:
                 rel_pos = (pidx - button_idx) % self.num_players
                 pos_label = _POS_LABELS_6.get(rel_pos, 'MP')
 
+                # Pot in dollars (chips / 40.0 for NL5)
+                pot_dollars = pot / 40.0
+
                 decision_points.append(DecisionPoint(
                     player_name=player.name,
                     observation=obs,
@@ -166,6 +188,8 @@ class ObservationBuilder:
                     player_idx=pidx,
                     hand_id=hand.hand_id,
                     action_index=player_action_count[player.name],
+                    pot_dollars=pot_dollars,
+                    source_file=source_file,
                 ))
                 player_action_count[player.name] += 1
 
@@ -332,43 +356,42 @@ class ObservationBuilder:
 
     def _equity_features(self, hole_cards: List[str],
                          community_cards: List[str]) -> np.ndarray:
-        """8 dims: hand_strength + board texture features."""
+        """8 dims: equity (Monte Carlo) + board texture features."""
         if len(hole_cards) < 2:
             return np.zeros(8, dtype=np.float32)
 
         r1 = _rank_val(hole_cards[0][0])
         r2 = _rank_val(hole_cards[1][0])
         hi, lo = max(r1, r2), min(r1, r2)
-        is_pair = (r1 == r2)
-        is_suited = (hole_cards[0][1] == hole_cards[1][1])
+
+        # Monte Carlo equity vs random range (eval7)
+        # Preflop needs more samples (5 community cards to simulate vs 0-2 postflop)
+        if _EVAL7_AVAILABLE:
+            try:
+                e7_hole = [_eval7.Card(c) for c in hole_cards[:2]]
+                e7_board = [_eval7.Card(c) for c in community_cards] if community_cards else []
+                n_samples = 1000 if not community_cards else 300
+                hand_strength = _eval7.py_hand_vs_range_monte_carlo(
+                    e7_hole, _EVAL7_RANDOM_RANGE, e7_board, n_samples)
+            except Exception:
+                hand_strength = self._approx_preflop_equity(hole_cards)
+        else:
+            hand_strength = self._approx_preflop_equity(hole_cards)
 
         if not community_cards:
-            # Preflop equity approximation
-            if is_pair:
-                hs = 0.53 + (hi - 2) / 12.0 * 0.32
-            else:
-                gap_penalty = max(0, hi - lo - 1) * 0.01
-                suited_bonus = 0.03 if is_suited else 0.0
-                hs = (0.36
-                      + (hi - 2) / 12.0 * 0.15
-                      + (lo - 2) / 12.0 * 0.08
-                      + suited_bonus - gap_penalty)
-            hs = float(np.clip(hs, 0.0, 1.0))
-            return np.array([hs, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
+            return np.array([hand_strength, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
 
         if not _TREYS_AVAILABLE:
-            return np.zeros(8, dtype=np.float32)
+            return np.array([hand_strength, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
 
-        # Postflop: treys evaluation
+        # Postflop: treys for made hand category + texture features
         try:
             treys_hole = [TreysCard.new(c[0] + c[1].lower()) for c in hole_cards[:2]]
             treys_board = [TreysCard.new(c[0] + c[1].lower()) for c in community_cards]
         except Exception:
-            return np.zeros(8, dtype=np.float32)
+            return np.array([hand_strength, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
 
         rank_int = _TREYS_EVALUATOR.evaluate(treys_board, treys_hole)
-        hand_strength = (7462 - rank_int) / 7462.0
-
         rank_class = _TREYS_EVALUATOR.get_rank_class(rank_int)
         made_hand_cat = (9 - rank_class) / 8.0
 
@@ -423,6 +446,24 @@ class ObservationBuilder:
              board_straight_texture],
             dtype=np.float32)
 
+    @staticmethod
+    def _approx_preflop_equity(hole_cards: List[str]) -> float:
+        """Fallback preflop equity approximation when eval7 is unavailable."""
+        r1 = _rank_val(hole_cards[0][0])
+        r2 = _rank_val(hole_cards[1][0])
+        hi, lo = max(r1, r2), min(r1, r2)
+        is_pair = (r1 == r2)
+        is_suited = (hole_cards[0][1] == hole_cards[1][1])
+        if is_pair:
+            hs = 0.53 + (hi - 2) / 12.0 * 0.32
+        else:
+            gap_penalty = max(0, hi - lo - 1) * 0.01
+            suited_bonus = 0.03 if is_suited else 0.0
+            hs = (0.36 + (hi - 2) / 12.0 * 0.15
+                  + (lo - 2) / 12.0 * 0.08
+                  + suited_bonus - gap_penalty)
+        return float(np.clip(hs, 0.0, 1.0))
+
     def _street_features(self, street: str) -> np.ndarray:
         """4 dims: one-hot [preflop, flop, turn, river]."""
         idx = {'preflop': 0, 'flop': 1, 'turn': 2, 'river': 3}.get(street, 0)
@@ -462,6 +503,10 @@ class ObservationBuilder:
         can_raise = 1.0 if (player.stake > call_amount and
                             min_raise <= player.stake - call_amount) else 0.0
 
+        if self.legacy_game_state:
+            return np.array(
+                [players_alive_norm, call_amount_norm, aggression_level],
+                dtype=np.float32)
         return np.array(
             [players_alive_norm, call_amount_norm, aggression_level,
              facing_bet, bet_to_pot, can_raise],

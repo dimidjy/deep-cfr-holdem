@@ -29,7 +29,9 @@ logging.disable(logging.WARNING)
 
 from src.engine import EnhancedPokerEngine
 from src.training import DeepCFR
+from src.training.deep_cfr import StrategyNetwork
 from src.utils import load_config
+from src.blended_model import BlendedModel
 from src.hand_history import parse_directory, ObservationBuilder, DecisionPoint
 from src.search import PlaytimeStrategy
 from src.preflop_ranges import PreflopRanges
@@ -65,7 +67,7 @@ def _current_strategy(deep_cfr, obs, player_idx, legal):
 # Model loading (reused from validate_spots.py)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _make_engine(num_players: int) -> EnhancedPokerEngine:
+def _make_engine(num_players: int, legacy_game_state: bool = False) -> EnhancedPokerEngine:
     return EnhancedPokerEngine(
         num_players=num_players,
         add_position_features=True,
@@ -76,23 +78,73 @@ def _make_engine(num_players: int) -> EnhancedPokerEngine:
         add_street_features=True,
         add_game_state_features=True,
         add_betting_history_features=True,
+        legacy_game_state=legacy_game_state,
     )
 
 
-def _autodetect_players(model_path: Path, default: int = 6) -> int:
+def _is_supervised_checkpoint(ckpt: dict) -> bool:
+    return 'model_state_dict' in ckpt and 'advantage_networks' not in ckpt
+
+
+class _SupervisedWrapper:
+    """Wraps a supervised StrategyNetwork to look like DeepCFR for validation."""
+
+    def __init__(self, model, obs_size, action_size, num_players, iteration=0):
+        self.action_size = action_size
+        self.num_players = num_players
+        self.device = torch.device('cpu')
+        self.iteration = iteration
+        self.strategy_networks = [model] * num_players
+        self.advantage_networks = [model] * num_players
+
+    def get_strategy(self, observation, player_idx, legal_actions):
+        obs_t = torch.FloatTensor(observation).unsqueeze(0)
+        with torch.no_grad():
+            logits = self.strategy_networks[player_idx](obs_t).numpy()[0]
+        masked = np.full(self.action_size, -1e9, dtype=np.float32)
+        for a in legal_actions:
+            masked[a] = logits[a]
+        masked -= masked.max()
+        exp_s = np.exp(masked)
+        return exp_s / exp_s.sum()
+
+
+def _autodetect_players(model_path: Path, default: int = 6, force_legacy: bool = False):
+    """Returns (num_players, legacy_game_state)."""
     try:
         ckpt = torch.load(str(model_path), map_location='cpu')
+        if _is_supervised_checkpoint(ckpt):
+            return ckpt.get('num_players', default), False
         input_size = ckpt['advantage_networks'][0]['network.0.weight'].shape[1]
+        if force_legacy:
+            for p in range(2, 10):
+                if _make_engine(p, legacy_game_state=True).get_observation_space_size() == input_size:
+                    return p, True
         for p in range(2, 10):
             if _make_engine(p).get_observation_space_size() == input_size:
-                return p
+                return p, False
+        for p in range(2, 10):
+            if _make_engine(p, legacy_game_state=True).get_observation_space_size() == input_size:
+                return p, True
     except Exception:
         pass
-    return default
+    return default, False
 
 
-def _load_model(model_path: Path, config: dict, num_players: int) -> 'DeepCFR':
-    engine = _make_engine(num_players)
+def _load_model(model_path: Path, config: dict, num_players: int, legacy: bool = False):
+    ckpt = torch.load(str(model_path), map_location='cpu')
+    if _is_supervised_checkpoint(ckpt):
+        engine = _make_engine(num_players, legacy_game_state=legacy)
+        obs_size = ckpt.get('obs_size', engine.get_observation_space_size())
+        action_size = ckpt.get('action_size', engine.get_action_space_size())
+        hidden = ckpt.get('hidden_layers', config['network']['hidden_layers'])
+        dropout = ckpt.get('dropout', 0.1)
+        model = StrategyNetwork(obs_size, action_size, hidden, dropout)
+        model.load_state_dict(ckpt['model_state_dict'])
+        model.eval()
+        return _SupervisedWrapper(model, obs_size, action_size,
+                                  num_players, ckpt.get('epoch', 0))
+    engine = _make_engine(num_players, legacy_game_state=legacy)
     deep_cfr = DeepCFR(
         observation_size=engine.get_observation_space_size(),
         action_size=engine.get_action_space_size(),
@@ -153,9 +205,7 @@ def analyze_decision_points(deep_cfr, decision_points: list,
         if (dp.street == 'preflop' and preflop_ranges is not None
                 and dp.hole_cards and len(dp.hole_cards) >= 2):
             pf_rel = _POS_TO_REL.get(dp.position_label, 0)
-            # Estimate pot_bb from context: no raise=1.5BB, single raise~5BB,
-            # 3bet~15BB, 4bet+~45BB. Use fold legality as proxy.
-            pot_bb = 1.5 if FOLD not in legal else 5.0
+            pot_bb = dp.pot_dollars / 0.05 if dp.pot_dollars > 0 else 1.5
             model_strategy = preflop_ranges.get_strategy(
                 dp.hole_cards, pf_rel, pot_bb, legal, deep_cfr.action_size)
         else:
@@ -426,7 +476,7 @@ def compute_showdown_ev(showdown_hands: list, all_decision_points: list,
                     _POS_TO_REL_EV = {'BTN': 0, 'SB': 1, 'BB': 2,
                                       'UTG': 3, 'MP': 4, 'CO': 5}
                     pf_rel = _POS_TO_REL_EV.get(dp.position_label, 0)
-                    pot_bb = 1.5 if FOLD not in legal else 5.0
+                    pot_bb = dp.pot_dollars / 0.05 if dp.pot_dollars > 0 else 1.5
                     model_strategy = preflop_ranges.get_strategy(
                         dp.hole_cards, pf_rel, pot_bb, legal,
                         deep_cfr.action_size)
@@ -904,6 +954,14 @@ def main():
                         help='Disable preflop range override (default: ranges enabled)')
     parser.add_argument('--supervised', action='store_true',
                         help='Load as supervised model (StrategyNetwork) instead of Deep CFR')
+    parser.add_argument('--blend', type=str, default=None,
+                        help='Deep CFR model for fold decisions (blended: fold from CFR, call/raise from --model)')
+    parser.add_argument('--fold-blend', type=float, default=1.0,
+                        help='Fold blend factor 0.0-1.0 (default: 1.0)')
+    parser.add_argument('--min-fold-weight', type=float, default=0.0,
+                        help='Minimum CFR fold influence 0.0-1.0 (use 0.3 for ratio_0.00)')
+    parser.add_argument('--legacy', action='store_true',
+                        help='Force legacy obs format (3-dim game_state, for old models)')
     args = parser.parse_args()
 
     model_path = Path(args.model)
@@ -920,7 +978,26 @@ def main():
     config_path = Path(__file__).parent.parent / 'configs/training_config.json'
     config = load_config(str(config_path))
 
-    if args.supervised:
+    legacy = args.legacy if hasattr(args, 'legacy') else False
+
+    if args.blend:
+        blend_path = Path(args.blend)
+        if not blend_path.exists():
+            print(f'Blend model not found: {blend_path}')
+            sys.exit(1)
+        num_players = 6
+        legacy = False  # supervised model uses current obs format
+        deep_cfr = BlendedModel(
+            supervised_path=str(model_path),
+            cfr_path=str(blend_path),
+            config=config,
+            num_players=num_players,
+            fold_blend=args.fold_blend,
+            legacy_cfr=args.legacy,
+            min_fold_weight=args.min_fold_weight,
+        )
+        print(f'Loaded blended model (iteration {deep_cfr.iteration})')
+    elif args.supervised:
         # Load supervised model (StrategyNetwork checkpoint)
         from src.training.deep_cfr import StrategyNetwork
         from train_supervised import SupervisedModelWrapper
@@ -939,10 +1016,10 @@ def main():
         print(f'Auto-detected: {num_players} players')
         print(f'Loaded supervised model: {model_path.name}  (epoch {deep_cfr.iteration})')
     else:
-        num_players = _autodetect_players(model_path)
-        print(f'Auto-detected: {num_players} players')
+        num_players, legacy = _autodetect_players(model_path, force_legacy=args.legacy)
+        print(f'Auto-detected: {num_players} players' + (' (legacy obs)' if legacy else ''))
 
-        deep_cfr = _load_model(model_path, config, num_players)
+        deep_cfr = _load_model(model_path, config, num_players, legacy)
         for net in deep_cfr.advantage_networks + deep_cfr.strategy_networks:
             net.eval()
         print(f'Loaded model: {model_path.name}  (iteration {deep_cfr.iteration})')
@@ -967,7 +1044,7 @@ def main():
 
     # Build decision points (showdown hands only)
     print(f'Building observations from {len(showdown)} showdown hands...')
-    builder = ObservationBuilder(num_players=num_players)
+    builder = ObservationBuilder(num_players=num_players, legacy_game_state=legacy)
     all_decision_points = []
     hands_with_dp = 0
 
