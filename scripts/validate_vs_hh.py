@@ -45,6 +45,72 @@ from validate_spots import (
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Strong-hand fold guard
+# ──────────────────────────────────────────────────────────────────────────────
+# Observation layout for 6p: Position(8) + PotOdds(3) + HandStrength(5) + Stack(2) + Equity(8)
+# Equity block: [hand_strength, made_hand_cat, flush_draw, straight_draw, ...]
+# made_hand_cat at index 19:  0.0=high card, 0.125=pair, 0.25=two pair,
+#   0.375=trips/set, 0.5=straight, 0.625=flush, 0.75=full house, 0.875=quads, 1.0=SF
+
+_MADE_HAND_IDX = 19   # index of made_hand_cat in observation vector
+_HAND_STRENGTH_IDX = 18  # eval7 hand_strength (equity vs random)
+
+# Fold cap per hand category: (min_made_hand_cat, max_fold_prob)
+_FOLD_CAPS = [
+    (0.75, 0.00),   # full house+ → never fold
+    (0.625, 0.01),  # flush → 1% max fold
+    (0.5, 0.02),    # straight → 2% max fold
+    (0.375, 0.03),  # set/trips → 3% max fold
+    (0.25, 0.05),   # two pair → 5% max fold
+]
+
+
+def apply_strong_hand_guard(strategy, observation, legal_actions):
+    """Cap fold probability for strong made hands, redistribute to other actions.
+
+    This is a post-hoc adjustment to prevent the model from folding
+    strong hands (two pair+) too often — a known weakness in supervised
+    and CQL models trained on showdown-biased data.
+    """
+    if 0 not in legal_actions:
+        return strategy  # fold not legal, nothing to do
+
+    made_hand = observation[_MADE_HAND_IDX] if len(observation) > _MADE_HAND_IDX else 0.0
+
+    max_fold = 1.0  # no cap by default
+    for min_cat, cap in _FOLD_CAPS:
+        if made_hand >= min_cat - 0.01:  # small epsilon for float comparison
+            max_fold = cap
+            break
+
+    if max_fold >= 1.0:
+        return strategy  # no cap needed
+
+    fold_prob = strategy[0]
+    if fold_prob <= max_fold:
+        return strategy  # already below cap
+
+    # Redistribute excess fold probability to non-fold legal actions
+    excess = fold_prob - max_fold
+    strategy = strategy.copy()
+    strategy[0] = max_fold
+
+    # Distribute proportionally to existing non-fold probabilities
+    non_fold_legal = [a for a in legal_actions if a != 0]
+    non_fold_sum = sum(strategy[a] for a in non_fold_legal)
+
+    if non_fold_sum > 0:
+        for a in non_fold_legal:
+            strategy[a] += excess * (strategy[a] / non_fold_sum)
+    else:
+        # All weight was on fold — distribute evenly
+        for a in non_fold_legal:
+            strategy[a] = excess / len(non_fold_legal)
+
+    return strategy
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Strategy functions
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -82,8 +148,39 @@ def _make_engine(num_players: int, legacy_game_state: bool = False) -> EnhancedP
     )
 
 
+def _is_cql_checkpoint(ckpt: dict) -> bool:
+    return ckpt.get('model_type') == 'cql'
+
+
 def _is_supervised_checkpoint(ckpt: dict) -> bool:
-    return 'model_state_dict' in ckpt and 'advantage_networks' not in ckpt
+    return ('model_state_dict' in ckpt and 'advantage_networks' not in ckpt
+            and not _is_cql_checkpoint(ckpt))
+
+
+class _CQLWrapper:
+    """Wraps a CQL QNetwork to look like DeepCFR for validation."""
+
+    def __init__(self, q_net, obs_size, action_size, num_players,
+                 iteration=0, temperature=1.0):
+        self.action_size = action_size
+        self.num_players = num_players
+        self.device = torch.device('cpu')
+        self.iteration = iteration
+        self.temperature = temperature
+        self.q_net = q_net
+        self.strategy_networks = [q_net] * num_players
+        self.advantage_networks = [q_net] * num_players
+
+    def get_strategy(self, observation, player_idx, legal_actions):
+        obs_t = torch.FloatTensor(observation).unsqueeze(0)
+        with torch.no_grad():
+            q_values = self.q_net(obs_t).numpy()[0]
+        masked = np.full(self.action_size, -1e9, dtype=np.float32)
+        for a in legal_actions:
+            masked[a] = q_values[a] / self.temperature
+        masked -= masked.max()
+        exp_s = np.exp(masked)
+        return exp_s / exp_s.sum()
 
 
 class _SupervisedWrapper:
@@ -113,7 +210,7 @@ def _autodetect_players(model_path: Path, default: int = 6, force_legacy: bool =
     """Returns (num_players, legacy_game_state)."""
     try:
         ckpt = torch.load(str(model_path), map_location='cpu')
-        if _is_supervised_checkpoint(ckpt):
+        if _is_cql_checkpoint(ckpt) or _is_supervised_checkpoint(ckpt):
             return ckpt.get('num_players', default), False
         input_size = ckpt['advantage_networks'][0]['network.0.weight'].shape[1]
         if force_legacy:
@@ -133,6 +230,18 @@ def _autodetect_players(model_path: Path, default: int = 6, force_legacy: bool =
 
 def _load_model(model_path: Path, config: dict, num_players: int, legacy: bool = False):
     ckpt = torch.load(str(model_path), map_location='cpu')
+    if _is_cql_checkpoint(ckpt):
+        from train_cql import QNetwork
+        obs_size = ckpt['obs_size']
+        action_size = ckpt['action_size']
+        hidden = ckpt.get('hidden_layers', config['network']['hidden_layers'])
+        dropout = ckpt.get('dropout', 0.1)
+        q_net = QNetwork(obs_size, action_size, hidden, dropout)
+        q_net.load_state_dict(ckpt['model_state_dict'])
+        q_net.eval()
+        temperature = ckpt.get('temperature', 1.0)
+        return _CQLWrapper(q_net, obs_size, action_size, num_players,
+                           ckpt.get('epoch', 0), temperature)
     if _is_supervised_checkpoint(ckpt):
         engine = _make_engine(num_players, legacy_game_state=legacy)
         obs_size = ckpt.get('obs_size', engine.get_observation_space_size())
@@ -162,7 +271,7 @@ def _load_model(model_path: Path, config: dict, num_players: int, legacy: bool =
 
 def analyze_decision_points(deep_cfr, decision_points: list,
                             strategy_fn, num_players: int,
-                            preflop_ranges=None):
+                            preflop_ranges=None, strong_hand_guard=False):
     """Analyze model strategy at each decision point from hand histories.
 
     Returns dicts of metrics for reporting.
@@ -210,6 +319,9 @@ def analyze_decision_points(deep_cfr, decision_points: list,
                 dp.hole_cards, pf_rel, pot_bb, legal, deep_cfr.action_size)
         else:
             model_strategy = strategy_fn(dp.observation, rel_pos, legal)
+
+        if strong_hand_guard and dp.street != 'preflop':
+            model_strategy = apply_strong_hand_guard(model_strategy, dp.observation, legal)
 
         actual = dp.actual_action
         street = dp.street
@@ -406,7 +518,7 @@ def compute_nl5_population_stats(all_6p_hands: list, num_players: int = 6):
 
 def compute_showdown_ev(showdown_hands: list, all_decision_points: list,
                         strategy_fn, deep_cfr, num_players: int,
-                        preflop_ranges=None):
+                        preflop_ranges=None, strong_hand_guard=False):
     """Estimate model's EV advantage vs NL5 players at showdown hands.
 
     For each showdown player with known hole cards:
@@ -482,6 +594,9 @@ def compute_showdown_ev(showdown_hands: list, all_decision_points: list,
                         deep_cfr.action_size)
                 else:
                     model_strategy = strategy_fn(dp.observation, rel_pos, legal)
+
+                if strong_hand_guard and dp.street != 'preflop':
+                    model_strategy = apply_strong_hand_guard(model_strategy, dp.observation, legal)
 
                 model_top = int(np.argmax(model_strategy))
 
@@ -962,6 +1077,8 @@ def main():
                         help='Minimum CFR fold influence 0.0-1.0 (use 0.3 for ratio_0.00)')
     parser.add_argument('--legacy', action='store_true',
                         help='Force legacy obs format (3-dim game_state, for old models)')
+    parser.add_argument('--strong-hand-guard', action='store_true',
+                        help='Cap fold probability for strong made hands (two pair+)')
     args = parser.parse_args()
 
     model_path = Path(args.model)
@@ -1086,7 +1203,8 @@ def main():
 
     metrics = analyze_decision_points(
         deep_cfr, all_decision_points, sfn, num_players,
-        preflop_ranges=pf_ranges)
+        preflop_ranges=pf_ranges,
+        strong_hand_guard=args.strong_hand_guard)
 
     # Override NL5 position stats with population-level data
     metrics['nl5_pos'] = nl5_pop_pos
@@ -1095,7 +1213,8 @@ def main():
     print(f'Computing showdown EV analysis...')
     ev_data = compute_showdown_ev(
         showdown, all_decision_points, sfn, deep_cfr, num_players,
-        preflop_ranges=pf_ranges)
+        preflop_ranges=pf_ranges,
+        strong_hand_guard=args.strong_hand_guard)
     metrics['showdown_ev'] = ev_data
 
     parse_stats = {

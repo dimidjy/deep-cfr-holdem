@@ -418,11 +418,13 @@ def apply_counterfactual_folds(decision_points: list) -> list:
         if FOLD not in dp.legal_actions:
             continue  # fold wasn't legal
 
-        # Only create fold labels when equity was low — player was likely beat
-        # Skip strong hands (two pair+, good draws) that just got unlucky
+        # Only create fold labels when equity was below ~70%
+        # This catches: weak/mid pairs, busted draws, ace-high
+        # Skips: overpair+, two pair+, strong made hands that got unlucky
+        # Data shows: p25=0.73, median=0.85 for losing showdown last-actions
         equity = dp.observation[EQUITY_IDX] if len(dp.observation) > EQUITY_IDX else 0.5
-        if equity > 0.5:
-            continue  # hand had >50% equity — don't teach to fold strong hands
+        if equity > 0.7:
+            continue
 
         # Create synthetic fold — copy of same observation but action=fold
         import copy

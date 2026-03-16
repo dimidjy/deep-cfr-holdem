@@ -36,7 +36,8 @@ class PokerGUI:
     HIGHLIGHT_COLOR = (255, 215, 0)
     
     def __init__(self, num_players: int = 2, ai_model=None, ai_search=None,
-                 ai_strategy_refiner=None, preflop_ranges=None):
+                 ai_strategy_refiner=None, preflop_ranges=None,
+                 strategy_post_hook=None):
         pygame.init()
         self.screen = pygame.display.set_mode((self.WINDOW_WIDTH, self.WINDOW_HEIGHT))
         
@@ -71,11 +72,15 @@ class PokerGUI:
         self.ai_search = ai_search
         self.ai_strategy_refiner = ai_strategy_refiner
         self.preflop_ranges = preflop_ranges
+        self.strategy_post_hook = strategy_post_hook
         suffix = ""
         if ai_search: suffix += " + Search"
         if ai_strategy_refiner: suffix += " + Refined"
         self.ai_name = ("Trained AI" + suffix) if ai_model else "AI (Random)"
         self.show_opponent_cards = False
+
+        # Per-player statistics
+        self.player_stats = {}  # agent -> {profit, hands, wins, losses}
         
     def reset_game(self):
         self.state = self.engine.reset()
@@ -283,13 +288,26 @@ class PokerGUI:
         if self.engine.is_done():
             rewards = self.engine.get_rewards()
             human_reward = rewards.get(self.human_player, 0)
-            
+
             if not self.result_counted:
                 if human_reward > 0:
                     self.wins += 1
                 elif human_reward < 0:
                     self.losses += 1
                 self.result_counted = True
+
+                # Update per-player stats
+                for agent in self.engine.agents:
+                    if agent not in self.player_stats:
+                        self.player_stats[agent] = {
+                            'profit': 0.0, 'hands': 0, 'wins': 0, 'losses': 0}
+                    r = rewards.get(agent, 0)
+                    self.player_stats[agent]['profit'] += r
+                    self.player_stats[agent]['hands'] += 1
+                    if r > 0:
+                        self.player_stats[agent]['wins'] += 1
+                    elif r < 0:
+                        self.player_stats[agent]['losses'] += 1
             
             if human_reward > 0:
                 status_text = f"YOU WON! +{int(human_reward)} chips"
@@ -392,6 +410,59 @@ class PokerGUI:
             text = font_info.render(line, True, self.TEXT_COLOR)
             self.screen.blit(text, (info_x + 5, y_pos))
     
+    def draw_player_stats(self):
+        """Draw per-player profit/loss stats panel below the game info panel."""
+        if not self.player_stats:
+            return
+
+        info_x = self.WINDOW_WIDTH - 300
+        info_y = 310  # below the game info panel
+
+        title = self.font_small.render("Player Stats:", True, self.HIGHLIGHT_COLOR)
+        self.screen.blit(title, (info_x, info_y))
+
+        num_agents = len(self.engine.agents)
+        panel_h = 30 + num_agents * 44
+        bg_rect = pygame.Rect(info_x - 5, info_y + 25, 280, panel_h)
+        pygame.draw.rect(self.screen, (0, 0, 0, 128), bg_rect)
+        pygame.draw.rect(self.screen, self.HIGHLIGHT_COLOR, bg_rect, 2, border_radius=5)
+
+        font_info = pygame.font.Font(None, 22)
+        font_tiny = pygame.font.Font(None, 19)
+        y = info_y + 35
+
+        for idx, agent in enumerate(self.engine.agents):
+            stats = self.player_stats.get(agent)
+            if not stats or stats['hands'] == 0:
+                continue
+
+            name = "You" if agent == self.human_player else f"AI-{idx}"
+            profit = stats['profit']
+            hands = stats['hands']
+            # BB/100 (1 BB = 2 chips in standard no-limit)
+            bb100 = (profit / 2.0) / hands * 100 if hands > 0 else 0.0
+            w, l = stats['wins'], stats['losses']
+
+            # Color: green if winning, red if losing
+            if profit > 0:
+                color = (100, 255, 100)
+                sign = '+'
+            elif profit < 0:
+                color = (255, 100, 100)
+                sign = ''
+            else:
+                color = self.TEXT_COLOR
+                sign = ''
+
+            line1 = f"{name}: {sign}{profit:.0f} chips  ({w}W-{l}L)"
+            line2 = f"  BB/100: {sign}{bb100:.1f}   ({hands} hands)"
+
+            text1 = font_info.render(line1, True, color)
+            self.screen.blit(text1, (info_x + 5, y))
+            text2 = font_tiny.render(line2, True, color)
+            self.screen.blit(text2, (info_x + 5, y + 20))
+            y += 44
+
     def handle_button_click(self, pos):
         for button in self.buttons:
             if button['rect'].collidepoint(pos):
@@ -459,6 +530,8 @@ class PokerGUI:
                         strategy = self.ai_model.get_strategy(
                             observation, agent_idx, legal_actions
                         )
+                if self.strategy_post_hook and not use_range:
+                    strategy = self.strategy_post_hook(strategy, observation, legal_actions)
                 legal_strategy = strategy[legal_actions]
                 legal_strategy /= legal_strategy.sum()
                 ai_action = np.random.choice(legal_actions, p=legal_strategy)
@@ -507,7 +580,8 @@ class PokerGUI:
         self.draw_game_status()
         self.draw_action_history()
         self.draw_game_info()
-        
+        self.draw_player_stats()
+
         help_text = self.font_small.render("R: Next Hand | SPACE: Random | V: Show/Hide Cards | Q: Quit", 
                                           True, self.TEXT_COLOR)
         self.screen.blit(help_text, (10, self.WINDOW_HEIGHT - 30))

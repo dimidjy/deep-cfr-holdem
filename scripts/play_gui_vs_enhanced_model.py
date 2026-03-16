@@ -16,6 +16,60 @@ import numpy as np
 import torch
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Strong-hand fold guard
+# ──────────────────────────────────────────────────────────────────────────────
+# Obs layout (6p): Position(8) + PotOdds(3) + HandStrength(5) + Stack(2) + Equity(8)
+# made_hand_cat at index 19:  0.0=high card, 0.125=pair, 0.25=two pair,
+#   0.375=trips/set, 0.5=straight, 0.625=flush, 0.75=full house, 0.875=quads
+
+_MADE_HAND_IDX = 19
+_FOLD_CAPS = [
+    (0.75, 0.00),   # full house+ → never fold
+    (0.625, 0.01),  # flush → 1% max fold
+    (0.5, 0.02),    # straight → 2% max fold
+    (0.375, 0.03),  # set/trips → 3% max fold
+    (0.25, 0.05),   # two pair → 5% max fold
+]
+
+
+def apply_strong_hand_guard(strategy, observation, legal_actions):
+    """Cap fold probability for strong made hands, redistribute to other actions."""
+    if 0 not in legal_actions:
+        return strategy
+
+    made_hand = observation[_MADE_HAND_IDX] if len(observation) > _MADE_HAND_IDX else 0.0
+
+    max_fold = 1.0
+    for min_cat, cap in _FOLD_CAPS:
+        if made_hand >= min_cat - 0.01:
+            max_fold = cap
+            break
+
+    if max_fold >= 1.0:
+        return strategy
+
+    fold_prob = strategy[0]
+    if fold_prob <= max_fold:
+        return strategy
+
+    excess = fold_prob - max_fold
+    strategy = strategy.copy()
+    strategy[0] = max_fold
+
+    non_fold_legal = [a for a in legal_actions if a != 0]
+    non_fold_sum = sum(strategy[a] for a in non_fold_legal)
+
+    if non_fold_sum > 0:
+        for a in non_fold_legal:
+            strategy[a] += excess * (strategy[a] / non_fold_sum)
+    else:
+        for a in non_fold_legal:
+            strategy[a] = excess / len(non_fold_legal)
+
+    return strategy
+
+
 def _make_engine(num_players: int) -> FastEnhancedPokerEngine:
     return FastEnhancedPokerEngine(
         num_players=num_players,
@@ -59,6 +113,27 @@ def load_model(model_path: str, num_players: int = 6):
     # Auto-detect player count from checkpoint input size
     try:
         checkpoint = torch.load(model_path, map_location='cpu')
+
+        # CQL model (from train_cql.py)
+        if checkpoint.get('model_type') == 'cql':
+            from scripts.train_cql import QNetwork, CQLModelWrapper
+            num_players = checkpoint.get('num_players', num_players)
+            obs_size = checkpoint['obs_size']
+            action_size = checkpoint['action_size']
+            hidden = checkpoint.get('hidden_layers', [512, 512, 256])
+            dropout = checkpoint.get('dropout', 0.1)
+            temperature = checkpoint.get('temperature', 1.0)
+            q_net = QNetwork(obs_size, action_size, hidden, dropout)
+            q_net.load_state_dict(checkpoint['model_state_dict'])
+            q_net.eval()
+            engine = _make_engine(num_players)
+            wrapper = CQLModelWrapper(
+                q_net, obs_size, action_size, num_players, 'cpu',
+                iteration=checkpoint.get('epoch', 0),
+                temperature=temperature)
+            print(f"  CQL model loaded (epoch {checkpoint.get('epoch', '?')}, "
+                  f"alpha={checkpoint.get('alpha_cql', '?')}, temp={temperature})")
+            return wrapper, engine, num_players
 
         # Supervised model (from train_supervised.py)
         if 'model_state_dict' in checkpoint and 'advantage_networks' not in checkpoint:
@@ -156,6 +231,7 @@ def main():
     parser.add_argument('--exploit', type=float, default=0.0, help='Exploit factor 0.0-1.0 (0=GTO, 0.7=good vs fish)')
     parser.add_argument('--blend', type=str, default=None, help='Deep CFR model for fold decisions (blended mode: fold from CFR, call/raise from --model)')
     parser.add_argument('--fold-blend', type=float, default=1.0, help='Fold blend factor 0.0-1.0 (default: 1.0)')
+    parser.add_argument('--strong-hand-guard', action='store_true', help='Cap fold probability for strong made hands (two pair+)')
 
     args = parser.parse_args()
     
@@ -242,9 +318,14 @@ def main():
     if preflop_ranges:
         print(f"  Preflop: GTO ranges (locked)")
 
+    post_hook = apply_strong_hand_guard if args.strong_hand_guard else None
+    if args.strong_hand_guard:
+        print(f"  Strong-hand guard: ON (two pair+ fold capped)")
+
     gui = PokerGUI(num_players=trained_players, ai_model=deep_cfr,
                    ai_search=search, ai_strategy_refiner=refiner,
-                   preflop_ranges=preflop_ranges)
+                   preflop_ranges=preflop_ranges,
+                   strategy_post_hook=post_hook)
     gui.engine = engine
     gui.engine.reset()
     gui.run()
