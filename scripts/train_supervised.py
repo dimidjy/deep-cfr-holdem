@@ -196,9 +196,10 @@ def _prefilter_files(hh_files: list, good_players: set, hh_dir: str) -> list:
 
 _PARSE_CFG = {}  # set by _parse_worker_init
 
-def _parse_worker_init(num_players, good_players, postflop_only):
+def _parse_worker_init(num_players, good_players, bad_players, postflop_only):
     _PARSE_CFG['num_players'] = num_players
     _PARSE_CFG['good_players'] = good_players
+    _PARSE_CFG['bad_players'] = bad_players
     _PARSE_CFG['postflop_only'] = postflop_only
     _PARSE_CFG['builder'] = ObservationBuilder(num_players=num_players)
 
@@ -207,18 +208,22 @@ def _parse_single_file(file_path):
     """Parse one HH file and extract decision points (worker function)."""
     num_players = _PARSE_CFG['num_players']
     good_players = _PARSE_CFG['good_players']
+    bad_players = _PARSE_CFG['bad_players']
     postflop_only = _PARSE_CFG['postflop_only']
     builder = _PARSE_CFG['builder']
+
+    FOLD = 0
 
     file_dps = []
     file_total = 0
     file_used = 0
     player_counts = defaultdict(int)
+    bad_fold_count = 0
 
     try:
         hands = parse_file(str(file_path))
     except Exception:
-        return file_dps, file_total, file_used, dict(player_counts)
+        return file_dps, file_total, file_used, dict(player_counts), 0
 
     for hand in hands:
         if abs(hand.big_blind_dollars - 0.05) > 0.001:
@@ -233,13 +238,14 @@ def _parse_single_file(file_path):
 
         known_players = set(hand.shown_hands.keys())
 
-        # Only learn from good players (or all showdown players if no list)
-        if good_players:
-            target_known = known_players & good_players
-        else:
-            target_known = known_players
+        # Check if hand has good players OR bad players we can learn from
+        has_good = bool(good_players and (known_players & good_players))
+        has_bad = bool(bad_players and (known_players & bad_players))
 
-        if not target_known:
+        if not good_players:
+            has_good = bool(known_players)  # all showdown players if no list
+
+        if not has_good and not has_bad:
             continue
 
         dps = builder.build_decision_points(hand, allow_unknown_cards=False,
@@ -248,17 +254,40 @@ def _parse_single_file(file_path):
             continue
 
         # Compute player net profit from hand result
-        # net = winnings - total_invested (stack_before - stack_after is equivalent)
         player_winnings = {}
         for w in hand.result.winners:
             name = w['name']
             player_winnings[name] = player_winnings.get(name, 0) + w['amount_dollars']
 
-        player_invested = {}
+        player_invested = defaultdict(float)
+        round_committed = defaultdict(float)
+        current_street = 'preflop'
         for action in hand.actions:
-            if action.is_blind or action.action_type in ('bet', 'raise', 'call'):
-                name = action.player_name
-                player_invested[name] = player_invested.get(name, 0) + action.amount_dollars
+            if action.street != current_street:
+                current_street = action.street
+                round_committed.clear()
+            name = action.player_name
+            if action.is_blind or action.action_type in ('bet', 'call'):
+                player_invested[name] += action.amount_dollars
+                round_committed[name] += action.amount_dollars
+            elif action.action_type == 'raise':
+                to_amt = action.amount_dollars
+                already = round_committed.get(name, 0)
+                delta = to_amt - already
+                if delta > 0:
+                    player_invested[name] += delta
+                round_committed[name] = to_amt
+
+        # Fix uncalled bets
+        total_won = sum(player_winnings.values())
+        total_put = sum(player_invested.values())
+        rake = hand.result.rake_dollars
+        gap = total_won - total_put + rake
+        if abs(gap) > 0.001:
+            for action in reversed(hand.actions):
+                if action.action_type in ('raise', 'bet') and not action.is_blind:
+                    player_invested[action.player_name] += gap
+                    break
 
         player_net = {}
         for p in hand.active_players:
@@ -282,12 +311,33 @@ def _parse_single_file(file_path):
             if postflop_only and dp.street == 'preflop':
                 continue
 
-            if dp.player_name in target_known:
-                # Good player's own actions (call, raise, fold, etc.)
-                file_dps.append(dp)
-                player_counts[dp.player_name] += 1
+            # Good player's own actions (call, raise, fold, etc.)
+            if good_players:
+                if dp.player_name in (known_players & good_players):
+                    file_dps.append(dp)
+                    player_counts[dp.player_name] += 1
+            else:
+                if dp.player_name in known_players:
+                    file_dps.append(dp)
+                    player_counts[dp.player_name] += 1
 
-    return file_dps, file_total, file_used, dict(player_counts)
+            # Bad player's losing postflop calls/raises → synthetic folds
+            # Only for weak hands: high card or one pair (made_hand_cat < 0.25)
+            # This avoids fold labels for two pair, trips, straights, flushes, etc.
+            if bad_players and dp.player_name in bad_players:
+                if dp.player_net_dollars < 0 and dp.actual_action != FOLD:
+                    if dp.street != 'preflop' and FOLD in dp.legal_actions:
+                        made_hand = dp.observation[19] if len(dp.observation) > 19 else 0.0
+                        if made_hand < 0.20:
+                            import copy
+                            fold_dp = copy.copy(dp)
+                            fold_dp.actual_action = FOLD
+                            fold_dp.player_net_dollars = 0.0  # fold costs nothing
+                            fold_dp.player_name = f'_bad_fold_{dp.player_name}'
+                            file_dps.append(fold_dp)
+                            bad_fold_count += 1
+
+    return file_dps, file_total, file_used, dict(player_counts), bad_fold_count
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -297,22 +347,26 @@ def _parse_single_file(file_path):
 def collect_decision_points(hh_dir: str, num_players: int,
                             max_hands: int,
                             good_players: set,
+                            bad_players: set,
                             no_cache: bool,
-                            postflop_only: bool) -> list:
+                            postflop_only: bool,
+                            workers: int = 0) -> list:
     """Parse HH files and collect decision points from target players."""
     hh_path = Path(hh_dir)
     all_hh_files = sorted(hh_path.rglob('*.txt'))
     print(f'  Found {len(all_hh_files)} .txt files in {hh_dir}')
 
     # Fast pre-filter: grep for player names to skip irrelevant files
-    hh_files = _prefilter_files(all_hh_files, good_players, hh_dir)
+    all_target_players = good_players | bad_players
+    hh_files = _prefilter_files(all_hh_files, all_target_players, hh_dir)
 
     if not hh_files:
         return []
 
     # Cache key
     player_key = '|'.join(sorted(good_players)) if good_players else 'all'
-    cache_key = f'sv2|{hh_dir}|{len(all_hh_files)}|flt{len(hh_files)}|np{num_players}|max{max_hands}|g{player_key}|pf{postflop_only}'
+    bad_key = f'bad{len(bad_players)}' if bad_players else 'nobad'
+    cache_key = f'sv3|{hh_dir}|{len(all_hh_files)}|flt{len(hh_files)}|np{num_players}|max{max_hands}|g{player_key}|{bad_key}|pf{postflop_only}'
     cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:12]
     cache_dir = Path(__file__).parent.parent / 'data' / '.hh_cache'
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -329,7 +383,7 @@ def collect_decision_points(hh_dir: str, num_players: int,
     # ── Parallel file parsing ────────────────────────────────────────────
     import multiprocessing as mp
 
-    parse_workers = min(120, max(1, mp.cpu_count() - 1))
+    parse_workers = workers if workers > 0 else min(120, max(1, mp.cpu_count() - 1))
 
     all_dps = []
     total_hands = 0
@@ -339,11 +393,13 @@ def collect_decision_points(hh_dir: str, num_players: int,
 
     print(f'  Parsing {len(hh_files)} files with {parse_workers} workers...')
 
+    total_bad_folds = 0
     with mp.Pool(processes=parse_workers, initializer=_parse_worker_init,
-                 initargs=(num_players, good_players, postflop_only)) as parse_pool:
+                 initargs=(num_players, good_players, bad_players, postflop_only)) as parse_pool:
         results = parse_pool.imap_unordered(_parse_single_file, hh_files, chunksize=16)
         files_done = 0
-        for file_dps, file_total, file_used, file_player_counts in results:
+        for file_dps, file_total, file_used, file_player_counts, file_bad_folds in results:
+            total_bad_folds += file_bad_folds
             all_dps.extend(file_dps)
             total_hands += file_total
             hands_used += file_used
@@ -367,6 +423,8 @@ def collect_decision_points(hh_dir: str, num_players: int,
     print(f'  Total showdown hands: {total_hands}')
     print(f'  Hands with target players: {hands_used}')
     print(f'  Decision points collected: {len(all_dps)}')
+    if bad_players:
+        print(f'  Bad player fold labels: {total_bad_folds}')
 
     # Show top players
     if player_dps:
@@ -430,10 +488,131 @@ def apply_counterfactual_folds(decision_points: list) -> list:
         import copy
         fold_dp = copy.copy(dp)
         fold_dp.actual_action = FOLD
+        fold_dp.player_net_dollars = 0.0  # fold costs nothing beyond committed chips
         synthetic_folds.append(fold_dp)
 
     print(f'  Counterfactual folds: {len(synthetic_folds)} synthetic fold labels '
           f'from losing players\' last actions')
+
+    return decision_points + synthetic_folds
+
+
+def apply_spot_lookup_folds(decision_points: list, spot_db_path: str,
+                            k: int = 100, min_fold_advantage: float = 1.0) -> list:
+    """Generate fold labels using spot lookup — data-driven fold decisions.
+
+    For each losing player's last postflop action, queries the spot DB for
+    similar historical spots. If folding has higher avg_bb than calling in
+    similar spots, creates a synthetic fold label.
+
+    This is better than equity-based filtering because it uses actual outcomes
+    from millions of hands to determine when folding is correct.
+
+    Args:
+        decision_points: List of DecisionPoint objects
+        spot_db_path: Path to spot_db.npz
+        k: Number of nearest neighbors to query
+        min_fold_advantage: Minimum BB advantage of fold over call to create label
+    """
+    import copy
+    from scipy.spatial import KDTree
+
+    FOLD = 0
+    street_map = {'preflop': 0, 'flop': 1, 'turn': 2, 'river': 3}
+
+    # Load spot database
+    print(f'  Loading spot DB from {spot_db_path}...')
+    data = np.load(spot_db_path)
+    db_obs = data['observations']      # (N, obs_dim)
+    db_actions = data['actions']        # (N,)
+    db_net_bb = data['net_bb']          # (N,)
+    db_streets = data['streets']        # (N,)
+    print(f'  Spot DB: {len(db_obs)} spots')
+
+    # Build per-street KDTree
+    trees = {}
+    indices = {}
+    for s_idx in range(4):
+        mask = db_streets == s_idx
+        idx = np.where(mask)[0]
+        if len(idx) > 0:
+            trees[s_idx] = KDTree(db_obs[idx])
+            indices[s_idx] = idx
+
+    # Collect candidates: all losing players' postflop actions
+    candidates = []
+    candidate_indices = []
+    for i, dp in enumerate(decision_points):
+        if dp.player_net_dollars >= 0:
+            continue
+        if dp.actual_action == FOLD:
+            continue
+        if dp.street == 'preflop':
+            continue
+        if FOLD not in dp.legal_actions:
+            continue
+        candidates.append(dp)
+        candidate_indices.append(i)
+
+    print(f'  Fold candidates (losing last-actions): {len(candidates)}')
+
+    if not candidates:
+        return decision_points
+
+    # Batch query per street
+    synthetic_folds = []
+    fold_reasons = {'weak_hand': 0, 'draw_missed': 0, 'overpaid': 0}
+
+    for s_idx in range(1, 4):  # flop, turn, river only
+        s_name = {1: 'flop', 2: 'turn', 3: 'river'}[s_idx]
+        street_cands = [(dp, ci) for dp, ci in zip(candidates, candidate_indices)
+                        if street_map.get(dp.street, 0) == s_idx]
+        if not street_cands or s_idx not in trees:
+            continue
+
+        tree = trees[s_idx]
+        idx_map = indices[s_idx]
+
+        # Build observation matrix for batch query
+        obs_matrix = np.array([dp.observation for dp, _ in street_cands], dtype=np.float32)
+        query_k = min(k, len(idx_map))
+
+        # Batch KDTree query
+        distances, local_indices = tree.query(obs_matrix, k=query_k)
+
+        for j, (dp, _) in enumerate(street_cands):
+            nn_global = idx_map[local_indices[j]]
+            nn_actions = db_actions[nn_global]
+            nn_net_bb = db_net_bb[nn_global]
+
+            # Compute fold EV vs call EV from neighbors
+            call_mask = nn_actions == 1  # check/call
+            fold_mask = nn_actions == 0
+
+            # Need at least some call samples to compare
+            call_count = call_mask.sum()
+            if call_count < 5:
+                continue
+
+            call_avg = nn_net_bb[call_mask].mean()
+
+            # Fold EV is approximately 0 (you lose what you already put in, gain nothing)
+            # But the net_bb from fold in db includes the blind/invested loss
+            # Use 0 as fold EV since we're comparing future EV
+            fold_ev = 0.0
+            if fold_mask.sum() >= 3:
+                fold_ev = nn_net_bb[fold_mask].mean()
+
+            # If folding saves more than min_fold_advantage BB compared to calling
+            if fold_ev - call_avg >= min_fold_advantage or (call_avg < -min_fold_advantage and fold_mask.sum() < 3):
+                fold_dp = copy.copy(dp)
+                fold_dp.actual_action = FOLD
+                fold_dp.player_net_dollars = 0.0
+                fold_dp.player_name = f'_spot_fold_{dp.player_name}'
+                synthetic_folds.append(fold_dp)
+
+    print(f'  Spot-lookup folds: {len(synthetic_folds)} synthetic fold labels '
+          f'(from {len(candidates)} candidates, k={k}, min_adv={min_fold_advantage} BB)')
 
     return decision_points + synthetic_folds
 
@@ -462,55 +641,60 @@ def build_dataset(decision_points: list, action_size: int = 5,
                   weight_by_street: bool = True,
                   weight_by_pot: bool = True,
                   reward_weight: bool = False):
-    """Convert decision points to training tensors."""
+    """Convert decision points to training tensors (vectorized)."""
     n = len(decision_points)
     obs_size = decision_points[0].observation.shape[0]
 
+    # Extract arrays in one pass
     observations = np.zeros((n, obs_size), dtype=np.float32)
     actions = np.zeros(n, dtype=np.int64)
     legal_masks = np.zeros((n, action_size), dtype=np.float32)
-    weights = np.ones(n, dtype=np.float32)
+    pot_dollars = np.zeros(n, dtype=np.float32)
+    net_dollars = np.zeros(n, dtype=np.float32)
+    street_idx = np.zeros(n, dtype=np.int8)  # 0=pre,1=flop,2=turn,3=river
 
-    # Street weights: postflop decisions are more valuable
-    street_weights = {
-        'preflop': 1.0,
-        'flop': 2.0,
-        'turn': 3.0,
-        'river': 4.0,
-    }
-
-    FOLD = 0
-    bb = 0.05  # big blind in dollars
+    street_map = {'preflop': 0, 'flop': 1, 'turn': 2, 'river': 3}
 
     for i, dp in enumerate(decision_points):
         observations[i] = dp.observation
         actions[i] = dp.actual_action
         for a in dp.legal_actions:
             legal_masks[i, a] = 1.0
+        pot_dollars[i] = dp.pot_dollars
+        net_dollars[i] = dp.player_net_dollars
+        street_idx[i] = street_map.get(dp.street, 0)
 
-        w = 1.0
-        if weight_by_street:
-            w *= street_weights.get(dp.street, 1.0)
-        if weight_by_pot and dp.pot_dollars > 0:
-            # log(1 + pot/$0.05) so small pots ~1x, $1 pot ~3x, $5 pot ~4.6x
-            w *= np.log1p(dp.pot_dollars / 0.05)
+    # Vectorized weight computation
+    weights = np.ones(n, dtype=np.float32)
 
-        if reward_weight and dp.player_net_dollars != 0:
-            net_bb = dp.player_net_dollars / bb
-            if dp.actual_action == FOLD:
-                # Counterfactual fold: weight by how much was lost (saved by folding)
-                # net is negative for the original hand, fold "saves" that loss
-                w *= min(abs(net_bb) / 10.0, 3.0)  # cap at 3x
-            elif dp.player_net_dollars > 0:
-                # Winner: boost weight (learn from winning play)
-                w *= min(1.0 + net_bb / 20.0, 3.0)  # +1BB→1.05x, +20BB→2x, cap 3x
-            else:
-                # Loser (non-fold action): reduce weight
-                w *= max(0.2, 1.0 / (1.0 + abs(net_bb) / 10.0))  # -10BB→0.5x, floor 0.2x
+    if weight_by_street:
+        street_w = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+        weights *= street_w[street_idx]
 
-        weights[i] = w
+    if weight_by_pot:
+        pot_mask = pot_dollars > 0
+        weights[pot_mask] *= np.log1p(pot_dollars[pot_mask] / 0.05)
 
-    # Normalize weights to mean=1 so loss scale doesn't change
+    if reward_weight:
+        bb = 0.05
+        net_bb = net_dollars / bb
+
+        # Folds: weight by loss saved
+        fold_mask = (actions == 0) & (net_dollars != 0)
+        fold_w = np.minimum(np.abs(net_bb) / 10.0, 3.0)
+        weights[fold_mask] *= fold_w[fold_mask]
+
+        # Winners (non-fold): boost
+        win_mask = (actions != 0) & (net_dollars > 0)
+        win_w = np.minimum(1.0 + net_bb / 20.0, 3.0)
+        weights[win_mask] *= win_w[win_mask]
+
+        # Losers (non-fold): reduce
+        lose_mask = (actions != 0) & (net_dollars < 0)
+        lose_w = np.maximum(0.2, 1.0 / (1.0 + np.abs(net_bb) / 10.0))
+        weights[lose_mask] *= lose_w[lose_mask]
+
+    # Normalize weights to mean=1
     mean_w = weights.mean()
     if mean_w > 0:
         weights /= mean_w
@@ -668,10 +852,17 @@ def main():
     parser = argparse.ArgumentParser(
         description='Supervised poker model — behavioral cloning from hand histories'
     )
+    parser.add_argument('--training-data', type=str, default='',
+                        help='Path to pre-built training data .npz (from build_training_data.py). '
+                             'Skips HH parsing when provided.')
     parser.add_argument('--hh-dir', type=str, default='data/poker_archive/',
                         help='Directory with PokerStars HH files')
     parser.add_argument('--good-players', type=str, default='',
                         help='Path to .txt file with winning player names (one per line)')
+    parser.add_argument('--bad-players', type=str, default='',
+                        help='Path to .txt file with losing player names — their losing calls become fold labels')
+    parser.add_argument('--num-players', type=int, default=6,
+                        help='Number of players (default: 6)')
     parser.add_argument('--max-hands', type=int, default=0,
                         help='Max showdown hands to use (0=all)')
     parser.add_argument('--no-cache', action='store_true',
@@ -698,12 +889,18 @@ def main():
                         help='Label smoothing factor (0=off, 0.1=default)')
     parser.add_argument('--no-action-costs', action='store_true',
                         help='Disable action cost matrix (treat all misclassifications equally)')
-    parser.add_argument('--counterfactual-folds', action='store_true', default=True,
-                        help='Generate synthetic fold labels from losers\' last actions (default: on)')
+    parser.add_argument('--counterfactual-folds', action='store_true', default=False,
+                        help='Generate synthetic fold labels from losers\' last actions (default: off)')
     parser.add_argument('--no-counterfactual-folds', action='store_true',
                         help='Disable counterfactual fold generation')
-    parser.add_argument('--reward-weight', action='store_true', default=True,
-                        help='Weight samples by hand outcome (winners up, losers down) (default: on)')
+    parser.add_argument('--spot-db', type=str, default='',
+                        help='Path to spot_db.npz for spot-lookup fold labels')
+    parser.add_argument('--spot-k', type=int, default=100,
+                        help='Number of neighbors for spot lookup (default: 100)')
+    parser.add_argument('--spot-min-adv', type=float, default=1.0,
+                        help='Min BB advantage of fold over call for spot-lookup folds (default: 1.0)')
+    parser.add_argument('--reward-weight', action='store_true', default=False,
+                        help='Weight samples by hand outcome (winners up, losers down) (default: off)')
     parser.add_argument('--no-reward-weight', action='store_true',
                         help='Disable reward-based sample weighting')
 
@@ -720,6 +917,8 @@ def main():
                         help='Resume from checkpoint')
     parser.add_argument('--device', type=str, default=None,
                         help='cuda | cpu (auto-detected if omitted)')
+    parser.add_argument('--workers', type=int, default=0,
+                        help='Number of parse workers (0=auto: cpu_count-1)')
 
     args = parser.parse_args()
 
@@ -745,7 +944,21 @@ def main():
             for name in sorted(good_players):
                 print(f'  - {name}')
 
-    num_players = 6
+    bad_players = set()
+    if args.bad_players:
+        p = Path(args.bad_players)
+        if not p.exists():
+            print(f'Bad players file not found: {p}')
+            sys.exit(1)
+        bad_players = set(
+            line.strip() for line in p.read_text().splitlines()
+            if line.strip() and not line.strip().startswith('#')
+        )
+        # Exclude anyone who is also in good_players
+        bad_players -= good_players
+        print(f'Bad players ({len(bad_players)}): loaded from {p.name}')
+
+    num_players = args.num_players
     action_size = 5
     hidden_layers = [int(x) for x in args.hidden_layers.split(',')]
     device = torch.device(args.device or ('cuda' if torch.cuda.is_available() else 'cpu'))
@@ -768,6 +981,8 @@ def main():
     print(f'  act_costs: {use_action_costs}')
     print(f'  pot_wt   : {weight_pot}')
     print(f'  cf_folds : {use_counterfactual}')
+    print(f'  spot_db  : {args.spot_db or "off"}')
+    print(f'  bad_folds: {len(bad_players)} bad players' if bad_players else '  bad_folds: off')
     print(f'  reward_wt: {use_reward_weight}')
     print(f'  preflop  : GTO ranges (locked)')
     print(f'  training : postflop only')
@@ -779,81 +994,135 @@ def main():
     print(f'  COLLECTING TRAINING DATA')
     print(f'{"="*70}')
 
-    decision_points = collect_decision_points(
-        args.hh_dir, num_players, args.max_hands,
-        good_players, args.no_cache,
-        postflop_only,
-    )
+    # ── Load pre-built data OR parse from HH files ────────────────────────
+    use_prebuilt = bool(args.training_data)
 
-    if len(decision_points) < 100:
-        print(f'Not enough data: {len(decision_points)} decision points. Need at least 100.')
-        sys.exit(1)
+    if use_prebuilt:
+        # Load pre-built training data from build_training_data.py
+        print(f'  Loading pre-built training data from {args.training_data}...')
+        data = np.load(args.training_data)
+        observations = data['observations']
+        actions = data['actions']
+        legal_masks = data['legal_masks']
+        weights = data['weights']
+        streets = data['streets'] if 'streets' in data else np.zeros(len(actions), dtype=np.int8)
 
-    # ── Counterfactual fold labels ─────────────────────────────────────────
-    if use_counterfactual:
-        decision_points = apply_counterfactual_folds(decision_points)
+        obs_size = observations.shape[1]
+        n = len(actions)
+        print(f'  Observation size: {obs_size}')
+        print(f'  Total samples: {n}')
 
-    # ── Reward weighting info ─────────────────────────────────────────────
-    if use_reward_weight:
-        decision_points = apply_reward_weighting(decision_points)
+        street_names = {0: 'preflop', 1: 'flop', 2: 'turn', 3: 'river'}
+        print(f'  Street distribution:')
+        for s_idx in range(4):
+            c = int((streets == s_idx).sum())
+            print(f'    {street_names[s_idx]:<10} {c:>8}  ({c/n*100:.1f}%)')
 
-    # ── Build dataset ────────────────────────────────────────────────────
-    print(f'Building dataset...')
-    obs_size = decision_points[0].observation.shape[0]
-    observations, actions, legal_masks, weights = build_dataset(
-        decision_points, action_size, True, weight_pot, use_reward_weight)
+        action_names = {0: 'fold', 1: 'call', 2: 'raise_half', 3: 'raise_pot', 4: 'all_in'}
+        print(f'  Action distribution:')
+        for a in range(action_size):
+            c = int((actions == a).sum())
+            print(f'    {action_names[a]:<12} {c:>8}  ({c/n*100:.1f}%)')
 
-    # Street distribution
-    street_counts = defaultdict(int)
-    action_counts = defaultdict(int)
-    for dp in decision_points:
-        street_counts[dp.street] += 1
-        action_counts[dp.actual_action] += 1
+        # Random train/val split for pre-built data
+        rng = np.random.RandomState(42)
+        perm = rng.permutation(n)
+        val_n = int(n * args.val_split)
+        val_idx = perm[:val_n]
+        train_idx = perm[val_n:]
 
-    print(f'  Observation size: {obs_size}')
-    print(f'  Total samples: {len(observations)}')
-    print(f'  Street distribution:')
-    for s in ['preflop', 'flop', 'turn', 'river']:
-        c = street_counts.get(s, 0)
-        print(f'    {s:<10} {c:>8}  ({c/len(observations)*100:.1f}%)')
-    print(f'  Action distribution:')
-    action_names = {0: 'fold', 1: 'call', 2: 'raise_half', 3: 'raise_pot', 4: 'all_in'}
-    for a in range(action_size):
-        c = action_counts.get(a, 0)
-        print(f'    {action_names[a]:<12} {c:>8}  ({c/len(observations)*100:.1f}%)')
+        decision_points = None  # not available for pre-built data
+    else:
+        decision_points = collect_decision_points(
+            args.hh_dir, num_players, args.max_hands,
+            good_players, bad_players, args.no_cache,
+            postflop_only, args.workers,
+        )
 
-    # ── File-based train/val split (no data leakage between sessions) ───
-    # Group decision points by source file, then split files into train/val
-    file_to_indices = defaultdict(list)
-    for i, dp in enumerate(decision_points):
-        file_to_indices[dp.source_file or f'unknown_{i}'].append(i)
+        if len(decision_points) < 100:
+            print(f'Not enough data: {len(decision_points)} decision points. Need at least 100.')
+            sys.exit(1)
 
-    unique_files = sorted(file_to_indices.keys())
-    rng = np.random.RandomState(42)
-    rng.shuffle(unique_files)
+        # ── Counterfactual fold labels ─────────────────────────────────────
+        if use_counterfactual:
+            decision_points = apply_counterfactual_folds(decision_points)
 
-    val_target = int(len(observations) * args.val_split)
-    val_indices = []
-    train_indices = []
-    val_count = 0
+        # ── Spot-lookup fold labels ────────────────────────────────────────
+        if args.spot_db:
+            decision_points = apply_spot_lookup_folds(
+                decision_points, args.spot_db,
+                k=args.spot_k, min_fold_advantage=args.spot_min_adv)
 
-    for f in unique_files:
-        idxs = file_to_indices[f]
-        if val_count < val_target:
-            val_indices.extend(idxs)
-            val_count += len(idxs)
-        else:
-            train_indices.extend(idxs)
+        # ── Reward weighting info ──────────────────────────────────────────
+        if use_reward_weight:
+            decision_points = apply_reward_weighting(decision_points)
 
-    train_idx = np.array(train_indices)
-    val_idx = np.array(val_indices)
+        # ── Build dataset ──────────────────────────────────────────────────
+        print(f'Building dataset...')
+        obs_size = decision_points[0].observation.shape[0]
+        observations, actions, legal_masks, weights = build_dataset(
+            decision_points, action_size, True, weight_pot, use_reward_weight)
+
+        # Street distribution
+        street_counts = defaultdict(int)
+        action_counts = defaultdict(int)
+        for dp in decision_points:
+            street_counts[dp.street] += 1
+            action_counts[dp.actual_action] += 1
+
+        print(f'  Observation size: {obs_size}')
+        print(f'  Total samples: {len(observations)}')
+        print(f'  Street distribution:')
+        for s in ['preflop', 'flop', 'turn', 'river']:
+            c = street_counts.get(s, 0)
+            print(f'    {s:<10} {c:>8}  ({c/len(observations)*100:.1f}%)')
+        print(f'  Action distribution:')
+        action_names = {0: 'fold', 1: 'call', 2: 'raise_half', 3: 'raise_pot', 4: 'all_in'}
+        for a in range(action_size):
+            c = action_counts.get(a, 0)
+            print(f'    {action_names[a]:<12} {c:>8}  ({c/len(observations)*100:.1f}%)')
+
+        # ── File-based train/val split ─────────────────────────────────────
+        file_to_indices = defaultdict(list)
+        for i, dp in enumerate(decision_points):
+            file_to_indices[dp.source_file or f'unknown_{i}'].append(i)
+
+        unique_files = sorted(file_to_indices.keys())
+        rng = np.random.RandomState(42)
+        rng.shuffle(unique_files)
+
+        val_target = int(len(observations) * args.val_split)
+        val_indices = []
+        train_indices = []
+        val_count = 0
+
+        for f in unique_files:
+            idxs = file_to_indices[f]
+            if val_count < val_target:
+                val_indices.extend(idxs)
+                val_count += len(idxs)
+            else:
+                train_indices.extend(idxs)
+
+        train_idx = np.array(train_indices)
+        val_idx = np.array(val_indices)
     train_n = len(train_idx)
     val_n = len(val_idx)
 
-    n_val_files = sum(1 for f in unique_files
-                      if any(i in set(val_indices) for i in file_to_indices[f][:1]))
-    print(f'\n  File-based split: {len(unique_files)} files total, '
-          f'~{n_val_files} val files')
+    if use_prebuilt:
+        print(f'\n  Random split: train={train_n}, val={val_n}')
+    else:
+        n_val_files = sum(1 for f in unique_files
+                          if any(i in set(val_indices) for i in file_to_indices[f][:1]))
+        print(f'\n  File-based split: {len(unique_files)} files total, '
+              f'~{n_val_files} val files')
+        del file_to_indices, unique_files
+        del train_indices, val_indices
+
+    # Free large objects no longer needed
+    if decision_points is not None:
+        del decision_points
+    import gc; gc.collect()
 
     train_dataset = PokerActionDataset(
         observations[train_idx], actions[train_idx],
@@ -863,10 +1132,10 @@ def main():
         legal_masks[val_idx], weights[val_idx])
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
-                              shuffle=True, num_workers=12, pin_memory=True,
+                              shuffle=True, num_workers=4, pin_memory=True,
                               persistent_workers=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size,
-                            shuffle=False, num_workers=12, pin_memory=True,
+                            shuffle=False, num_workers=4, pin_memory=True,
                             persistent_workers=True)
 
     print(f'  Train samples: {train_n}')
