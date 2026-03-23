@@ -1181,7 +1181,7 @@ def main():
         sys.exit(1)
 
     # Load preflop ranges
-    pf_ranges = None if args.no_preflop_ranges else PreflopRanges()
+    pf_ranges = None if args.no_preflop_ranges else PreflopRanges(num_players=num_players)
     if pf_ranges:
         print('Preflop: GTO ranges (locked)')
 

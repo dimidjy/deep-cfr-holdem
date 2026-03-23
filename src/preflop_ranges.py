@@ -15,16 +15,17 @@ from typing import Optional, List, Tuple
 import numpy as np
 
 
-# Position mapping: relative_pos (0=BTN..5=CO for 6-max) → range key
-# The ranges JSON uses: LJ (=UTG), HJ (=MP), CO, BTN, SB, BB
-_POS_TO_RANGE_KEY = {
-    0: 'BTN',
-    1: 'SB',
-    2: 'BB',
-    3: 'LJ',   # UTG in 6-max
-    4: 'HJ',   # MP in 6-max
-    5: 'CO',
+# Position mapping: relative_pos → range key, per table size
+# rel_pos: 0=BTN, 1=SB, 2=BB, 3+=EP positions
+_POS_TO_RANGE_KEY_BY_PLAYERS = {
+    6: {0: 'BTN', 1: 'SB', 2: 'BB', 3: 'LJ', 4: 'HJ', 5: 'CO'},
+    5: {0: 'BTN', 1: 'SB', 2: 'BB', 3: 'HJ', 4: 'CO'},
+    4: {0: 'BTN', 1: 'SB', 2: 'BB', 3: 'CO'},
+    3: {0: 'BTN', 1: 'SB', 2: 'BB'},
+    2: {0: 'BTN', 1: 'BB'},
 }
+# Fallback for legacy code that doesn't pass num_players
+_POS_TO_RANGE_KEY = _POS_TO_RANGE_KEY_BY_PLAYERS[6]
 
 # Action constants (matching engine action space)
 FOLD = 0
@@ -73,7 +74,7 @@ def _is_in_range(combo: str, range_dict: dict) -> bool:
 
 
 class PreflopRanges:
-    """Preflop range chart for 6-max poker.
+    """Preflop range chart for N-max poker (2-6 players).
 
     Determines preflop action (fold/call/raise/all-in) based on:
     - Hole cards
@@ -81,10 +82,20 @@ class PreflopRanges:
     - Pot size in BB (determines scenario: RFI, facing raise, facing 3bet, etc.)
     """
 
-    def __init__(self, ranges_path: Optional[str] = None):
+    def __init__(self, ranges_path: Optional[str] = None, num_players: int = 6):
+        self.num_players = num_players
+        self.pos_map = _POS_TO_RANGE_KEY_BY_PLAYERS.get(
+            num_players, _POS_TO_RANGE_KEY_BY_PLAYERS[6])
+
         if ranges_path is None:
-            ranges_path = str(
-                Path(__file__).parent.parent / 'configs' / 'preflop_ranges.json')
+            configs_dir = Path(__file__).parent.parent / 'configs'
+            # Try player-specific config first, fall back to generic
+            player_specific = configs_dir / f'preflop_ranges_{num_players}p.json'
+            if player_specific.exists():
+                ranges_path = str(player_specific)
+            else:
+                ranges_path = str(configs_dir / 'preflop_ranges.json')
+
         with open(ranges_path) as f:
             self.ranges = json.load(f)
 
@@ -105,7 +116,7 @@ class PreflopRanges:
             return None
 
         combo = _cards_to_combo(hole_cards[0], hole_cards[1])
-        pos_key = _POS_TO_RANGE_KEY.get(rel_pos, 'HJ')
+        pos_key = self.pos_map.get(rel_pos, 'BTN')
 
         # Determine scenario based on pot size (in BB)
         # pot_bb < 4: no raise yet → check RFI range

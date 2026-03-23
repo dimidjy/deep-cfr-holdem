@@ -314,7 +314,7 @@ def main():
     print("  - Q: Quit")
     print("="*60 + "\n")
 
-    preflop_ranges = None if args.no_preflop_ranges else PreflopRanges()
+    preflop_ranges = None if args.no_preflop_ranges else PreflopRanges(num_players=trained_players)
     if preflop_ranges:
         print(f"  Preflop: GTO ranges (locked)")
 

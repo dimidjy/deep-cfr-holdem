@@ -129,7 +129,7 @@ def main():
         )
         print(f"  Strategy refinement: temperature={args.temperature}, all-in penalty=ON")
 
-    preflop_ranges = None if args.no_preflop_ranges else PreflopRanges()
+    preflop_ranges = None if args.no_preflop_ranges else PreflopRanges(num_players=num_players)
     if preflop_ranges:
         print(f"  Preflop: GTO ranges (locked)")
 

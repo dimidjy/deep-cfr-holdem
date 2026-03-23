@@ -862,7 +862,7 @@ def main():
         deep_cfr = _load_model(model_path, config, engine)
         print(f'Loaded: {model_path.name}  (iteration {deep_cfr.iteration})')
 
-    pf_ranges = None if args.no_preflop_ranges else PreflopRanges()
+    pf_ranges = None if args.no_preflop_ranges else PreflopRanges(num_players=num_players)
     if pf_ranges:
         print('Preflop: GTO ranges (locked)')
 
