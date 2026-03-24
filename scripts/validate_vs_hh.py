@@ -186,15 +186,23 @@ class _CQLWrapper:
 class _SupervisedWrapper:
     """Wraps a supervised StrategyNetwork to look like DeepCFR for validation."""
 
-    def __init__(self, model, obs_size, action_size, num_players, iteration=0):
+    def __init__(self, model, obs_size, action_size, num_players, iteration=0,
+                 model_num_players=None):
         self.action_size = action_size
         self.num_players = num_players
+        self.model_num_players = model_num_players or num_players
         self.device = torch.device('cpu')
         self.iteration = iteration
         self.strategy_networks = [model] * num_players
         self.advantage_networks = [model] * num_players
+        self._pad_obs = None
+        if self.model_num_players != num_players:
+            from src.utils.obs_padding import pad_observation_to_6p
+            self._pad_obs = pad_observation_to_6p
 
     def get_strategy(self, observation, player_idx, legal_actions):
+        if self._pad_obs is not None:
+            observation = self._pad_obs(observation, self.num_players)
         obs_t = torch.FloatTensor(observation).unsqueeze(0)
         with torch.no_grad():
             logits = self.strategy_networks[player_idx](obs_t).numpy()[0]
@@ -228,8 +236,12 @@ def _autodetect_players(model_path: Path, default: int = 6, force_legacy: bool =
     return default, False
 
 
-def _load_model(model_path: Path, config: dict, num_players: int, legacy: bool = False):
+def _load_model(model_path: Path, config: dict, num_players: int,
+                legacy: bool = False, model_num_players: int = None):
+    """Load model. If model_num_players is set and differs from num_players,
+    observations will be padded from num_players to model_num_players format."""
     ckpt = torch.load(str(model_path), map_location='cpu')
+    mnp = model_num_players  # the player count the model was trained on
     if _is_cql_checkpoint(ckpt):
         from train_cql import QNetwork
         obs_size = ckpt['obs_size']
@@ -243,16 +255,20 @@ def _load_model(model_path: Path, config: dict, num_players: int, legacy: bool =
         return _CQLWrapper(q_net, obs_size, action_size, num_players,
                            ckpt.get('epoch', 0), temperature)
     if _is_supervised_checkpoint(ckpt):
-        engine = _make_engine(num_players, legacy_game_state=legacy)
-        obs_size = ckpt.get('obs_size', engine.get_observation_space_size())
-        action_size = ckpt.get('action_size', engine.get_action_space_size())
+        # Use model's trained player count for obs_size/action_size
+        model_np = mnp or ckpt.get('num_players', num_players)
+        engine_for_model = _make_engine(model_np, legacy_game_state=legacy)
+        obs_size = ckpt.get('obs_size', engine_for_model.get_observation_space_size())
+        action_size = ckpt.get('action_size', engine_for_model.get_action_space_size())
         hidden = ckpt.get('hidden_layers', config['network']['hidden_layers'])
         dropout = ckpt.get('dropout', 0.1)
         model = StrategyNetwork(obs_size, action_size, hidden, dropout)
         model.load_state_dict(ckpt['model_state_dict'])
         model.eval()
-        return _SupervisedWrapper(model, obs_size, action_size,
-                                  num_players, ckpt.get('epoch', 0))
+        return _SupervisedWrapper(
+            model, obs_size, action_size, num_players,
+            ckpt.get('epoch', 0),
+            model_num_players=model_np if model_np != num_players else None)
     engine = _make_engine(num_players, legacy_game_state=legacy)
     deep_cfr = DeepCFR(
         observation_size=engine.get_observation_space_size(),
@@ -1079,6 +1095,8 @@ def main():
                         help='Force legacy obs format (3-dim game_state, for old models)')
     parser.add_argument('--strong-hand-guard', action='store_true',
                         help='Cap fold probability for strong made hands (two pair+)')
+    parser.add_argument('--game-players', type=int, default=0,
+                        help='Override game player count (e.g. use 6p model on 4p hands)')
     args = parser.parse_args()
 
     model_path = Path(args.model)
@@ -1097,12 +1115,14 @@ def main():
 
     legacy = args.legacy if hasattr(args, 'legacy') else False
 
+    game_players_override = args.game_players if args.game_players > 0 else 0
+
     if args.blend:
         blend_path = Path(args.blend)
         if not blend_path.exists():
             print(f'Blend model not found: {blend_path}')
             sys.exit(1)
-        num_players = 6
+        num_players = game_players_override or 6
         legacy = False  # supervised model uses current obs format
         deep_cfr = BlendedModel(
             supervised_path=str(model_path),
@@ -1119,7 +1139,8 @@ def main():
         from src.training.deep_cfr import StrategyNetwork
         from train_supervised import SupervisedModelWrapper
         ckpt = torch.load(str(model_path), map_location='cpu')
-        num_players = ckpt.get('num_players', 6)
+        model_np = ckpt.get('num_players', 6)
+        num_players = game_players_override or model_np
         obs_size = ckpt['obs_size']
         action_size = ckpt['action_size']
         hidden_layers = ckpt['hidden_layers']
@@ -1130,13 +1151,18 @@ def main():
         deep_cfr = SupervisedModelWrapper(
             model, obs_size, action_size, num_players, 'cpu',
             iteration=ckpt.get('epoch', 0))
-        print(f'Auto-detected: {num_players} players')
+        print(f'Auto-detected: {model_np} players' +
+              (f' (game: {num_players}p)' if num_players != model_np else ''))
         print(f'Loaded supervised model: {model_path.name}  (epoch {deep_cfr.iteration})')
     else:
-        num_players, legacy = _autodetect_players(model_path, force_legacy=args.legacy)
-        print(f'Auto-detected: {num_players} players' + (' (legacy obs)' if legacy else ''))
+        model_np, legacy = _autodetect_players(model_path, force_legacy=args.legacy)
+        num_players = game_players_override or model_np
+        print(f'Auto-detected: {model_np} players' +
+              (f' (game: {num_players}p)' if num_players != model_np else '') +
+              (' (legacy obs)' if legacy else ''))
 
-        deep_cfr = _load_model(model_path, config, num_players, legacy)
+        deep_cfr = _load_model(model_path, config, num_players, legacy,
+                               model_num_players=model_np if num_players != model_np else None)
         for net in deep_cfr.advantage_networks + deep_cfr.strategy_networks:
             net.eval()
         print(f'Loaded model: {model_path.name}  (iteration {deep_cfr.iteration})')

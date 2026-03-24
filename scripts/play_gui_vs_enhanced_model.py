@@ -87,15 +87,23 @@ def _make_engine(num_players: int) -> FastEnhancedPokerEngine:
 class _SupervisedWrapper:
     """Wraps a supervised StrategyNetwork to look like DeepCFR for the GUI."""
 
-    def __init__(self, model, obs_size, action_size, num_players, iteration=0):
+    def __init__(self, model, obs_size, action_size, num_players, iteration=0,
+                 model_num_players=None):
         self.action_size = action_size
         self.num_players = num_players
+        self.model_num_players = model_num_players or num_players
         self.device = torch.device('cpu')
         self.iteration = iteration
         self.strategy_networks = [model] * num_players
         self.advantage_networks = [model] * num_players
+        self._pad_obs = None
+        if self.model_num_players != num_players:
+            from src.utils.obs_padding import pad_observation_to_6p
+            self._pad_obs = pad_observation_to_6p
 
     def get_strategy(self, observation, player_idx, legal_actions):
+        if self._pad_obs is not None:
+            observation = self._pad_obs(observation, self.num_players)
         obs_t = torch.FloatTensor(observation).unsqueeze(0)
         with torch.no_grad():
             logits = self.strategy_networks[player_idx](obs_t).numpy()[0]
@@ -107,7 +115,9 @@ class _SupervisedWrapper:
         return exp_s / exp_s.sum()
 
 
-def load_model(model_path: str, num_players: int = 6):
+def load_model(model_path: str, num_players: int = 6, game_num_players: int = None):
+    """Load model. If game_num_players differs from model's player count,
+    the wrapper will pad observations to match the model's expected input."""
     print(f"\nLoading ENHANCED model from: {model_path}")
 
     # Auto-detect player count from checkpoint input size
@@ -126,31 +136,38 @@ def load_model(model_path: str, num_players: int = 6):
             q_net = QNetwork(obs_size, action_size, hidden, dropout)
             q_net.load_state_dict(checkpoint['model_state_dict'])
             q_net.eval()
-            engine = _make_engine(num_players)
+            game_np = game_num_players or num_players
+            engine = _make_engine(game_np)
             wrapper = CQLModelWrapper(
-                q_net, obs_size, action_size, num_players, 'cpu',
+                q_net, obs_size, action_size, game_np, 'cpu',
                 iteration=checkpoint.get('epoch', 0),
                 temperature=temperature)
             print(f"  CQL model loaded (epoch {checkpoint.get('epoch', '?')}, "
                   f"alpha={checkpoint.get('alpha_cql', '?')}, temp={temperature})")
-            return wrapper, engine, num_players
+            return wrapper, engine, game_np
 
         # Supervised model (from train_supervised.py)
         if 'model_state_dict' in checkpoint and 'advantage_networks' not in checkpoint:
-            num_players = checkpoint.get('num_players', num_players)
-            print(f"  Supervised model detected ({num_players} players)")
-            engine = _make_engine(num_players)
-            obs_size = checkpoint.get('obs_size', engine.get_observation_space_size())
-            action_size = checkpoint.get('action_size', engine.get_action_space_size())
+            model_np = checkpoint.get('num_players', num_players)
+            game_np = game_num_players or model_np
+            print(f"  Supervised model detected (trained {model_np}p"
+                  + (f", game {game_np}p" if game_np != model_np else "") + ")")
+            engine = _make_engine(game_np)
+            obs_size = checkpoint.get('obs_size',
+                                      _make_engine(model_np).get_observation_space_size())
+            action_size = checkpoint.get('action_size',
+                                          _make_engine(model_np).get_action_space_size())
             hidden = checkpoint.get('hidden_layers', [512, 512, 256])
             dropout = checkpoint.get('dropout', 0.1)
             model = StrategyNetwork(obs_size, action_size, hidden, dropout)
             model.load_state_dict(checkpoint['model_state_dict'])
             model.eval()
-            wrapper = _SupervisedWrapper(model, obs_size, action_size,
-                                         num_players, checkpoint.get('epoch', 0))
-            print(f"✓ Supervised model loaded (epoch {checkpoint.get('epoch', '?')})")
-            return wrapper, engine, num_players
+            wrapper = _SupervisedWrapper(
+                model, obs_size, action_size, game_np,
+                checkpoint.get('epoch', 0),
+                model_num_players=model_np if game_np != model_np else None)
+            print(f"  Supervised model loaded (epoch {checkpoint.get('epoch', '?')})")
+            return wrapper, engine, game_np
 
         # Deep CFR model
         if 'advantage_networks' in checkpoint and len(checkpoint['advantage_networks']) > 0:
@@ -271,7 +288,8 @@ def main():
         engine = _make_engine(args.players)
         trained_players = args.players
     else:
-        deep_cfr, engine, trained_players = load_model(str(model_path), args.players)
+        deep_cfr, engine, trained_players = load_model(
+            str(model_path), args.players, game_num_players=args.players)
         if deep_cfr is None or engine is None:
             print("\n⚠️  If you're trying to load a BASE model, use:")
             print("    python3 scripts/play_gui_vs_model.py --model", args.model)

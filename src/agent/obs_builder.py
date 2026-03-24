@@ -43,16 +43,31 @@ _RANK_MAP = {
 
 _POS_LABELS = {0: 'BTN', 1: 'SB', 2: 'BB', 3: 'UTG', 4: 'MP', 5: 'CO'}
 
+# Maps (num_players, rel_pos) → 6p rel_pos for observation padding
+_POS_MAP_TO_6P = {
+    6: {0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5},  # identity
+    5: {0: 0, 1: 1, 2: 2, 3: 4, 4: 5},          # HJ→4(MP), CO→5
+    4: {0: 0, 1: 1, 2: 2, 3: 5},                 # CO→5
+    3: {0: 0, 1: 1, 2: 2},                        # BTN, SB, BB only
+    2: {0: 0, 1: 2},                              # BTN→0, BB→2
+}
+
 
 def _rank_val(rank_char: str) -> int:
     return _RANK_MAP.get(rank_char.upper(), 0)
 
 
 class ObservationBuilder:
-    """Build observation vectors from GameState for model inference."""
+    """Build observation vectors from GameState for model inference.
 
-    def __init__(self, num_players: int = 6):
+    When pad_to_6p=True, always outputs 41-dim (6-player format) observations,
+    mapping positions to their 6p equivalents. This allows using a single 6p model
+    for all table sizes (2-6 players).
+    """
+
+    def __init__(self, num_players: int = 6, pad_to_6p: bool = False):
         self.num_players = num_players
+        self.pad_to_6p = pad_to_6p and num_players < 6
 
     def build(self, game_state: GameState) -> Optional[np.ndarray]:
         """Build observation vector from GameState. Returns None if hole cards missing."""
@@ -102,11 +117,21 @@ class ObservationBuilder:
 
     def _position_features(self, player_idx: int, button_idx: int) -> np.ndarray:
         rel_pos = (player_idx - button_idx) % self.num_players
-        one_hot = np.zeros(self.num_players, dtype=np.float32)
-        one_hot[rel_pos] = 1.0
-        norm_pos = rel_pos / self.num_players
-        is_button = 1.0 if rel_pos == 0 else 0.0
-        return np.array([*one_hot, norm_pos, is_button], dtype=np.float32)
+
+        if self.pad_to_6p:
+            # Map to 6p position and build 8-dim (6+2) position block
+            mapped_pos = _POS_MAP_TO_6P[self.num_players].get(rel_pos, 0)
+            one_hot = np.zeros(6, dtype=np.float32)
+            one_hot[mapped_pos] = 1.0
+            norm_pos = mapped_pos / 6.0
+            is_button = 1.0 if rel_pos == 0 else 0.0
+            return np.array([*one_hot, norm_pos, is_button], dtype=np.float32)
+        else:
+            one_hot = np.zeros(self.num_players, dtype=np.float32)
+            one_hot[rel_pos] = 1.0
+            norm_pos = rel_pos / self.num_players
+            is_button = 1.0 if rel_pos == 0 else 0.0
+            return np.array([*one_hot, norm_pos, is_button], dtype=np.float32)
 
     def _pot_odds_features(self, gs: GameState, players: List[PlayerInfo],
                            player_idx: int) -> np.ndarray:
