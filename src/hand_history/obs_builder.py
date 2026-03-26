@@ -80,7 +80,8 @@ class ObservationBuilder:
 
     def build_decision_points(self, hand: ParsedHand,
                               allow_unknown_cards: bool = False,
-                              source_file: str = '') -> List[DecisionPoint]:
+                              source_file: str = '',
+                              track_action_history: bool = False) -> List[DecisionPoint]:
         """Replay a hand and build DecisionPoint at each non-blind decision.
 
         Args:
@@ -115,6 +116,18 @@ class ObservationBuilder:
         decision_points: List[DecisionPoint] = []
         player_action_count = defaultdict(int)  # name -> count of non-blind actions
 
+        # Action history tracking for range estimator
+        encoded_actions = [] if track_action_history else None
+        ah_pot_chips = 0
+        ah_player_bets = defaultdict(int)
+        ah_player_spent = defaultdict(int)
+        ah_start_stacks = {}
+        avg_stack = 1
+        if track_action_history:
+            for p in players:
+                ah_start_stacks[p.name] = p.stake
+            avg_stack = max(1, sum(p.stake for p in players) / len(players))
+
         for action in hand.actions:
             if action.player_name not in name_to_idx:
                 continue
@@ -131,13 +144,27 @@ class ObservationBuilder:
                 current_street = action.street
                 community_cards = cc.get(current_street, [])
 
+                if track_action_history:
+                    ah_pot_chips += sum(ah_player_bets.values())
+                    ah_player_bets.clear()
+
             # Skip blind actions (not decisions)
             if action.is_blind:
                 self._apply_blind(player, action)
+                if track_action_history:
+                    ah_player_bets[action.player_name] += action.amount_chips
+                    ah_player_spent[action.player_name] += action.amount_chips
                 continue
 
-            # Skip actions from folded/all-in players
+            # Skip actions from folded/all-in players (no DP created)
+            # But still encode action for history — folds/all-ins are informative
             if not player.active or player.stake == 0:
+                if track_action_history:
+                    self._encode_ah_action(
+                        action, pidx, button_idx, current_street,
+                        ah_pot_chips, ah_player_bets, ah_player_spent,
+                        ah_start_stacks, avg_stack, encoded_actions,
+                        community_cards)
                 continue
 
             # ── Build observation and record decision point ───────────
@@ -176,7 +203,7 @@ class ObservationBuilder:
                 # Pot in dollars (chips / 40.0 for NL5)
                 pot_dollars = pot / 40.0
 
-                decision_points.append(DecisionPoint(
+                dp_kwargs = dict(
                     player_name=player.name,
                     observation=obs,
                     legal_actions=legal,
@@ -190,13 +217,75 @@ class ObservationBuilder:
                     action_index=player_action_count[player.name],
                     pot_dollars=pot_dollars,
                     source_file=source_file,
-                ))
+                )
+                if track_action_history:
+                    dp_kwargs['action_history'] = list(encoded_actions)
+
+                decision_points.append(DecisionPoint(**dp_kwargs))
                 player_action_count[player.name] += 1
+
+            # ── Encode action for history (after creating DP, before applying) ──
+            if track_action_history:
+                self._encode_ah_action(
+                    action, pidx, button_idx, current_street,
+                    ah_pot_chips, ah_player_bets, ah_player_spent,
+                    ah_start_stacks, avg_stack, encoded_actions)
 
             # ── Apply action to state ─────────────────────────────────
             self._apply_action(player, action, max_bet)
 
         return decision_points
+
+    def _encode_ah_action(self, action, pidx, button_idx, current_street,
+                          ah_pot_chips, ah_player_bets, ah_player_spent,
+                          ah_start_stacks, avg_stack, encoded_actions,
+                          community_cards=None):
+        """Encode one action for the action history and update bet tracking."""
+        from src.training.range_estimator import encode_action as _re_encode
+
+        rel_pos = (pidx - button_idx) % self.num_players
+        total_pot = ah_pot_chips + sum(ah_player_bets.values())
+
+        if action.is_all_in:
+            atype = 'all_in'
+        elif action.action_type in ('bet', 'raise', 'call', 'check', 'fold'):
+            atype = action.action_type
+        else:
+            atype = 'check'
+
+        if action.action_type in ('bet', 'raise') and total_pot > 0:
+            sizing = action.amount_chips / max(total_pot, 1)
+        else:
+            sizing = 0.0
+
+        pot_ratio = total_pot / avg_stack
+
+        actor_start = ah_start_stacks.get(action.player_name, avg_stack)
+        actor_spent = ah_player_spent.get(action.player_name, 0)
+        actor_remaining = max(0, actor_start - actor_spent)
+        stack_ratio = actor_remaining / max(1, actor_start)
+
+        encoded_actions.append(_re_encode(
+            action_type=atype,
+            rel_position=rel_pos,
+            sizing=sizing,
+            street=current_street,
+            pot_ratio=pot_ratio,
+            stack_ratio=stack_ratio,
+            num_players=self.num_players,
+            community_cards=community_cards,
+        ))
+
+        # Update bet tracking
+        if action.action_type in ('bet', 'call'):
+            ah_player_bets[action.player_name] += action.amount_chips
+            ah_player_spent[action.player_name] += action.amount_chips
+        elif action.action_type == 'raise':
+            already = ah_player_bets.get(action.player_name, 0)
+            delta = action.amount_chips - already
+            if delta > 0:
+                ah_player_spent[action.player_name] += delta
+                ah_player_bets[action.player_name] = action.amount_chips
 
     def _find_button_idx(self, active_players, button_seat: int) -> int:
         """Find button index in the active player list."""

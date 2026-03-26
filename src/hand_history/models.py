@@ -110,3 +110,4 @@ class DecisionPoint:
     source_file: str = ''            # source HH file path (for file-based splits)
     player_net_dollars: float = 0.0  # player's net profit/loss for this hand
     is_last_action: bool = False     # True if this is the player's final action in the hand
+    action_history: Optional[List[List[float]]] = None  # encoded action sequence up to this point (for range estimator)

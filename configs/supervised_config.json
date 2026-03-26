@@ -1,0 +1,30 @@
+{
+  "data": {
+    "hh_dir": "data/poker_archive/",
+    "good_players": "data/good_players.txt",
+    "bad_players": "data/bad_players.txt",
+    "num_players": 6,
+    "workers": 47
+  },
+  "spot_db": {
+    "output": "data/spot_db_6p.npz"
+  },
+  "build_training_data": {
+    "spot_k": 100,
+    "fold_ratio": 0.15,
+    "min_lose_pct": 60,
+    "max_made_hand": 0.25,
+    "range_estimator": "models/range_estimator.pt",
+    "output": "data/training_data_6p.npz"
+  },
+  "train": {
+    "device": "cuda",
+    "hidden_layers": [512, 512, 512, 256],
+    "epochs": 100,
+    "lr": 0.0003,
+    "batch_size": 32768,
+    "dropout": 0.1,
+    "label_smoothing": 0.1,
+    "output": "models/supervised_6p.pt"
+  }
+}

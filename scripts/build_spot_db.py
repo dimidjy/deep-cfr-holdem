@@ -126,19 +126,40 @@ def _worker(file_path):
     return results
 
 
+def _load_config(config_path):
+    """Load supervised config for spot_db settings."""
+    import json
+    with open(config_path) as f:
+        cfg = json.load(f)
+    data = cfg.get('data', {})
+    spot_db = cfg.get('spot_db', {})
+
+    class Args: pass
+    args = Args()
+    args.hh_dir = data.get('hh_dir', 'data/poker_archive/')
+    args.num_players = data.get('num_players', 6)
+    args.workers = data.get('workers', 0)
+    args.output = spot_db.get('output', 'data/spot_db.npz')
+    args.max_files = 0
+    return args
+
+
 def main():
     parser = argparse.ArgumentParser(description='Build spot database from hand histories')
-    parser.add_argument('--hh-dir', type=str, default='data/poker_archive/',
-                        help='Directory with HH files')
-    parser.add_argument('--output', type=str, default='data/spot_db.npz',
-                        help='Output .npz file')
-    parser.add_argument('--num-players', type=int, default=6,
-                        help='Filter for N-player hands (default: 6)')
-    parser.add_argument('--workers', type=int, default=0,
-                        help='Number of workers (0=auto)')
-    parser.add_argument('--max-files', type=int, default=0,
-                        help='Max files to process (0=all)')
-    args = parser.parse_args()
+    parser.add_argument('--config', type=str, default='configs/supervised_config.json',
+                        help='Path to supervised_config.json')
+    parser.add_argument('--hh-dir', type=str, default=None)
+    parser.add_argument('--output', type=str, default=None)
+    parser.add_argument('--num-players', type=int, default=None)
+    parser.add_argument('--workers', type=int, default=None)
+    parser.add_argument('--max-files', type=int, default=None)
+    cli_args = parser.parse_args()
+
+    args = _load_config(cli_args.config)
+    for key in ['hh_dir', 'output', 'num_players', 'workers', 'max_files']:
+        cli_val = getattr(cli_args, key, None)
+        if cli_val is not None:
+            setattr(args, key, cli_val)
 
     hh_path = Path(args.hh_dir)
     all_files = sorted(hh_path.rglob('*.txt'))

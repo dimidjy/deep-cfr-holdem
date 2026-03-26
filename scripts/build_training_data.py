@@ -32,8 +32,13 @@ import numpy as np
 from collections import defaultdict
 from pathlib import Path
 
+import torch
 from src.hand_history.parser import parse_file
 from src.hand_history import ObservationBuilder
+from src.training.range_estimator import (
+    RangeEstimator, ACTION_STEP_DIM as RE_ACTION_STEP_DIM,
+    MAX_ACTIONS as RE_MAX_ACTIONS, NUM_HAND_CATEGORIES,
+)
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -84,11 +89,46 @@ def _prefilter_files(hh_files, players, hh_dir):
 _CFG = {}
 
 
-def _worker_init(num_players, good_players, bad_players):
+def _worker_init(num_players, good_players, bad_players, range_ckpt=None):
     _CFG['num_players'] = num_players
     _CFG['good_players'] = good_players
     _CFG['bad_players'] = bad_players
     _CFG['builder'] = ObservationBuilder(num_players=num_players)
+    _CFG['range_model'] = None
+    if range_ckpt is not None:
+        model = RangeEstimator(
+            input_dim=range_ckpt.get('input_dim', RE_ACTION_STEP_DIM),
+            hidden_dim=range_ckpt.get('hidden_dim', 128),
+            num_layers=range_ckpt.get('num_layers', 2),
+            output_dim=range_ckpt.get('output_dim', NUM_HAND_CATEGORIES),
+            dropout=0.0,
+            num_positions=range_ckpt.get('num_positions', num_players),
+        )
+        model.load_state_dict(range_ckpt['model_state_dict'])
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad_(False)
+        _CFG['range_model'] = model
+
+
+def _compute_range_probs(action_history, target_pos, range_model):
+    """Run range estimator on a single action history → numpy probs."""
+    seq_len = min(len(action_history), RE_MAX_ACTIONS)
+    if seq_len == 0:
+        return np.zeros(NUM_HAND_CATEGORIES, dtype=np.float32)
+
+    seq = np.zeros((1, RE_MAX_ACTIONS, RE_ACTION_STEP_DIM), dtype=np.float32)
+    for j in range(seq_len):
+        seq[0, j] = action_history[j]
+
+    with torch.no_grad():
+        logits = range_model(
+            torch.from_numpy(seq),
+            torch.tensor([seq_len]),
+            torch.tensor([target_pos]),
+        )
+        probs = torch.softmax(logits, dim=-1).squeeze(0).numpy()
+    return probs
 
 
 def _worker(file_path):
@@ -97,6 +137,8 @@ def _worker(file_path):
     good_players = _CFG['good_players']
     bad_players = _CFG['bad_players']
     builder = _CFG['builder']
+    range_model = _CFG['range_model']
+    use_range = range_model is not None
 
     good_spots = []   # (obs, action, net_bb, street_idx, legal_mask, hand_id)
     bad_cands = []     # (obs, action, net_bb, street_idx, legal_mask, hand_id)
@@ -130,7 +172,8 @@ def _worker(file_path):
             continue
 
         dps = builder.build_decision_points(hand, allow_unknown_cards=False,
-                                            source_file=str(file_path))
+                                            source_file=str(file_path),
+                                            track_action_history=use_range)
         if not dps:
             continue
 
@@ -194,8 +237,22 @@ def _worker(file_path):
                 if a < action_size:
                     legal_mask[a] = 1.0
 
+            # Compute range features if available
+            obs = dp.observation.astype(np.float32)
+            if use_range and dp.action_history:
+                # Find target opponent position (all other players are opponents)
+                # Use player's own position as target for range estimation
+                button_idx = 0
+                for ii, p in enumerate(hand.active_players):
+                    if p.seat == hand.button_seat:
+                        button_idx = ii
+                        break
+                target_pos = (dp.player_idx - button_idx) % num_players
+                range_probs = _compute_range_probs(dp.action_history, target_pos, range_model)
+                obs = np.concatenate([obs, range_probs])
+
             spot = (
-                dp.observation.astype(np.float32),
+                obs,
                 dp.actual_action,
                 np.float32(net_bb),
                 np.int8(street_idx),
@@ -222,35 +279,63 @@ def _worker(file_path):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def _load_config(config_path):
+    """Load supervised config and return a namespace matching CLI args."""
+    import json
+    with open(config_path) as f:
+        cfg = json.load(f)
+
+    data = cfg.get('data', {})
+    spot_db = cfg.get('spot_db', {})
+    btd = cfg.get('build_training_data', {})
+
+    class Args: pass
+    args = Args()
+    args.hh_dir = data.get('hh_dir', 'data/poker_archive/')
+    args.good_players = data.get('good_players', '')
+    args.bad_players = data.get('bad_players', '')
+    args.num_players = data.get('num_players', 6)
+    args.workers = data.get('workers', 0)
+    args.spot_db = spot_db.get('output', '')
+    args.fold_ratio = btd.get('fold_ratio', 0.15)
+    args.min_lose_pct = btd.get('min_lose_pct', 60.0)
+    args.max_made_hand = btd.get('max_made_hand', 0.25)
+    args.spot_k = btd.get('spot_k', 100)
+    args.range_estimator = btd.get('range_estimator', '')
+    args.output = btd.get('output', 'data/training_data.npz')
+    return args
+
+
 def main():
     import re
 
     parser = argparse.ArgumentParser(
         description='Build training dataset with spot-DB-validated fold labels')
-    parser.add_argument('--hh-dir', type=str, default='data/poker_archive/',
-                        help='Hand history directory')
-    parser.add_argument('--good-players', type=str, required=True,
-                        help='Path to good_players.txt')
-    parser.add_argument('--bad-players', type=str, required=True,
-                        help='Path to bad_players.txt')
-    parser.add_argument('--spot-db', type=str, required=True,
-                        help='Path to spot_db.npz')
-    parser.add_argument('--num-players', type=int, default=6,
-                        help='Filter for N-player hands (default: 6)')
-    parser.add_argument('--fold-ratio', type=float, default=0.15,
-                        help='Target fold ratio in final dataset (default: 0.15 = 15%%)')
-    parser.add_argument('--min-lose-pct', type=float, default=60.0,
-                        help='Min %% of similar spots that must be losers to create fold label (default: 60)')
-    parser.add_argument('--max-made-hand', type=float, default=0.25,
-                        help='Max made_hand_cat for fold labels (default: 0.25 = up to two_pair). '
-                             '0.125=pair only, 0.25=two_pair, 0.375=trips, 1.0=no filter')
-    parser.add_argument('--spot-k', type=int, default=100,
-                        help='Number of nearest neighbors for spot DB query (default: 100)')
-    parser.add_argument('--workers', type=int, default=0,
-                        help='Number of parse workers (0=auto)')
-    parser.add_argument('--output', type=str, default='data/training_data.npz',
-                        help='Output .npz file')
-    args = parser.parse_args()
+    parser.add_argument('--config', type=str, default='configs/supervised_config.json',
+                        help='Path to supervised_config.json (default: configs/supervised_config.json)')
+    # All params can still be overridden via CLI
+    parser.add_argument('--hh-dir', type=str, default=None)
+    parser.add_argument('--good-players', type=str, default=None)
+    parser.add_argument('--bad-players', type=str, default=None)
+    parser.add_argument('--spot-db', type=str, default=None)
+    parser.add_argument('--num-players', type=int, default=None)
+    parser.add_argument('--fold-ratio', type=float, default=None)
+    parser.add_argument('--min-lose-pct', type=float, default=None)
+    parser.add_argument('--max-made-hand', type=float, default=None)
+    parser.add_argument('--spot-k', type=int, default=None)
+    parser.add_argument('--workers', type=int, default=None)
+    parser.add_argument('--range-estimator', type=str, default=None)
+    parser.add_argument('--output', type=str, default=None)
+    cli_args = parser.parse_args()
+
+    # Load config, then override with any CLI args
+    args = _load_config(cli_args.config)
+    for key in ['hh_dir', 'good_players', 'bad_players', 'spot_db', 'num_players',
+                'fold_ratio', 'min_lose_pct', 'max_made_hand', 'spot_k', 'workers',
+                'range_estimator', 'output']:
+        cli_val = getattr(cli_args, key, None)
+        if cli_val is not None:
+            setattr(args, key, cli_val)
 
     # Load player lists
     def load_players(path):
@@ -266,6 +351,20 @@ def main():
     bad_players = load_players(args.bad_players)
     print(f'Good players: {len(good_players)}')
     print(f'Bad players: {len(bad_players)}')
+
+    # Load range estimator checkpoint (will be sent to workers)
+    range_ckpt = None
+    if args.range_estimator:
+        re_path = Path(args.range_estimator)
+        if not re_path.exists():
+            print(f'ERROR: Range estimator not found: {re_path}')
+            sys.exit(1)
+        range_ckpt = torch.load(str(re_path), map_location='cpu')
+        print(f'Range estimator: {re_path.name} '
+              f'(epoch {range_ckpt.get("epoch", "?")}, '
+              f'val_acc={range_ckpt.get("val_acc", 0):.1%}, '
+              f'output_dim={range_ckpt.get("output_dim", NUM_HAND_CATEGORIES)})')
+        print(f'  Observations will be {38 + range_ckpt.get("output_dim", NUM_HAND_CATEGORIES)}-dim')
 
     # Find HH files
     hh_path = Path(args.hh_dir)
@@ -293,7 +392,7 @@ def main():
     with mp.Pool(
         processes=workers,
         initializer=_worker_init,
-        initargs=(args.num_players, good_players, bad_players),
+        initargs=(args.num_players, good_players, bad_players, range_ckpt),
     ) as pool:
         for good_spots, bad_cands, n_hands, n_used in pool.imap_unordered(
             _worker, filtered_files, chunksize=32

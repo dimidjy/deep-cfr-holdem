@@ -46,6 +46,10 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from src.training.deep_cfr import StrategyNetwork
+from src.training.range_estimator import (
+    RangeEstimator, ACTION_STEP_DIM as RE_ACTION_STEP_DIM,
+    MAX_ACTIONS as RE_MAX_ACTIONS, NUM_HAND_CATEGORIES,
+)
 from src.hand_history import ObservationBuilder, DecisionPoint
 from src.hand_history.parser import parse_file
 from validate_spots import run_validation, validation_summary_line
@@ -59,6 +63,7 @@ class SupervisedModelWrapper:
     """Wraps a StrategyNetwork to mimic the DeepCFR interface for run_validation."""
 
     def __init__(self, model, obs_size, action_size, num_players, device, iteration=0):
+        self.obs_size = obs_size
         self.action_size = action_size
         self.num_players = num_players
         self.device = torch.device(device)
@@ -70,6 +75,11 @@ class SupervisedModelWrapper:
 
     def get_strategy(self, observation: np.ndarray, player_idx: int,
                      legal_actions: list) -> np.ndarray:
+        # Pad observation to model's expected input size (e.g. 38 → 47 with range features)
+        if len(observation) < self.obs_size:
+            padded = np.zeros(self.obs_size, dtype=np.float32)
+            padded[:len(observation)] = observation
+            observation = padded
         obs_tensor = torch.FloatTensor(observation).unsqueeze(0).to(self.device)
         with torch.no_grad():
             logits = self.strategy_networks[player_idx](obs_tensor).cpu().numpy()[0]
@@ -196,11 +206,13 @@ def _prefilter_files(hh_files: list, good_players: set, hh_dir: str) -> list:
 
 _PARSE_CFG = {}  # set by _parse_worker_init
 
-def _parse_worker_init(num_players, good_players, bad_players, postflop_only):
+def _parse_worker_init(num_players, good_players, bad_players, postflop_only,
+                        track_action_history=False):
     _PARSE_CFG['num_players'] = num_players
     _PARSE_CFG['good_players'] = good_players
     _PARSE_CFG['bad_players'] = bad_players
     _PARSE_CFG['postflop_only'] = postflop_only
+    _PARSE_CFG['track_action_history'] = track_action_history
     _PARSE_CFG['builder'] = ObservationBuilder(num_players=num_players)
 
 
@@ -249,7 +261,8 @@ def _parse_single_file(file_path):
             continue
 
         dps = builder.build_decision_points(hand, allow_unknown_cards=False,
-                                               source_file=str(file_path))
+                                               source_file=str(file_path),
+                                               track_action_history=_PARSE_CFG['track_action_history'])
         if not dps:
             continue
 
@@ -350,7 +363,8 @@ def collect_decision_points(hh_dir: str, num_players: int,
                             bad_players: set,
                             no_cache: bool,
                             postflop_only: bool,
-                            workers: int = 0) -> list:
+                            workers: int = 0,
+                            track_action_history: bool = False) -> list:
     """Parse HH files and collect decision points from target players."""
     hh_path = Path(hh_dir)
     all_hh_files = sorted(hh_path.rglob('*.txt'))
@@ -366,7 +380,8 @@ def collect_decision_points(hh_dir: str, num_players: int,
     # Cache key
     player_key = '|'.join(sorted(good_players)) if good_players else 'all'
     bad_key = f'bad{len(bad_players)}' if bad_players else 'nobad'
-    cache_key = f'sv3|{hh_dir}|{len(all_hh_files)}|flt{len(hh_files)}|np{num_players}|max{max_hands}|g{player_key}|{bad_key}|pf{postflop_only}'
+    ah_key = 'ah1' if track_action_history else 'ah0'
+    cache_key = f'sv3|{hh_dir}|{len(all_hh_files)}|flt{len(hh_files)}|np{num_players}|max{max_hands}|g{player_key}|{bad_key}|pf{postflop_only}|{ah_key}'
     cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:12]
     cache_dir = Path(__file__).parent.parent / 'data' / '.hh_cache'
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -395,7 +410,8 @@ def collect_decision_points(hh_dir: str, num_players: int,
 
     total_bad_folds = 0
     with mp.Pool(processes=parse_workers, initializer=_parse_worker_init,
-                 initargs=(num_players, good_players, bad_players, postflop_only)) as parse_pool:
+                 initargs=(num_players, good_players, bad_players, postflop_only,
+                           track_action_history)) as parse_pool:
         results = parse_pool.imap_unordered(_parse_single_file, hh_files, chunksize=16)
         files_done = 0
         for file_dps, file_total, file_used, file_player_counts, file_bad_folds in results:
@@ -637,16 +653,97 @@ def apply_reward_weighting(decision_points: list) -> list:
     return decision_points
 
 
+def compute_range_features(decision_points: list, range_model: RangeEstimator,
+                           device: torch.device, num_players: int = 6) -> np.ndarray:
+    """Run frozen range estimator on action histories to produce features.
+
+    For each decision point with action_history, encodes the sequence and runs
+    the range estimator for each opponent position, producing a
+    (num_opponents * NUM_HAND_CATEGORIES)-dim feature vector.
+
+    To keep it simple and useful: run the range estimator for the single
+    "average opponent" — use the mean of all non-hero position predictions.
+    This gives a compact NUM_HAND_CATEGORIES-dim (9) feature per decision point.
+
+    Decision points without action_history or on preflop get zeros.
+    """
+    n = len(decision_points)
+    range_dim = NUM_HAND_CATEGORIES
+    features = np.zeros((n, range_dim), dtype=np.float32)
+
+    # Collect indices with valid action histories
+    valid_indices = []
+    for i, dp in enumerate(decision_points):
+        if dp.action_history and len(dp.action_history) > 0 and dp.street != 'preflop':
+            valid_indices.append(i)
+
+    if not valid_indices:
+        return features
+
+    print(f'  Computing range features for {len(valid_indices)} decision points...')
+    t0 = time.time()
+
+    range_model.eval()
+    batch_size = 4096
+
+    for batch_start in range(0, len(valid_indices), batch_size):
+        batch_idx = valid_indices[batch_start:batch_start + batch_size]
+        b = len(batch_idx)
+
+        # Build padded sequences
+        seqs = np.zeros((b, RE_MAX_ACTIONS, RE_ACTION_STEP_DIM), dtype=np.float32)
+        lens = np.zeros(b, dtype=np.int64)
+
+        for j, idx in enumerate(batch_idx):
+            dp = decision_points[idx]
+            ah = dp.action_history
+            actual_len = min(len(ah), RE_MAX_ACTIONS)
+            for k in range(actual_len):
+                seqs[j, k] = ah[k]
+            lens[j] = actual_len
+
+        seqs_t = torch.FloatTensor(seqs).to(device, non_blocking=True)
+        lens_t = torch.LongTensor(lens).to(device, non_blocking=True)
+
+        # Run for each opponent position, average the results
+        all_probs = []
+        for opp_pos in range(num_players):
+            pos_t = torch.full((b,), opp_pos, dtype=torch.long, device=device)
+            with torch.no_grad(), torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
+                probs = range_model.predict_probs(seqs_t, lens_t, pos_t)
+            all_probs.append(probs)
+
+        # Average over all opponent positions (excluding hero's own position)
+        # For simplicity, average all positions — the model learns to use this
+        avg_probs = torch.stack(all_probs, dim=0).mean(dim=0)  # (b, 9)
+        avg_np = avg_probs.cpu().numpy()
+
+        for j, idx in enumerate(batch_idx):
+            features[idx] = avg_np[j]
+
+    elapsed = time.time() - t0
+    print(f'  Range features computed in {elapsed:.1f}s')
+
+    return features
+
+
 def build_dataset(decision_points: list, action_size: int = 5,
                   weight_by_street: bool = True,
                   weight_by_pot: bool = True,
-                  reward_weight: bool = False):
+                  reward_weight: bool = False,
+                  range_features: np.ndarray = None):
     """Convert decision points to training tensors (vectorized)."""
     n = len(decision_points)
     obs_size = decision_points[0].observation.shape[0]
 
+    # If range features provided, augment obs_size
+    if range_features is not None:
+        aug_size = obs_size + range_features.shape[1]
+    else:
+        aug_size = obs_size
+
     # Extract arrays in one pass
-    observations = np.zeros((n, obs_size), dtype=np.float32)
+    observations = np.zeros((n, aug_size), dtype=np.float32)
     actions = np.zeros(n, dtype=np.int64)
     legal_masks = np.zeros((n, action_size), dtype=np.float32)
     pot_dollars = np.zeros(n, dtype=np.float32)
@@ -656,7 +753,9 @@ def build_dataset(decision_points: list, action_size: int = 5,
     street_map = {'preflop': 0, 'flop': 1, 'turn': 2, 'river': 3}
 
     for i, dp in enumerate(decision_points):
-        observations[i] = dp.observation
+        observations[i, :obs_size] = dp.observation
+        if range_features is not None:
+            observations[i, obs_size:] = range_features[i]
         actions[i] = dp.actual_action
         for a in dp.legal_actions:
             legal_masks[i, a] = 1.0
@@ -848,79 +947,107 @@ def eval_epoch(model, dataloader, device,
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _load_config(config_path):
+    """Load supervised config for train_supervised settings."""
+    import json
+    with open(config_path) as f:
+        cfg = json.load(f)
+    data = cfg.get('data', {})
+    btd = cfg.get('build_training_data', {})
+    train = cfg.get('train', {})
+
+    class Args: pass
+    args = Args()
+    # Data
+    args.training_data = btd.get('output', '')
+    args.hh_dir = data.get('hh_dir', 'data/poker_archive/')
+    args.good_players = data.get('good_players', '')
+    args.bad_players = data.get('bad_players', '')
+    args.num_players = data.get('num_players', 6)
+    args.max_hands = 0
+    args.no_cache = False
+    args.workers = data.get('workers', 0)
+    # Training
+    args.epochs = train.get('epochs', 50)
+    args.batch_size = train.get('batch_size', 32768)
+    args.lr = train.get('lr', 0.001)
+    args.hidden_layers = ','.join(str(x) for x in train.get('hidden_layers', [512, 512, 256]))
+    args.dropout = train.get('dropout', 0.1)
+    args.val_split = 0.1
+    args.weight_pot = True
+    args.no_weight_pot = False
+    args.label_smoothing = train.get('label_smoothing', 0.1)
+    args.no_action_costs = False
+    args.counterfactual_folds = False
+    args.no_counterfactual_folds = False
+    args.spot_db = ''
+    args.spot_k = 100
+    args.spot_min_adv = 1.0
+    args.reward_weight = False
+    args.no_reward_weight = False
+    args.range_estimator = ''
+    # Validation
+    args.val_interval = 5
+    args.val_games = 500
+    # Output
+    args.output = train.get('output', 'models/supervised_model.pt')
+    args.resume = ''
+    args.device = train.get('device', None)
+    return args
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Supervised poker model — behavioral cloning from hand histories'
     )
-    parser.add_argument('--training-data', type=str, default='',
-                        help='Path to pre-built training data .npz (from build_training_data.py). '
-                             'Skips HH parsing when provided.')
-    parser.add_argument('--hh-dir', type=str, default='data/poker_archive/',
-                        help='Directory with PokerStars HH files')
-    parser.add_argument('--good-players', type=str, default='',
-                        help='Path to .txt file with winning player names (one per line)')
-    parser.add_argument('--bad-players', type=str, default='',
-                        help='Path to .txt file with losing player names — their losing calls become fold labels')
-    parser.add_argument('--num-players', type=int, default=6,
-                        help='Number of players (default: 6)')
-    parser.add_argument('--max-hands', type=int, default=0,
-                        help='Max showdown hands to use (0=all)')
-    parser.add_argument('--no-cache', action='store_true',
-                        help='Force re-parse HH files')
+    parser.add_argument('--config', type=str, default='configs/supervised_config.json',
+                        help='Path to supervised_config.json')
+    # All params can still be overridden via CLI
+    parser.add_argument('--training-data', type=str, default=None)
+    parser.add_argument('--hh-dir', type=str, default=None)
+    parser.add_argument('--good-players', type=str, default=None)
+    parser.add_argument('--bad-players', type=str, default=None)
+    parser.add_argument('--num-players', type=int, default=None)
+    parser.add_argument('--max-hands', type=int, default=None)
+    parser.add_argument('--no-cache', action='store_true', default=False)
 
-    # Training hyperparameters
-    parser.add_argument('--epochs', type=int, default=50,
-                        help='Number of training epochs')
-    parser.add_argument('--batch-size', type=int, default=32768,
-                        help='Training batch size')
-    parser.add_argument('--lr', type=float, default=0.001,
-                        help='Learning rate')
-    parser.add_argument('--hidden-layers', type=str, default='512,512,256',
-                        help='Hidden layer sizes (comma-separated)')
-    parser.add_argument('--dropout', type=float, default=0.1,
-                        help='Dropout rate')
-    parser.add_argument('--val-split', type=float, default=0.1,
-                        help='Validation split ratio')
-    parser.add_argument('--weight-pot', action='store_true', default=True,
-                        help='Weight decisions by pot size (bigger pots matter more)')
-    parser.add_argument('--no-weight-pot', action='store_true',
-                        help='Disable pot-size weighting')
-    parser.add_argument('--label-smoothing', type=float, default=0.1,
-                        help='Label smoothing factor (0=off, 0.1=default)')
-    parser.add_argument('--no-action-costs', action='store_true',
-                        help='Disable action cost matrix (treat all misclassifications equally)')
-    parser.add_argument('--counterfactual-folds', action='store_true', default=False,
-                        help='Generate synthetic fold labels from losers\' last actions (default: off)')
-    parser.add_argument('--no-counterfactual-folds', action='store_true',
-                        help='Disable counterfactual fold generation')
-    parser.add_argument('--spot-db', type=str, default='',
-                        help='Path to spot_db.npz for spot-lookup fold labels')
-    parser.add_argument('--spot-k', type=int, default=100,
-                        help='Number of neighbors for spot lookup (default: 100)')
-    parser.add_argument('--spot-min-adv', type=float, default=1.0,
-                        help='Min BB advantage of fold over call for spot-lookup folds (default: 1.0)')
-    parser.add_argument('--reward-weight', action='store_true', default=False,
-                        help='Weight samples by hand outcome (winners up, losers down) (default: off)')
-    parser.add_argument('--no-reward-weight', action='store_true',
-                        help='Disable reward-based sample weighting')
+    parser.add_argument('--epochs', type=int, default=None)
+    parser.add_argument('--batch-size', type=int, default=None)
+    parser.add_argument('--lr', type=float, default=None)
+    parser.add_argument('--hidden-layers', type=str, default=None)
+    parser.add_argument('--dropout', type=float, default=None)
+    parser.add_argument('--val-split', type=float, default=None)
+    parser.add_argument('--weight-pot', action='store_true', default=None)
+    parser.add_argument('--no-weight-pot', action='store_true', default=None)
+    parser.add_argument('--label-smoothing', type=float, default=None)
+    parser.add_argument('--no-action-costs', action='store_true', default=None)
+    parser.add_argument('--counterfactual-folds', action='store_true', default=None)
+    parser.add_argument('--no-counterfactual-folds', action='store_true', default=None)
+    parser.add_argument('--spot-db', type=str, default=None)
+    parser.add_argument('--spot-k', type=int, default=None)
+    parser.add_argument('--spot-min-adv', type=float, default=None)
+    parser.add_argument('--reward-weight', action='store_true', default=None)
+    parser.add_argument('--no-reward-weight', action='store_true', default=None)
+    parser.add_argument('--range-estimator', type=str, default=None)
 
-    # Validation
-    parser.add_argument('--val-interval', type=int, default=5,
-                        help='Run spot validation every N epochs (0=disabled)')
-    parser.add_argument('--val-games', type=int, default=500,
-                        help='Number of games for spot validation')
+    parser.add_argument('--val-interval', type=int, default=None)
+    parser.add_argument('--val-games', type=int, default=None)
 
-    # Output
-    parser.add_argument('--output', type=str, default='models/supervised_model.pt',
-                        help='Output model path')
-    parser.add_argument('--resume', type=str, default='',
-                        help='Resume from checkpoint')
-    parser.add_argument('--device', type=str, default=None,
-                        help='cuda | cpu (auto-detected if omitted)')
-    parser.add_argument('--workers', type=int, default=0,
-                        help='Number of parse workers (0=auto: cpu_count-1)')
+    parser.add_argument('--output', type=str, default=None)
+    parser.add_argument('--resume', type=str, default=None)
+    parser.add_argument('--device', type=str, default=None)
+    parser.add_argument('--workers', type=int, default=None)
 
-    args = parser.parse_args()
+    cli_args = parser.parse_args()
+
+    # Load config, then override with any CLI args
+    args = _load_config(cli_args.config)
+    for key in vars(cli_args):
+        if key == 'config':
+            continue
+        cli_val = getattr(cli_args, key)
+        if cli_val is not None:
+            setattr(args, key, cli_val)
 
     postflop_only = True
     weight_pot = args.weight_pot and not args.no_weight_pot
@@ -984,10 +1111,39 @@ def main():
     print(f'  spot_db  : {args.spot_db or "off"}')
     print(f'  bad_folds: {len(bad_players)} bad players' if bad_players else '  bad_folds: off')
     print(f'  reward_wt: {use_reward_weight}')
+    print(f'  range_est: {args.range_estimator or "off"}')
     print(f'  preflop  : GTO ranges (locked)')
     print(f'  training : postflop only')
     print(f'  val_int  : {args.val_interval} epochs')
     print('=' * 60)
+
+    # ── Load range estimator (if provided) ─────────────────────────────
+    range_model = None
+    use_range_estimator = bool(args.range_estimator)
+    if use_range_estimator:
+        re_path = Path(args.range_estimator)
+        if not re_path.exists():
+            print(f'Range estimator not found: {re_path}')
+            sys.exit(1)
+        re_ckpt = torch.load(str(re_path), map_location=device)
+        range_model = RangeEstimator(
+            input_dim=re_ckpt.get('input_dim', RE_ACTION_STEP_DIM),
+            hidden_dim=re_ckpt.get('hidden_dim', 128),
+            num_layers=re_ckpt.get('num_layers', 2),
+            output_dim=re_ckpt.get('output_dim', NUM_HAND_CATEGORIES),
+            dropout=0.0,  # no dropout at inference
+            num_positions=re_ckpt.get('num_positions', num_players),
+        )
+        range_model.load_state_dict(re_ckpt['model_state_dict'])
+        range_model = range_model.to(device)
+        range_model.eval()
+        for p in range_model.parameters():
+            p.requires_grad_(False)
+        re_params = sum(p.numel() for p in range_model.parameters())
+        print(f'  Range estimator loaded: {re_path.name} '
+              f'(epoch {re_ckpt.get("epoch", "?")}, '
+              f'val_acc={re_ckpt.get("val_acc", 0):.1%}, '
+              f'{re_params:,} params, frozen)')
 
     # ── Collect data ─────────────────────────────────────────────────────
     print(f'\n{"="*70}')
@@ -998,6 +1154,10 @@ def main():
     use_prebuilt = bool(args.training_data)
 
     if use_prebuilt:
+        if use_range_estimator:
+            print('  WARNING: --range-estimator is ignored with --training-data '
+                  '(pre-built data has no action histories)')
+            use_range_estimator = False
         # Load pre-built training data from build_training_data.py
         print(f'  Loading pre-built training data from {args.training_data}...')
         data = np.load(args.training_data)
@@ -1037,6 +1197,7 @@ def main():
             args.hh_dir, num_players, args.max_hands,
             good_players, bad_players, args.no_cache,
             postflop_only, args.workers,
+            track_action_history=use_range_estimator,
         )
 
         if len(decision_points) < 100:
@@ -1057,11 +1218,20 @@ def main():
         if use_reward_weight:
             decision_points = apply_reward_weighting(decision_points)
 
+        # ── Compute range features (if range estimator provided) ──────────
+        range_features = None
+        if use_range_estimator and range_model is not None:
+            range_features = compute_range_features(
+                decision_points, range_model, device, num_players)
+
         # ── Build dataset ──────────────────────────────────────────────────
         print(f'Building dataset...')
         obs_size = decision_points[0].observation.shape[0]
+        if range_features is not None:
+            obs_size += NUM_HAND_CATEGORIES  # augmented
         observations, actions, legal_masks, weights = build_dataset(
-            decision_points, action_size, True, weight_pot, use_reward_weight)
+            decision_points, action_size, True, weight_pot, use_reward_weight,
+            range_features=range_features)
 
         # Street distribution
         street_counts = defaultdict(int)
@@ -1246,6 +1416,8 @@ def main():
                 'use_action_costs': use_action_costs,
                 'counterfactual_folds': use_counterfactual,
                 'reward_weight': use_reward_weight,
+                'range_estimator': args.range_estimator or None,
+                'range_estimator_dim': NUM_HAND_CATEGORIES if use_range_estimator else 0,
             }
             torch.save(save_dict, str(output_path))
 

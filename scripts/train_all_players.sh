@@ -158,3 +158,23 @@ echo "  models/supervised_5p.pt"
 echo "  models/supervised_4p.pt"
 echo "  models/supervised_3p.pt"
 echo "  models/supervised_2p.pt"
+
+
+
+
+python3 scripts/build_spot_db.py --num-players 6 --workers 47 --output data/spot_db_6p.npz &&
+python3 scripts/train_supervised.py \
+  --num-players 6 \
+  --good-players data/good_players.txt \
+  --bad-players data/bad_players.txt \
+  --spot-db data/spot_db_6p.npz \
+  --counterfactual-folds \
+  --range-estimator models/range_estimator.pt \
+  --hidden-layers 512,512,256 \
+  --epochs 100 \
+  --lr 0.0003 \
+  --workers 47 \
+  --device cuda \
+  --output models/supervised_6p_range.pt \
+  --no-cache
+
