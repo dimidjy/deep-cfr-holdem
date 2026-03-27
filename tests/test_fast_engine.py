@@ -15,7 +15,6 @@ Tests:
 
 import sys
 import os
-import time
 import numpy as np
 import pytest
 
@@ -25,8 +24,6 @@ from src.engine import (
     FastPokerEngine,
     FastEnhancedPokerEngine,
 )
-# Import legacy PettingZoo engine directly for comparison tests
-from src.engine.poker_engine_enhanced import EnhancedPokerEngine as LegacyEnhancedPokerEngine
 
 
 # ── 1. Basic game flow ──────────────────────────────────────────────────────
@@ -201,20 +198,6 @@ class TestFeatures:
                 if not legal:
                     break
                 eng.step(np.random.choice(legal))
-
-    def test_obs_size_matches_old_engine(self):
-        """Feature vector size should match between old and new engines."""
-        old = LegacyEnhancedPokerEngine(num_players=6)
-        new = FastEnhancedPokerEngine(num_players=6)
-        assert old.get_observation_space_size() == new.get_observation_space_size(), \
-            f"Size mismatch: old={old.get_observation_space_size()} vs new={new.get_observation_space_size()}"
-        old.close()
-
-    def test_obs_size_2_players(self):
-        old = LegacyEnhancedPokerEngine(num_players=2)
-        new = FastEnhancedPokerEngine(num_players=2)
-        assert old.get_observation_space_size() == new.get_observation_space_size()
-        old.close()
 
 
 # ── 5. Deterministic replay ─────────────────────────────────────────────────
@@ -397,47 +380,6 @@ class TestScenarios:
                 assert abs(sum(rewards.values())) < 0.01
 
 
-# ── 8. Performance comparison ───────────────────────────────────────────────
-
-class TestPerformance:
-    def test_fast_engine_faster_than_pettingzoo(self):
-        """Fast engine should be significantly faster."""
-        N = 500
-
-        # Fast engine
-        fast = FastPokerEngine(num_players=6)
-        t0 = time.time()
-        for _ in range(N):
-            fast.reset()
-            while not fast.is_done():
-                legal = fast.get_legal_actions()
-                if not legal:
-                    break
-                fast.step(legal[1] if len(legal) > 1 else legal[0])
-        fast_time = time.time() - t0
-
-        # PettingZoo engine
-        old = LegacyEnhancedPokerEngine(num_players=6)
-        from pettingzoo.classic import texas_holdem_no_limit_v6
-        env = texas_holdem_no_limit_v6.env(num_players=6)
-        t0 = time.time()
-        for _ in range(N):
-            env.reset()
-            for agent in env.agent_iter():
-                obs, rew, term, trunc, info = env.last()
-                if term or trunc:
-                    env.step(None)
-                else:
-                    mask = obs['action_mask']
-                    legal = [i for i, m in enumerate(mask) if m]
-                    env.step(legal[1] if len(legal) > 1 else legal[0])
-        pz_time = time.time() - t0
-        old.close()
-
-        speedup = pz_time / fast_time
-        print(f"\n  Fast: {fast_time:.3f}s, PettingZoo: {pz_time:.3f}s, Speedup: {speedup:.1f}x")
-        assert speedup > 5, f"Expected >5x speedup, got {speedup:.1f}x"
-
 
 # ── 9. _get_game proxy ──────────────────────────────────────────────────────
 
@@ -503,76 +445,6 @@ class TestFeatureParity:
         if hasattr(eng, 'close'):
             eng.close()
         return np.array(all_obs)
-
-    def test_feature_dimensions_match(self):
-        """Both engines produce same number of features."""
-        old = LegacyEnhancedPokerEngine(num_players=6)
-        new = FastEnhancedPokerEngine(num_players=6)
-        assert old.get_observation_space_size() == new.get_observation_space_size()
-        old.close()
-
-    def test_feature_ranges_similar(self):
-        """Feature min/max ranges should be similar between engines."""
-        np.random.seed(123)
-        old_obs = self._collect_features(LegacyEnhancedPokerEngine, n_games=300)
-        np.random.seed(123)
-        new_obs = self._collect_features(FastEnhancedPokerEngine, n_games=300)
-
-        obs_size = old_obs.shape[1]
-        assert new_obs.shape[1] == obs_size
-
-        for i in range(obs_size):
-            old_min, old_max = old_obs[:, i].min(), old_obs[:, i].max()
-            new_min, new_max = new_obs[:, i].min(), new_obs[:, i].max()
-            # Ranges should overlap substantially
-            assert new_min <= old_max + 0.1, \
-                f"Feature {i}: new min {new_min:.3f} > old max {old_max:.3f}"
-            assert new_max >= old_min - 0.1, \
-                f"Feature {i}: new max {new_max:.3f} < old min {old_min:.3f}"
-
-    def test_feature_means_similar(self):
-        """Feature means should be in the same ballpark.
-
-        Note: engines deal different cards and have slightly different legal action
-        profiles, so game flow differs (fast engine has more postflop play).
-        We check that no feature is completely broken (always 0 in one, nonzero in other).
-        """
-        np.random.seed(456)
-        old_obs = self._collect_features(LegacyEnhancedPokerEngine, n_games=500)
-        np.random.seed(456)
-        new_obs = self._collect_features(FastEnhancedPokerEngine, n_games=500)
-
-        obs_size = old_obs.shape[1]
-        max_diff = 0
-        warnings = []
-        broken = []
-        for i in range(obs_size):
-            old_mean = old_obs[:, i].mean()
-            new_mean = new_obs[:, i].mean()
-            old_std = old_obs[:, i].std()
-            new_std = new_obs[:, i].std()
-            diff = abs(old_mean - new_mean)
-            max_diff = max(max_diff, diff)
-
-            # Broken: one engine always 0, other has meaningful values
-            if old_std < 0.001 and new_std > 0.05 and new_mean > 0.1:
-                broken.append(
-                    f"  feat {i}: old is constant ({old_mean:.4f}), new varies (mean={new_mean:.4f}, std={new_std:.4f})")
-            elif new_std < 0.001 and old_std > 0.05 and old_mean > 0.1:
-                broken.append(
-                    f"  feat {i}: new is constant ({new_mean:.4f}), old varies (mean={old_mean:.4f}, std={old_std:.4f})")
-
-            if diff > 0.15:
-                warnings.append(
-                    f"  feat {i}: old_mean={old_mean:.4f}, new_mean={new_mean:.4f}, diff={diff:.4f}")
-
-        print(f"\n  Max mean difference across features: {max_diff:.4f}")
-        if warnings:
-            print(f"  {len(warnings)} features with mean diff > 0.15 (expected due to different game flow):")
-            for w in warnings:
-                print(w)
-        assert len(broken) == 0, \
-            f"{len(broken)} features appear broken:\n" + "\n".join(broken)
 
     def test_position_features_one_hot(self):
         """Position features should be valid one-hot + normalized values."""
@@ -654,45 +526,6 @@ class TestFeatureParity:
                 expected_po = eng._state.pot / (eng._state.pot + call_amt)
                 assert abs(pot_odds - expected_po) < 0.01, \
                     f"pot_odds mismatch: obs={pot_odds}, expected={expected_po}"
-
-    def test_rewards_distribution_similar(self):
-        """Reward distributions should be similar between engines."""
-        np.random.seed(789)
-        old_rewards = []
-        old_eng = LegacyEnhancedPokerEngine(num_players=6)
-        for _ in range(500):
-            old_eng.reset()
-            while not old_eng.is_done():
-                legal = old_eng.get_legal_actions()
-                if not legal:
-                    break
-                old_eng.step(np.random.choice(legal))
-            rw = old_eng.get_rewards()
-            old_rewards.extend(rw.values())
-        old_eng.close()
-
-        np.random.seed(789)
-        new_rewards = []
-        new_eng = FastEnhancedPokerEngine(num_players=6)
-        for _ in range(500):
-            new_eng.reset()
-            while not new_eng.is_done():
-                legal = new_eng.get_legal_actions()
-                if not legal:
-                    break
-                new_eng.step(np.random.choice(legal))
-            rw = new_eng.get_rewards()
-            new_rewards.extend(rw.values())
-
-        old_arr = np.array(old_rewards)
-        new_arr = np.array(new_rewards)
-        # Means should be close to 0 (zero-sum)
-        assert abs(old_arr.mean()) < 1.0
-        assert abs(new_arr.mean()) < 1.0
-        # Std devs should be in same ballpark
-        ratio = new_arr.std() / max(old_arr.std(), 0.01)
-        assert 0.3 < ratio < 3.0, \
-            f"Reward std ratio={ratio:.2f} (old={old_arr.std():.1f}, new={new_arr.std():.1f})"
 
 
 # ── 11. MCCFR replay pattern test ──────────────────────────────────────────

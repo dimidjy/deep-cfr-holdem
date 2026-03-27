@@ -32,13 +32,8 @@ import numpy as np
 from collections import defaultdict
 from pathlib import Path
 
-import torch
 from src.hand_history.parser import parse_file
-from src.hand_history import ObservationBuilder
-from src.training.range_estimator import (
-    RangeEstimator, ACTION_STEP_DIM as RE_ACTION_STEP_DIM,
-    MAX_ACTIONS as RE_MAX_ACTIONS, NUM_HAND_CATEGORIES,
-)
+from src.hand_history import ObservationBuilder, BEHAVIORAL_STATS_DIM
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -89,46 +84,12 @@ def _prefilter_files(hh_files, players, hh_dir):
 _CFG = {}
 
 
-def _worker_init(num_players, good_players, bad_players, range_ckpt=None):
+def _worker_init(num_players, good_players, bad_players, use_behavioral_stats=False):
     _CFG['num_players'] = num_players
     _CFG['good_players'] = good_players
     _CFG['bad_players'] = bad_players
     _CFG['builder'] = ObservationBuilder(num_players=num_players)
-    _CFG['range_model'] = None
-    if range_ckpt is not None:
-        model = RangeEstimator(
-            input_dim=range_ckpt.get('input_dim', RE_ACTION_STEP_DIM),
-            hidden_dim=range_ckpt.get('hidden_dim', 128),
-            num_layers=range_ckpt.get('num_layers', 2),
-            output_dim=range_ckpt.get('output_dim', NUM_HAND_CATEGORIES),
-            dropout=0.0,
-            num_positions=range_ckpt.get('num_positions', num_players),
-        )
-        model.load_state_dict(range_ckpt['model_state_dict'])
-        model.eval()
-        for p in model.parameters():
-            p.requires_grad_(False)
-        _CFG['range_model'] = model
-
-
-def _compute_range_probs(action_history, target_pos, range_model):
-    """Run range estimator on a single action history → numpy probs."""
-    seq_len = min(len(action_history), RE_MAX_ACTIONS)
-    if seq_len == 0:
-        return np.zeros(NUM_HAND_CATEGORIES, dtype=np.float32)
-
-    seq = np.zeros((1, RE_MAX_ACTIONS, RE_ACTION_STEP_DIM), dtype=np.float32)
-    for j in range(seq_len):
-        seq[0, j] = action_history[j]
-
-    with torch.no_grad():
-        logits = range_model(
-            torch.from_numpy(seq),
-            torch.tensor([seq_len]),
-            torch.tensor([target_pos]),
-        )
-        probs = torch.softmax(logits, dim=-1).squeeze(0).numpy()
-    return probs
+    _CFG['behavioral_stats'] = use_behavioral_stats
 
 
 def _worker(file_path):
@@ -137,11 +98,10 @@ def _worker(file_path):
     good_players = _CFG['good_players']
     bad_players = _CFG['bad_players']
     builder = _CFG['builder']
-    range_model = _CFG['range_model']
-    use_range = range_model is not None
+    use_bh = _CFG['behavioral_stats']
 
     good_spots = []   # (obs, action, net_bb, street_idx, legal_mask, hand_id)
-    bad_cands = []     # (obs, action, net_bb, street_idx, legal_mask, hand_id)
+    bad_cands = []     # same
 
     try:
         hands = parse_file(str(file_path))
@@ -173,7 +133,7 @@ def _worker(file_path):
 
         dps = builder.build_decision_points(hand, allow_unknown_cards=False,
                                             source_file=str(file_path),
-                                            track_action_history=use_range)
+                                            behavioral_stats=use_bh)
         if not dps:
             continue
 
@@ -237,19 +197,7 @@ def _worker(file_path):
                 if a < action_size:
                     legal_mask[a] = 1.0
 
-            # Compute range features if available
             obs = dp.observation.astype(np.float32)
-            if use_range and dp.action_history:
-                # Find target opponent position (all other players are opponents)
-                # Use player's own position as target for range estimation
-                button_idx = 0
-                for ii, p in enumerate(hand.active_players):
-                    if p.seat == hand.button_seat:
-                        button_idx = ii
-                        break
-                target_pos = (dp.player_idx - button_idx) % num_players
-                range_probs = _compute_range_probs(dp.action_history, target_pos, range_model)
-                obs = np.concatenate([obs, range_probs])
 
             spot = (
                 obs,
@@ -301,7 +249,7 @@ def _load_config(config_path):
     args.min_lose_pct = btd.get('min_lose_pct', 60.0)
     args.max_made_hand = btd.get('max_made_hand', 0.25)
     args.spot_k = btd.get('spot_k', 100)
-    args.range_estimator = btd.get('range_estimator', '')
+    args.behavioral_stats = btd.get('behavioral_stats', False)
     args.output = btd.get('output', 'data/training_data.npz')
     return args
 
@@ -324,7 +272,8 @@ def main():
     parser.add_argument('--max-made-hand', type=float, default=None)
     parser.add_argument('--spot-k', type=int, default=None)
     parser.add_argument('--workers', type=int, default=None)
-    parser.add_argument('--range-estimator', type=str, default=None)
+    parser.add_argument('--behavioral-stats', action='store_true', default=None,
+                        help='Append 8-dim behavioral stats to observations')
     parser.add_argument('--output', type=str, default=None)
     cli_args = parser.parse_args()
 
@@ -332,7 +281,7 @@ def main():
     args = _load_config(cli_args.config)
     for key in ['hh_dir', 'good_players', 'bad_players', 'spot_db', 'num_players',
                 'fold_ratio', 'min_lose_pct', 'max_made_hand', 'spot_k', 'workers',
-                'range_estimator', 'output']:
+                'behavioral_stats', 'output']:
         cli_val = getattr(cli_args, key, None)
         if cli_val is not None:
             setattr(args, key, cli_val)
@@ -352,19 +301,9 @@ def main():
     print(f'Good players: {len(good_players)}')
     print(f'Bad players: {len(bad_players)}')
 
-    # Load range estimator checkpoint (will be sent to workers)
-    range_ckpt = None
-    if args.range_estimator:
-        re_path = Path(args.range_estimator)
-        if not re_path.exists():
-            print(f'ERROR: Range estimator not found: {re_path}')
-            sys.exit(1)
-        range_ckpt = torch.load(str(re_path), map_location='cpu')
-        print(f'Range estimator: {re_path.name} '
-              f'(epoch {range_ckpt.get("epoch", "?")}, '
-              f'val_acc={range_ckpt.get("val_acc", 0):.1%}, '
-              f'output_dim={range_ckpt.get("output_dim", NUM_HAND_CATEGORIES)})')
-        print(f'  Observations will be {38 + range_ckpt.get("output_dim", NUM_HAND_CATEGORIES)}-dim')
+    use_bh = bool(args.behavioral_stats)
+    if use_bh:
+        print(f'Behavioral stats: ENABLED (+{BEHAVIORAL_STATS_DIM} dims)')
 
     # Find HH files
     hh_path = Path(args.hh_dir)
@@ -392,7 +331,7 @@ def main():
     with mp.Pool(
         processes=workers,
         initializer=_worker_init,
-        initargs=(args.num_players, good_players, bad_players, range_ckpt),
+        initargs=(args.num_players, good_players, bad_players, use_bh),
     ) as pool:
         for good_spots, bad_cands, n_hands, n_used in pool.imap_unordered(
             _worker, filtered_files, chunksize=32
@@ -424,7 +363,7 @@ def main():
     print(f'  STEP 2: VALIDATING FOLD CANDIDATES VIA SPOT DB')
     print(f'{"="*70}')
 
-    from scipy.spatial import KDTree
+    from scipy.spatial import cKDTree as KDTree
 
     print(f'  Loading spot DB from {args.spot_db}...')
     db_data = np.load(args.spot_db)
@@ -463,8 +402,9 @@ def main():
         idx_map = tree_indices[s_idx]
         query_k = min(args.spot_k, len(idx_map))
 
-        # Build observation matrix for batch query
-        obs_matrix = np.array([c[0] for c in street_cands], dtype=np.float32)
+        # Build observation matrix for batch query (use only base obs dims to match spot DB)
+        db_dim = db_obs.shape[1]
+        obs_matrix = np.array([c[0][:db_dim] for c in street_cands], dtype=np.float32)
         total_cands = len(street_cands)
 
         print(f'  Querying {s_name}: {total_cands} candidates, k={query_k}...')
@@ -479,8 +419,8 @@ def main():
             chunk_end = min(chunk_start + chunk_size, total_cands)
             chunk_obs = obs_matrix[chunk_start:chunk_end]
 
-            # KDTree query for this chunk
-            distances_chunk, local_indices_chunk = tree.query(chunk_obs, k=query_k)
+            # KDTree query for this chunk (parallel across all cores)
+            distances_chunk, local_indices_chunk = tree.query(chunk_obs, k=query_k, workers=-1)
 
             for j in range(len(chunk_obs)):
                 cand = street_cands[chunk_start + j]
@@ -491,7 +431,7 @@ def main():
                 lose_pct = (nn_net_bb < 0).mean() * 100
 
                 if lose_pct >= args.min_lose_pct:
-                    obs, action, net_bb, street, legal_mask, hand_id = cand
+                    obs, action, net_bb, street, legal_mask, hand_id = cand[0], cand[1], cand[2], cand[3], cand[4], cand[5]
                     # Filter by made hand strength — don't create fold labels for strong hands
                     made_hand = float(obs[19]) if len(obs) > 19 else 0.0
                     if made_hand > args.max_made_hand:
@@ -586,7 +526,8 @@ def main():
     legal_masks = np.zeros((total_n, action_size), dtype=np.float32)
 
     # Fill good player spots
-    for i, (obs, action, net_bb, street, legal_mask, hand_id) in enumerate(all_good):
+    for i, spot in enumerate(all_good):
+        obs, action, net_bb, street, legal_mask, hand_id = spot[0], spot[1], spot[2], spot[3], spot[4], spot[5]
         observations[i] = obs
         actions[i] = action
         weights[i] = max(float(net_bb), 0.1)  # minimum weight 0.1 for break-even

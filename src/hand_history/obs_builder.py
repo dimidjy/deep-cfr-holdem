@@ -67,6 +67,111 @@ class _PlayerState:
         self.seat = seat
 
 
+# ── Behavioral stats helpers ──────────────────────────────────────────────
+
+# Number of behavioral features appended to observation
+BEHAVIORAL_STATS_DIM = 8
+
+
+def _bh_track_action(action, bh):
+    """Update behavioral tracking state after a non-blind action.
+
+    Tracks ALL players' actions. Hero-specific filtering happens at compute time.
+    """
+    atype = action.action_type
+    is_agg = atype in ('bet', 'raise') or action.is_all_in
+    name = action.player_name
+
+    # Track current street actions (all players)
+    bh['street_actions'].append((name, atype, action.is_all_in))
+
+    # Per-player counters
+    bh['player_total'][name] += 1
+    if is_agg:
+        bh['player_agg'][name] += 1
+    if atype == 'fold':
+        bh['player_fold'][name] += 1
+
+    # Sizing ratio for bets/raises (per-player)
+    if atype in ('bet', 'raise') and action.amount_chips > 0:
+        current_pot = bh['pot_committed'] + sum(bh['street_bets'].values())
+        if current_pot > 0:
+            ratio = action.amount_chips / current_pot
+            bh['sizing_ratios'].append((name, ratio))
+
+    # All-player raise count
+    if atype == 'raise':
+        bh['raise_count'] += 1
+
+    # Update street bet tracking (for pot computation)
+    if atype in ('bet', 'call'):
+        bh['street_bets'][name] += action.amount_chips
+    elif atype == 'raise':
+        already = bh['street_bets'].get(name, 0)
+        delta = action.amount_chips - already
+        if delta > 0:
+            bh['street_bets'][name] = action.amount_chips
+
+
+def _bh_compute(bh, hero_name):
+    """Compute 8-dim behavioral feature vector, excluding hero's own actions.
+
+    Features:
+      0. opp_aggression_ratio  — fraction of opp actions that are aggressive
+      1. opp_fold_ratio        — fraction of opp actions that are folds
+      2. avg_bet_sizing        — mean opp bet/raise size / pot (normalized)
+      3. max_bet_sizing        — largest opp bet/raise size / pot (normalized)
+      4. num_raises_norm       — total raise count / 6
+      5. street_aggression     — fraction of current-street actions that are aggressive
+      6. opp_check_ratio       — fraction of opp current-street actions that are checks
+      7. pot_escalation        — total pot / avg starting stack
+    """
+    feats = np.zeros(BEHAVIORAL_STATS_DIM, dtype=np.float32)
+
+    # Opponent totals (exclude hero)
+    opp_total = sum(c for n, c in bh['player_total'].items() if n != hero_name)
+    opp_agg = sum(c for n, c in bh['player_agg'].items() if n != hero_name)
+    opp_fold = sum(c for n, c in bh['player_fold'].items() if n != hero_name)
+    opp_sizing = [r for n, r in bh['sizing_ratios'] if n != hero_name]
+
+    opp_denom = max(opp_total, 1)
+
+    # 0: opp aggression ratio
+    feats[0] = opp_agg / opp_denom
+
+    # 1: opp fold ratio
+    feats[1] = opp_fold / opp_denom
+
+    # 2: avg bet sizing (normalized: /3 so 3x pot → 1.0)
+    if opp_sizing:
+        feats[2] = min(sum(opp_sizing) / len(opp_sizing) / 3.0, 1.0)
+
+    # 3: max bet sizing
+    if opp_sizing:
+        feats[3] = min(max(opp_sizing) / 3.0, 1.0)
+
+    # 4: num raises normalized (/6)
+    feats[4] = min(bh['raise_count'] / 6.0, 1.0)
+
+    # 5: current street aggression (all players)
+    sa = bh['street_actions']
+    if sa:
+        agg_count = sum(1 for _, a, ai in sa if a in ('bet', 'raise') or ai)
+        feats[5] = agg_count / len(sa)
+
+    # 6: opp check ratio on current street
+    opp_street = [(n, a) for n, a, _ in sa if n != hero_name]
+    if opp_street:
+        check_count = sum(1 for _, a in opp_street if a == 'check')
+        feats[6] = check_count / len(opp_street)
+
+    # 7: pot escalation (total pot / avg starting stack)
+    total_pot = bh['pot_committed'] + sum(bh['street_bets'].values())
+    feats[7] = min(total_pot / bh['avg_stack'], 1.0)
+
+    return feats
+
+
 class ObservationBuilder:
     """Build observation vectors from parsed hand histories.
 
@@ -81,7 +186,8 @@ class ObservationBuilder:
     def build_decision_points(self, hand: ParsedHand,
                               allow_unknown_cards: bool = False,
                               source_file: str = '',
-                              track_action_history: bool = False) -> List[DecisionPoint]:
+                              track_action_history: bool = False,
+                              behavioral_stats: bool = False) -> List[DecisionPoint]:
         """Replay a hand and build DecisionPoint at each non-blind decision.
 
         Args:
@@ -116,17 +222,31 @@ class ObservationBuilder:
         decision_points: List[DecisionPoint] = []
         player_action_count = defaultdict(int)  # name -> count of non-blind actions
 
-        # Action history tracking for range estimator
+        # Behavioral stats tracking (replaces range estimator)
+        bh = None
+        if behavioral_stats:
+            avg_stack = max(1, sum(p.stake + p.bet_chips for p in players) / len(players))
+            bh = {
+                'pot_committed': 0,
+                'street_bets': defaultdict(int),
+                'player_total': defaultdict(int),
+                'player_agg': defaultdict(int),
+                'player_fold': defaultdict(int),
+                'sizing_ratios': [],     # (player_name, ratio) tuples
+                'raise_count': 0,
+                'street_actions': [],    # (name, action_type, is_all_in)
+                'avg_stack': avg_stack,
+            }
+
+        # Legacy action history tracking for range estimator
         encoded_actions = [] if track_action_history else None
         ah_pot_chips = 0
         ah_player_bets = defaultdict(int)
         ah_player_spent = defaultdict(int)
         ah_start_stacks = {}
-        avg_stack = 1
         if track_action_history:
             for p in players:
                 ah_start_stacks[p.name] = p.stake
-            avg_stack = max(1, sum(p.stake for p in players) / len(players))
 
         for action in hand.actions:
             if action.player_name not in name_to_idx:
@@ -144,6 +264,11 @@ class ObservationBuilder:
                 current_street = action.street
                 community_cards = cc.get(current_street, [])
 
+                if bh is not None:
+                    bh['pot_committed'] += sum(bh['street_bets'].values())
+                    bh['street_bets'].clear()
+                    bh['street_actions'] = []
+
                 if track_action_history:
                     ah_pot_chips += sum(ah_player_bets.values())
                     ah_player_bets.clear()
@@ -151,14 +276,18 @@ class ObservationBuilder:
             # Skip blind actions (not decisions)
             if action.is_blind:
                 self._apply_blind(player, action)
+                if bh is not None:
+                    bh['street_bets'][action.player_name] += action.amount_chips
                 if track_action_history:
                     ah_player_bets[action.player_name] += action.amount_chips
                     ah_player_spent[action.player_name] += action.amount_chips
                 continue
 
             # Skip actions from folded/all-in players (no DP created)
-            # But still encode action for history — folds/all-ins are informative
+            # But still track for behavioral stats and action history
             if not player.active or player.stake == 0:
+                if bh is not None:
+                    _bh_track_action(action, bh)
                 if track_action_history:
                     self._encode_ah_action(
                         action, pidx, button_idx, current_street,
@@ -203,6 +332,11 @@ class ObservationBuilder:
                 # Pot in dollars (chips / 40.0 for NL5)
                 pot_dollars = pot / 40.0
 
+                # Append behavioral stats to observation
+                if bh is not None:
+                    bh_features = _bh_compute(bh, player.name)
+                    obs = np.concatenate([obs, bh_features])
+
                 dp_kwargs = dict(
                     player_name=player.name,
                     observation=obs,
@@ -223,6 +357,10 @@ class ObservationBuilder:
 
                 decision_points.append(DecisionPoint(**dp_kwargs))
                 player_action_count[player.name] += 1
+
+            # ── Track behavioral stats (after DP, before state update) ──
+            if bh is not None:
+                _bh_track_action(action, bh)
 
             # ── Encode action for history (after creating DP, before applying) ──
             if track_action_history:

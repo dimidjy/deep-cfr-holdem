@@ -169,12 +169,12 @@ python3 scripts/train_supervised.py \
   --bad-players data/bad_players.txt \
   --spot-db data/spot_db_6p.npz \
   --counterfactual-folds \
-  --range-estimator models/range_estimator.pt \
+  --behavioral-stats \
   --hidden-layers 512,512,256 \
   --epochs 100 \
   --lr 0.0003 \
   --workers 47 \
   --device cuda \
-  --output models/supervised_6p_range.pt \
+  --output models/supervised_6p_bh.pt \
   --no-cache
 

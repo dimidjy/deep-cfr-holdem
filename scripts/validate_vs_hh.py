@@ -32,7 +32,7 @@ from src.training import DeepCFR
 from src.training.deep_cfr import StrategyNetwork
 from src.utils import load_config
 from src.blended_model import BlendedModel
-from src.hand_history import parse_directory, ObservationBuilder, DecisionPoint
+from src.hand_history import parse_directory, ObservationBuilder, DecisionPoint, BEHAVIORAL_STATS_DIM
 from src.search import PlaytimeStrategy
 from src.preflop_ranges import PreflopRanges
 
@@ -287,13 +287,29 @@ def _load_model(model_path: Path, config: dict, num_players: int,
 
 def analyze_decision_points(deep_cfr, decision_points: list,
                             strategy_fn, num_players: int,
-                            preflop_ranges=None, strong_hand_guard=False):
+                            preflop_ranges=None, strong_hand_guard=False,
+                            good_players=None, bad_players=None):
     """Analyze model strategy at each decision point from hand histories.
 
     Returns dicts of metrics for reporting.
     """
+    good_players = good_players or set()
+    bad_players = bad_players or set()
+
     # Per-street action agreement
     agreement = defaultdict(lambda: {'match': 0, 'total': 0})
+    # Split by player quality: 'good', 'bad', 'unknown'
+    agreement_by_quality = {
+        'good': defaultdict(lambda: {'match': 0, 'total': 0}),
+        'bad': defaultdict(lambda: {'match': 0, 'total': 0}),
+        'unknown': defaultdict(lambda: {'match': 0, 'total': 0}),
+    }
+    # Pot-weighted agreement
+    pot_weighted = {'weighted_match': 0.0, 'weighted_total': 0.0}
+    pot_weighted_by_quality = {
+        'good': {'weighted_match': 0.0, 'weighted_total': 0.0},
+        'bad': {'weighted_match': 0.0, 'weighted_total': 0.0},
+    }
     # Model probability assigned to actual action
     p_actual_list = []
     # Spot-based samples: cat -> [(model_strategy, legal_set, ctx)]
@@ -346,9 +362,34 @@ def analyze_decision_points(deep_cfr, decision_points: list,
         model_top = int(np.argmax(model_strategy))
         agreement[street]['total'] += 1
         agreement['overall']['total'] += 1
-        if model_top == actual:
+        matched = (model_top == actual)
+        if matched:
             agreement[street]['match'] += 1
             agreement['overall']['match'] += 1
+
+        # Player quality split
+        pname = dp.player_name
+        if pname in good_players:
+            quality = 'good'
+        elif pname in bad_players:
+            quality = 'bad'
+        else:
+            quality = 'unknown'
+        agreement_by_quality[quality]['overall']['total'] += 1
+        agreement_by_quality[quality][street]['total'] += 1
+        if matched:
+            agreement_by_quality[quality]['overall']['match'] += 1
+            agreement_by_quality[quality][street]['match'] += 1
+
+        # Pot-weighted agreement (bigger pots matter more)
+        pot_bb = dp.pot_dollars / 0.05 if dp.pot_dollars > 0 else 1.0
+        pot_weighted['weighted_total'] += pot_bb
+        if matched:
+            pot_weighted['weighted_match'] += pot_bb
+        if quality in ('good', 'bad'):
+            pot_weighted_by_quality[quality]['weighted_total'] += pot_bb
+            if matched:
+                pot_weighted_by_quality[quality]['weighted_match'] += pot_bb
 
         # P(actual)
         if actual < len(model_strategy):
@@ -427,6 +468,9 @@ def analyze_decision_points(deep_cfr, decision_points: list,
 
     return {
         'agreement': dict(agreement),
+        'agreement_by_quality': {k: dict(v) for k, v in agreement_by_quality.items()},
+        'pot_weighted': pot_weighted,
+        'pot_weighted_by_quality': pot_weighted_by_quality,
         'p_actual': p_actual_list,
         'model_samples': dict(model_samples),
         'nl5_samples': dict(nl5_samples),
@@ -534,7 +578,8 @@ def compute_nl5_population_stats(all_6p_hands: list, num_players: int = 6):
 
 def compute_showdown_ev(showdown_hands: list, all_decision_points: list,
                         strategy_fn, deep_cfr, num_players: int,
-                        preflop_ranges=None, strong_hand_guard=False):
+                        preflop_ranges=None, strong_hand_guard=False,
+                        good_players=None, bad_players=None):
     """Estimate model's EV advantage vs NL5 players at showdown hands.
 
     For each showdown player with known hole cards:
@@ -545,6 +590,9 @@ def compute_showdown_ev(showdown_hands: list, all_decision_points: list,
 
     Returns dict with EV stats.
     """
+    good_players = good_players or set()
+    bad_players = bad_players or set()
+
     # Group decision points by (hand_id, player_name), preserving order
     dp_by_hand_player = defaultdict(list)
     for dp in all_decision_points:
@@ -557,6 +605,20 @@ def compute_showdown_ev(showdown_hands: list, all_decision_points: list,
     same_play = []         # hands where model plays the same
     model_nets = []
     player_nets = []
+
+    # Calling efficiency: when model continues, does it win?
+    continue_wins = 0      # model continues AND player won
+    continue_losses = 0    # model continues AND player lost
+    # Fold accuracy: when model folds, was the player losing?
+    fold_correct = 0       # model folds AND player lost
+    fold_wrong = 0         # model folds AND player won
+
+    # Split by player quality
+    ev_by_quality = {
+        'good': {'ev_diffs': [], 'model_nets': [], 'player_nets': []},
+        'bad': {'ev_diffs': [], 'model_nets': [], 'player_nets': []},
+        'unknown': {'ev_diffs': [], 'model_nets': [], 'player_nets': []},
+    }
 
     # Per-street fold savings
     street_folds = defaultdict(lambda: {'count': 0, 'saved': 0.0, 'missed': 0.0})
@@ -634,6 +696,17 @@ def compute_showdown_ev(showdown_hands: list, all_decision_points: list,
             model_nets.append(model_net)
             player_nets.append(player_net)
 
+            # Quality split
+            if player_name in good_players:
+                q = 'good'
+            elif player_name in bad_players:
+                q = 'bad'
+            else:
+                q = 'unknown'
+            ev_by_quality[q]['ev_diffs'].append(ev_diff)
+            ev_by_quality[q]['model_nets'].append(model_net)
+            ev_by_quality[q]['player_nets'].append(player_net)
+
             if model_would_fold:
                 if player_net < 0:
                     # Player lost, model folds = avoided loss
@@ -641,14 +714,20 @@ def compute_showdown_ev(showdown_hands: list, all_decision_points: list,
                     avoided_losses.append(saved)
                     street_folds[fold_street]['count'] += 1
                     street_folds[fold_street]['saved'] += saved
+                    fold_correct += 1
                 else:
                     # Player won, model folds = missed gain
                     missed = player_net + invested_at_fold  # total missed
                     missed_gains.append(missed)
                     street_folds[fold_street]['count'] += 1
                     street_folds[fold_street]['missed'] += missed
+                    fold_wrong += 1
             else:
                 same_play.append(player_net)
+                if player_net >= 0:
+                    continue_wins += 1
+                else:
+                    continue_losses += 1
 
     total = len(player_ev_diffs)
     return {
@@ -660,6 +739,11 @@ def compute_showdown_ev(showdown_hands: list, all_decision_points: list,
         'missed_gains': missed_gains,
         'same_play': same_play,
         'street_folds': dict(street_folds),
+        'continue_wins': continue_wins,
+        'continue_losses': continue_losses,
+        'fold_correct': fold_correct,
+        'fold_wrong': fold_wrong,
+        'ev_by_quality': ev_by_quality,
     }
 
 
@@ -757,6 +841,48 @@ def print_report(metrics: dict, parse_stats: dict, deep_cfr, num_dp: int):
             rate = a['match'] / a['total']
             label = key.capitalize() if key != 'overall' else 'Overall'
             print(f"  {label:<12} {rate:>6.1%}   ({a['match']}/{a['total']})")
+
+    # Pot-weighted agreement
+    pw = metrics.get('pot_weighted', {})
+    if pw.get('weighted_total', 0) > 0:
+        pw_rate = pw['weighted_match'] / pw['weighted_total']
+        print(f"  Pot-weighted {pw_rate:>6.1%}   (bigger pots count more)")
+
+    # ── Agreement by player quality ──────────────────────────────────────
+    abq = metrics.get('agreement_by_quality', {})
+    has_quality = any(
+        abq.get(q, {}).get('overall', {}).get('total', 0) > 0
+        for q in ('good', 'bad')
+    )
+    if has_quality:
+        print(f"\n  ── AGREEMENT BY PLAYER QUALITY ──")
+        print(f"  {'Quality':<10} {'Overall':>8}  {'Preflop':>8}  {'Flop':>8}  "
+              f"{'Turn':>8}  {'River':>8}  {'PotWtd':>8}")
+        print('  ' + '-' * 68)
+        pwq = metrics.get('pot_weighted_by_quality', {})
+        for q_name in ['good', 'bad', 'unknown']:
+            qa = abq.get(q_name, {})
+            ov = qa.get('overall', {})
+            if ov.get('total', 0) == 0:
+                continue
+            parts = [f"  {q_name.capitalize():<10}"]
+            for key in ['overall', 'preflop', 'flop', 'turn', 'river']:
+                a = qa.get(key, {})
+                if a.get('total', 0) > 0:
+                    rate = a['match'] / a['total']
+                    parts.append(f"{rate:>7.1%}")
+                else:
+                    parts.append(f"{'—':>8}")
+            # Pot-weighted for this quality
+            pq = pwq.get(q_name, {})
+            if pq.get('weighted_total', 0) > 0:
+                pwr = pq['weighted_match'] / pq['weighted_total']
+                parts.append(f"{pwr:>7.1%}")
+            else:
+                parts.append(f"{'—':>8}")
+            print('  '.join(parts))
+            n = ov['total']
+            print(f"  {'':>10} ({n} decisions)")
 
     # ── Model confidence in actual action ─────────────────────────────────
     p_actual = metrics['p_actual']
@@ -924,6 +1050,47 @@ def print_report(metrics: dict, parse_stats: dict, deep_cfr, num_dp: int):
                           f"   saved: ${s['saved']:>7.2f}"
                           f"   missed: ${s['missed']:>7.2f}"
                           f"   net: ${net:>+.2f}")
+
+        # ── Fold accuracy & calling efficiency ────────────────────────
+        fc = ev_data.get('fold_correct', 0)
+        fw = ev_data.get('fold_wrong', 0)
+        cw = ev_data.get('continue_wins', 0)
+        cl = ev_data.get('continue_losses', 0)
+
+        total_folds = fc + fw
+        total_continues = cw + cl
+
+        print(f"\n  ── DECISION QUALITY ──")
+        if total_folds > 0:
+            fold_acc = fc / total_folds
+            print(f"  Fold accuracy:      {fold_acc:>6.1%}   "
+                  f"({fc}/{total_folds} — model folds where player actually lost)")
+        if total_continues > 0:
+            call_eff = cw / total_continues
+            print(f"  Calling efficiency: {call_eff:>6.1%}   "
+                  f"({cw}/{total_continues} — model continues and player won)")
+
+        # ── EV by player quality ──────────────────────────────────────
+        evq = ev_data.get('ev_by_quality', {})
+        has_evq = any(len(evq.get(q, {}).get('ev_diffs', [])) > 0
+                      for q in ('good', 'bad'))
+        if has_evq:
+            print(f"\n  ── EV BY PLAYER QUALITY ──")
+            print(f"  {'Quality':<10} {'N':>6}  {'Player$':>10}  {'Model$':>10}  "
+                  f"{'EV diff':>10}  {'BB/hand':>8}")
+            print('  ' + '-' * 60)
+            for q_name in ['good', 'bad', 'unknown']:
+                qd = evq.get(q_name, {})
+                diffs = qd.get('ev_diffs', [])
+                if not diffs:
+                    continue
+                n = len(diffs)
+                p_total = sum(qd['player_nets'])
+                m_total = sum(qd['model_nets'])
+                ev_d = sum(diffs)
+                bb_h = (ev_d / n / 0.05)
+                print(f"  {q_name.capitalize():<10} {n:>6}  ${p_total:>+9.2f}  "
+                      f"${m_total:>+9.2f}  ${ev_d:>+9.2f}  {bb_h:>+7.2f}")
 
         # Per-hand EV
         ev_per_hand = ev_diff_total / total_sp
@@ -1097,6 +1264,12 @@ def main():
                         help='Cap fold probability for strong made hands (two pair+)')
     parser.add_argument('--game-players', type=int, default=0,
                         help='Override game player count (e.g. use 6p model on 4p hands)')
+    parser.add_argument('--behavioral-stats', action='store_true',
+                        help='Append behavioral stats to observations (for models trained with them)')
+    parser.add_argument('--good-players', type=str, default='',
+                        help='Path to good players list (for split metrics)')
+    parser.add_argument('--bad-players', type=str, default='',
+                        help='Path to bad players list (for split metrics)')
     args = parser.parse_args()
 
     model_path = Path(args.model)
@@ -1167,6 +1340,28 @@ def main():
             net.eval()
         print(f'Loaded model: {model_path.name}  (iteration {deep_cfr.iteration})')
 
+    use_bh = args.behavioral_stats
+    if use_bh:
+        print(f'Behavioral stats: ENABLED (+{BEHAVIORAL_STATS_DIM} dims)')
+
+    # Load player quality lists
+    good_players = set()
+    bad_players = set()
+    if args.good_players and Path(args.good_players).exists():
+        with open(args.good_players) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    good_players.add(line)
+        print(f'Good players loaded: {len(good_players)}')
+    if args.bad_players and Path(args.bad_players).exists():
+        with open(args.bad_players) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    bad_players.add(line)
+        print(f'Bad players loaded: {len(bad_players)}')
+
     # Parse hand histories (incremental with early stopping)
     print(f'\nParsing hand histories from {hh_dir} (recursive)...')
     all_6p, showdown, total_hands, file_count = _parse_incremental(
@@ -1192,7 +1387,7 @@ def main():
     hands_with_dp = 0
 
     for i, hand in enumerate(showdown):
-        dps = builder.build_decision_points(hand)
+        dps = builder.build_decision_points(hand, behavioral_stats=use_bh)
         if dps:
             all_decision_points.extend(dps)
             hands_with_dp += 1
@@ -1230,7 +1425,9 @@ def main():
     metrics = analyze_decision_points(
         deep_cfr, all_decision_points, sfn, num_players,
         preflop_ranges=pf_ranges,
-        strong_hand_guard=args.strong_hand_guard)
+        strong_hand_guard=args.strong_hand_guard,
+        good_players=good_players,
+        bad_players=bad_players)
 
     # Override NL5 position stats with population-level data
     metrics['nl5_pos'] = nl5_pop_pos
@@ -1240,7 +1437,9 @@ def main():
     ev_data = compute_showdown_ev(
         showdown, all_decision_points, sfn, deep_cfr, num_players,
         preflop_ranges=pf_ranges,
-        strong_hand_guard=args.strong_hand_guard)
+        strong_hand_guard=args.strong_hand_guard,
+        good_players=good_players,
+        bad_players=bad_players)
     metrics['showdown_ev'] = ev_data
 
     parse_stats = {

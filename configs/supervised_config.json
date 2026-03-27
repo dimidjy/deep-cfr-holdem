@@ -11,10 +11,10 @@
   },
   "build_training_data": {
     "spot_k": 100,
-    "fold_ratio": 0.15,
-    "min_lose_pct": 60,
-    "max_made_hand": 0.25,
-    "range_estimator": "models/range_estimator.pt",
+    "fold_ratio": 0.08,
+    "min_lose_pct": 70,
+    "max_made_hand": 0.125,
+    "behavioral_stats": true,
     "output": "data/training_data_6p.npz"
   },
   "train": {
