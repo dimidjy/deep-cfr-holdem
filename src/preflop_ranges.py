@@ -151,10 +151,8 @@ class PreflopRanges:
                 strategy[a] = 1.0 / len(legal_actions)
             return strategy
 
-        # 95% on chosen action, 5% uniform over rest
-        for a in legal_actions:
-            strategy[a] = 0.05 / len(legal_actions)
-        strategy[action] = 0.95 + 0.05 / len(legal_actions)
+        # Deterministic: 100% on chosen action
+        strategy[action] = 1.0
 
         # Normalize
         s = strategy.sum()
@@ -163,8 +161,8 @@ class PreflopRanges:
         return strategy
 
     def _best_raise(self, legal_actions: List[int]) -> int:
-        """Pick best available raise action."""
-        for a in [RAISE_POT, RAISE_HALF, ALL_IN]:
+        """Pick best available raise action (never all-in unless in allin range)."""
+        for a in [RAISE_POT, RAISE_HALF]:
             if a in legal_actions:
                 return a
         if CALL in legal_actions:

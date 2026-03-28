@@ -727,9 +727,9 @@ _ACTION_SIMILARITY = torch.tensor([
     # fold   call   r_half r_pot  all_in
     [1.00,  0.00,  0.00,  0.00,  0.00],  # fold — unique, no bleed
     [0.00,  1.00,  0.15,  0.05,  0.00],  # call — some bleed to small raise
-    [0.00,  0.15,  1.00,  0.20,  0.05],  # raise_half — bleed to call/raise_pot
-    [0.00,  0.05,  0.20,  1.00,  0.15],  # raise_pot — bleed to raise_half/allin
-    [0.00,  0.00,  0.05,  0.15,  1.00],  # all_in — bleed to raise_pot
+    [0.00,  0.15,  1.00,  0.20,  0.00],  # raise_half — bleed to call/raise_pot, NOT all-in
+    [0.00,  0.05,  0.20,  1.00,  0.05],  # raise_pot — bleed to raise_half, minimal all-in
+    [0.00,  0.00,  0.00,  0.10,  1.00],  # all_in — minimal bleed to raise_pot only
 ], dtype=torch.float32)
 
 # Normalize each row to sum to 1

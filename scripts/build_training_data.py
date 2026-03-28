@@ -39,12 +39,34 @@ from src.hand_history import ObservationBuilder, BEHAVIORAL_STATS_DIM
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 FOLD = 0
+ALL_IN = 4
 ACTION_NAMES = {0: 'fold', 1: 'call', 2: 'raise_half', 3: 'raise_pot', 4: 'all_in'}
 STREET_MAP = {'preflop': 0, 'flop': 1, 'turn': 2, 'river': 3}
 MADE_HAND_NAMES = {
     0.0: 'high_card', 0.125: 'pair', 0.25: 'two_pair', 0.375: 'trips/set',
     0.5: 'straight', 0.625: 'flush', 0.75: 'full_house', 0.875: 'quads', 1.0: 'str_flush',
 }
+
+# All-in quality filter: minimum made hand category for postflop all-in labels.
+# 0.25 = two pair.  Also allow strong draws (flush/straight draw features).
+# Obs layout: made_hand_cat at idx 19, has_flush_draw idx 20, has_straight_draw idx 21
+_MADE_HAND_IDX = 19
+_FLUSH_DRAW_IDX = 20
+_STRAIGHT_DRAW_IDX = 21
+
+
+def _is_quality_allin(obs, min_allin_hand=0.25):
+    """Check if all-in is justified by hand strength or strong draws."""
+    if len(obs) <= _STRAIGHT_DRAW_IDX:
+        return True  # can't check, allow it
+    made_hand = float(obs[_MADE_HAND_IDX])
+    if made_hand >= min_allin_hand - 0.01:  # two pair or better
+        return True
+    has_flush_draw = float(obs[_FLUSH_DRAW_IDX]) > 0.5
+    has_straight_draw = float(obs[_STRAIGHT_DRAW_IDX]) > 0.5
+    if has_flush_draw or has_straight_draw:
+        return True  # semi-bluff shove is valid
+    return False
 
 
 # ── File pre-filter ───────────────────────────────────────────────────────────
@@ -65,8 +87,10 @@ def _prefilter_files(hh_files, players, hh_dir):
     pattern = '|'.join(re.escape(p) for p in players)
 
     try:
+        # Use -f - to pass pattern via stdin (avoids "Argument list too long")
         result = subprocess.run(
-            [rg_path, '-l', '--no-messages', '-e', pattern, str(hh_dir)],
+            [rg_path, '-l', '--no-messages', '-f', '-', str(hh_dir)],
+            input='\n'.join(re.escape(p) for p in players),
             capture_output=True, text=True, timeout=1200
         )
         matched = set(result.stdout.strip().split('\n')) if result.stdout.strip() else set()
@@ -84,16 +108,18 @@ def _prefilter_files(hh_files, players, hh_dir):
 _CFG = {}
 
 
-def _worker_init(num_players, good_players, bad_players, use_behavioral_stats=False):
+def _worker_init(num_players, good_players, bad_players, use_behavioral_stats=False,
+                 min_allin_hand=0.25):
     _CFG['num_players'] = num_players
     _CFG['good_players'] = good_players
     _CFG['bad_players'] = bad_players
     _CFG['builder'] = ObservationBuilder(num_players=num_players)
     _CFG['behavioral_stats'] = use_behavioral_stats
+    _CFG['min_allin_hand'] = min_allin_hand
 
 
 def _worker(file_path):
-    """Parse one HH file. Returns (good_spots, bad_candidates)."""
+    """Parse one HH file. Returns (good_spots, bad_candidates, hands, used, allin_filtered)."""
     num_players = _CFG['num_players']
     good_players = _CFG['good_players']
     bad_players = _CFG['bad_players']
@@ -102,11 +128,12 @@ def _worker(file_path):
 
     good_spots = []   # (obs, action, net_bb, street_idx, legal_mask, hand_id)
     bad_cands = []     # same
+    allin_filtered = 0
 
     try:
         hands = parse_file(str(file_path))
     except Exception:
-        return good_spots, bad_cands, 0, 0
+        return good_spots, bad_cands, 0, 0, 0
 
     file_hands = 0
     file_used = 0
@@ -208,12 +235,22 @@ def _worker(file_path):
                 np.uint32(hand_id),
             )
 
-            # Good player winning spots
-            if good_players and dp.player_name in (known_players & good_players):
+            # Good player winning spots + good player folds facing big bets
+            is_good = (good_players and dp.player_name in (known_players & good_players))
+            if not good_players and dp.player_name in known_players:
+                is_good = True
+
+            if is_good:
                 if net_bb >= 0:
+                    # Filter junk all-ins: only keep all-in with strong hands/draws
+                    if dp.actual_action == ALL_IN and not _is_quality_allin(
+                            obs, _CFG['min_allin_hand']):
+                        allin_filtered += 1
+                        continue
                     good_spots.append(spot)
-            elif not good_players and dp.player_name in known_players:
-                if net_bb >= 0:
+                elif dp.actual_action == FOLD:
+                    # Good player folds are valuable training signal —
+                    # especially facing big bets (teaches model when to fold)
                     good_spots.append(spot)
 
             # Bad player losing spots (candidates for fold labels)
@@ -222,7 +259,7 @@ def _worker(file_path):
                     if FOLD in dp.legal_actions:
                         bad_cands.append(spot)
 
-    return good_spots, bad_cands, file_hands, file_used
+    return good_spots, bad_cands, file_hands, file_used, allin_filtered
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -249,6 +286,7 @@ def _load_config(config_path):
     args.min_lose_pct = btd.get('min_lose_pct', 60.0)
     args.max_made_hand = btd.get('max_made_hand', 0.25)
     args.spot_k = btd.get('spot_k', 100)
+    args.min_allin_hand = btd.get('min_allin_hand', 0.25)
     args.behavioral_stats = btd.get('behavioral_stats', False)
     args.output = btd.get('output', 'data/training_data.npz')
     return args
@@ -271,6 +309,8 @@ def main():
     parser.add_argument('--min-lose-pct', type=float, default=None)
     parser.add_argument('--max-made-hand', type=float, default=None)
     parser.add_argument('--spot-k', type=int, default=None)
+    parser.add_argument('--min-allin-hand', type=float, default=None,
+                        help='Min made_hand_cat for all-in labels (0.25=two_pair, default from config)')
     parser.add_argument('--workers', type=int, default=None)
     parser.add_argument('--behavioral-stats', action='store_true', default=None,
                         help='Append 8-dim behavioral stats to observations')
@@ -280,8 +320,8 @@ def main():
     # Load config, then override with any CLI args
     args = _load_config(cli_args.config)
     for key in ['hh_dir', 'good_players', 'bad_players', 'spot_db', 'num_players',
-                'fold_ratio', 'min_lose_pct', 'max_made_hand', 'spot_k', 'workers',
-                'behavioral_stats', 'output']:
+                'fold_ratio', 'min_lose_pct', 'max_made_hand', 'spot_k', 'min_allin_hand',
+                'workers', 'behavioral_stats', 'output']:
         cli_val = getattr(cli_args, key, None)
         if cli_val is not None:
             setattr(args, key, cli_val)
@@ -325,21 +365,26 @@ def main():
     all_bad_cands = []
     total_hands = 0
     total_used = 0
+    total_allin_filtered = 0
     done = 0
     t0 = time.time()
+
+    print(f'  All-in filter: min_hand >= {args.min_allin_hand} '
+          f'({MADE_HAND_NAMES.get(args.min_allin_hand, "?")}), or has draw')
 
     with mp.Pool(
         processes=workers,
         initializer=_worker_init,
-        initargs=(args.num_players, good_players, bad_players, use_bh),
+        initargs=(args.num_players, good_players, bad_players, use_bh, args.min_allin_hand),
     ) as pool:
-        for good_spots, bad_cands, n_hands, n_used in pool.imap_unordered(
+        for good_spots, bad_cands, n_hands, n_used, n_allin_filt in pool.imap_unordered(
             _worker, filtered_files, chunksize=32
         ):
             all_good.extend(good_spots)
             all_bad_cands.extend(bad_cands)
             total_hands += n_hands
             total_used += n_used
+            total_allin_filtered += n_allin_filt
             done += 1
 
             if done % 2000 == 0:
@@ -352,6 +397,7 @@ def main():
     print(f'  Total hands: {total_hands}, used: {total_used}')
     print(f'  Good player spots: {len(all_good)}')
     print(f'  Bad player fold candidates: {len(all_bad_cands)}')
+    print(f'  All-in filtered (weak hand): {total_allin_filtered}')
 
     if not all_good:
         print('ERROR: No good player spots found!')

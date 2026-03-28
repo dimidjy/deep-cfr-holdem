@@ -9,11 +9,150 @@ from src.gui import PokerGUI
 from src.training import DeepCFR, ModelAdapter
 from src.training.deep_cfr import StrategyNetwork
 from src.engine import FastEnhancedPokerEngine
-from src.search import DepthLimitedSearch, PlaytimeStrategy
+from src.search import DepthLimitedSearch, PlaytimeStrategy, MCRolloutSearch
 from src.preflop_ranges import PreflopRanges
 from src.blended_model import BlendedModel
+from src.hand_history.obs_builder import BEHAVIORAL_STATS_DIM, _bh_compute
 import numpy as np
 import torch
+from collections import defaultdict
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Live behavioral stats tracker (mirrors obs_builder._bh_track_action)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Action ID to action type name
+_ACTION_TYPE = {0: 'fold', 1: 'call', 2: 'raise', 3: 'raise', 4: 'all_in'}
+
+
+class LiveBehavioralTracker:
+    """Track actions during play and compute behavioral stats."""
+
+    def __init__(self, num_players, engine):
+        self.num_players = num_players
+        self.engine = engine
+        self.reset()
+
+    def reset(self):
+        """Reset for a new hand."""
+        avg_stack = 100  # default 100bb stacks
+        try:
+            total = sum(
+                self.engine.get_player_chips(a)
+                for a in self.engine.agents
+            )
+            avg_stack = max(1, total / self.num_players)
+        except Exception:
+            pass
+
+        self.bh = {
+            'pot_committed': 0,
+            'street_bets': defaultdict(int),
+            'player_total': defaultdict(int),
+            'player_agg': defaultdict(int),
+            'player_fold': defaultdict(int),
+            'sizing_ratios': [],
+            'raise_count': 0,
+            'street_actions': [],
+            'avg_stack': avg_stack,
+        }
+        self._last_stage = None
+
+    def track_action(self, agent_name, action_id):
+        """Track an action taken during play."""
+        # Detect street change
+        try:
+            stage = self.engine.get_stage()
+            if self._last_stage is not None and stage != self._last_stage:
+                # Street changed — commit bets to pot
+                self.bh['pot_committed'] += sum(self.bh['street_bets'].values())
+                self.bh['street_bets'].clear()
+                self.bh['street_actions'].clear()
+            self._last_stage = stage
+        except Exception:
+            pass
+
+        atype = _ACTION_TYPE.get(action_id, 'check')
+        # Check vs call: action 1 could be check if no bet to face
+        if action_id == 1:
+            try:
+                pid = self.engine.agents.index(agent_name)
+                ps = self.engine._state.players_state[pid]
+                max_bet = max(p.bet_chips for p in self.engine._state.players_state)
+                if ps.bet_chips >= max_bet:
+                    atype = 'check'
+                else:
+                    atype = 'call'
+            except Exception:
+                atype = 'call'
+
+        is_all_in = (action_id == 4)
+        is_agg = atype in ('bet', 'raise') or is_all_in
+        name = agent_name
+
+        # Track current street actions
+        self.bh['street_actions'].append((name, atype, is_all_in))
+
+        # Per-player counters
+        self.bh['player_total'][name] += 1
+        if is_agg:
+            self.bh['player_agg'][name] += 1
+        if atype == 'fold':
+            self.bh['player_fold'][name] += 1
+
+        # Sizing ratio for raises
+        if atype == 'raise' and action_id in (2, 3, 4):
+            try:
+                pot = self.engine.get_pot_size()
+                if pot > 0:
+                    # Estimate raise amount from action type
+                    if action_id == 2:
+                        ratio = 0.5  # half pot
+                    elif action_id == 3:
+                        ratio = 1.0  # pot
+                    else:
+                        # All-in: estimate from stack/pot
+                        pid = self.engine.agents.index(name)
+                        stake = self.engine._state.players_state[pid].stake
+                        ratio = stake / max(pot, 1)
+                    self.bh['sizing_ratios'].append((name, ratio))
+            except Exception:
+                pass
+
+        # Raise count
+        if atype == 'raise':
+            self.bh['raise_count'] += 1
+
+        # Bet tracking (approximate using pot changes)
+        if atype == 'call':
+            try:
+                pid = self.engine.agents.index(name)
+                ps = self.engine._state.players_state[pid]
+                max_bet = max(p.bet_chips for p in self.engine._state.players_state)
+                call_amt = max_bet - ps.bet_chips
+                self.bh['street_bets'][name] += max(call_amt, 0)
+            except Exception:
+                pass
+        elif atype == 'raise':
+            try:
+                pid = self.engine.agents.index(name)
+                ps = self.engine._state.players_state[pid]
+                pot = self.engine.get_pot_size()
+                if action_id == 2:
+                    amt = int(pot / 2)
+                elif action_id == 3:
+                    amt = pot
+                else:
+                    amt = ps.stake
+                self.bh['street_bets'][name] = max(
+                    self.bh['street_bets'].get(name, 0), amt)
+            except Exception:
+                pass
+
+    def compute(self, hero_name):
+        """Compute 8-dim behavioral stats for the given hero."""
+        return _bh_compute(self.bh, hero_name)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -249,6 +388,16 @@ def main():
     parser.add_argument('--blend', type=str, default=None, help='Deep CFR model for fold decisions (blended mode: fold from CFR, call/raise from --model)')
     parser.add_argument('--fold-blend', type=float, default=1.0, help='Fold blend factor 0.0-1.0 (default: 1.0)')
     parser.add_argument('--strong-hand-guard', action='store_true', help='Cap fold probability for strong made hands (two pair+)')
+    parser.add_argument('--behavioral-stats', action='store_true',
+                        help='Enable behavioral stats (for models trained with 49-dim obs)')
+    parser.add_argument('--mc-search', action='store_true',
+                        help='Enable Monte Carlo rollout search (works with any model)')
+    parser.add_argument('--mc-rollouts', type=int, default=50,
+                        help='Rollouts per action for MC search (default: 50)')
+    parser.add_argument('--mc-blend', type=float, default=0.3,
+                        help='MC search blend: 0=pure network, 1=pure rollout (default: 0.3)')
+    parser.add_argument('--mc-temperature', type=float, default=1.0,
+                        help='MC search temperature on normalized EVs: lower=greedier (default: 1.0)')
 
     args = parser.parse_args()
     
@@ -295,16 +444,26 @@ def main():
             print("    python3 scripts/play_gui_vs_model.py --model", args.model)
             return
 
-    # Set up depth-limited search if requested
+    # Set up search if requested
     search = None
-    if args.search:
+    if args.mc_search:
+        search = MCRolloutSearch(
+            deep_cfr,
+            num_rollouts=args.mc_rollouts,
+            blend=args.mc_blend,
+            temperature=args.mc_temperature,
+            obs_pad=BEHAVIORAL_STATS_DIM if args.behavioral_stats else 0,
+        )
+        print(f"\n  MC rollout search enabled: rollouts={args.mc_rollouts}, "
+              f"blend={args.mc_blend}, temperature={args.mc_temperature}")
+    elif args.search:
         search = DepthLimitedSearch(
             deep_cfr,
             num_rollouts=args.search_rollouts,
             cfr_iters=args.search_iters,
             max_depth=args.search_depth,
         )
-        print(f"\n  Search enabled: depth={args.search_depth}, "
+        print(f"\n  CFR search enabled: depth={args.search_depth}, "
               f"iters={args.search_iters}, rollouts={args.search_rollouts}")
 
     # Set up play-time strategy refinement (on by default)
@@ -323,7 +482,10 @@ def main():
     print("\n" + "="*60)
     print(f"Starting GUI - You vs {trained_players - 1} AI opponents ({trained_players}-player game)")
     if search:
-        print("  (Depth-limited search ON — AI will think longer but play stronger)")
+        if args.mc_search:
+            print("  (MC rollout search ON — AI will think longer but play stronger)")
+        else:
+            print("  (Depth-limited CFR search ON — AI will think longer but play stronger)")
     print("="*60)
     print("Controls:")
     print("  - Click buttons to take actions")
@@ -345,6 +507,51 @@ def main():
                    preflop_ranges=preflop_ranges,
                    strategy_post_hook=post_hook)
     gui.engine = engine
+
+    # Behavioral stats: wrap process_action to track actions and augment observations
+    if args.behavioral_stats:
+        print(f"  Behavioral stats: ON (+{BEHAVIORAL_STATS_DIM} dims)")
+        bh_tracker = LiveBehavioralTracker(trained_players, engine)
+
+        # Monkey-patch the GUI to inject behavioral stats
+        _orig_reset = gui.reset_game
+        _orig_process = gui.process_action
+
+        def _patched_reset():
+            _orig_reset()
+            bh_tracker.engine = gui.engine
+            bh_tracker.reset()
+
+        def _patched_process():
+            # Wrap get_observation to append behavioral stats
+            _orig_get_obs = gui.engine.get_observation
+
+            def _augmented_obs():
+                obs = _orig_get_obs()
+                if gui.state and gui.state.get('current_player'):
+                    hero = gui.state['current_player']
+                else:
+                    hero = gui.human_player
+                bh_feats = bh_tracker.compute(hero)
+                return np.concatenate([obs, bh_feats])
+
+            # Wrap step to track all actions (human + AI)
+            _orig_step = gui.engine.step
+
+            def _tracked_step(action):
+                if gui.state and gui.state.get('current_player'):
+                    bh_tracker.track_action(gui.state['current_player'], action)
+                return _orig_step(action)
+
+            gui.engine.get_observation = _augmented_obs
+            gui.engine.step = _tracked_step
+            _orig_process()
+            gui.engine.step = _orig_step
+            gui.engine.get_observation = _orig_get_obs
+
+        gui.reset_game = _patched_reset
+        gui.process_action = _patched_process
+
     gui.engine.reset()
     gui.run()
 

@@ -43,6 +43,8 @@ _RANK_MAP = {
 
 _POS_LABELS = {0: 'BTN', 1: 'SB', 2: 'BB', 3: 'UTG', 4: 'MP', 5: 'CO'}
 
+BEHAVIORAL_STATS_DIM = 8
+
 # Maps (num_players, rel_pos) → 6p rel_pos for observation padding
 _POS_MAP_TO_6P = {
     6: {0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5},  # identity
@@ -65,9 +67,11 @@ class ObservationBuilder:
     for all table sizes (2-6 players).
     """
 
-    def __init__(self, num_players: int = 6, pad_to_6p: bool = False):
+    def __init__(self, num_players: int = 6, pad_to_6p: bool = False,
+                 behavioral_stats: bool = False):
         self.num_players = num_players
         self.pad_to_6p = pad_to_6p and num_players < 6
+        self.behavioral_stats = behavioral_stats
 
     def build(self, game_state: GameState) -> Optional[np.ndarray]:
         """Build observation vector from GameState. Returns None if hole cards missing."""
@@ -100,6 +104,10 @@ class ObservationBuilder:
         features.append(self._street_features(game_state.street))
         features.append(self._game_state_features(game_state, players, player_idx))
         features.append(self._betting_history_features(game_state, players, player_idx))
+
+        if self.behavioral_stats:
+            features.append(self._behavioral_stats_features(
+                game_state, players, player_idx))
 
         return np.concatenate(features).astype(np.float32)
 
@@ -343,3 +351,75 @@ class ObservationBuilder:
             [my_pot_share, not_raise_fraction, facing_3bet_plus,
              pot_was_raised, min_opp_stack_norm],
             dtype=np.float32)
+
+    def _behavioral_stats_features(self, gs: GameState, players: List[PlayerInfo],
+                                   player_idx: int) -> np.ndarray:
+        """Compute 8-dim behavioral stats from current GameState snapshot.
+
+        Mirrors src/hand_history/obs_builder._bh_compute() features:
+          0. opp_aggression_ratio  — how aggressively opponents are betting
+          1. opp_fold_ratio        — how many opponents have folded
+          2. avg_bet_sizing        — average opponent bet size / pot
+          3. max_bet_sizing        — max opponent bet size / pot
+          4. num_raises_norm       — estimated raise count / 6
+          5. street_aggression     — current street aggression level
+          6. opp_check_ratio       — opponents checking on current street
+          7. pot_escalation        — pot size / avg starting stack
+        """
+        feats = np.zeros(BEHAVIORAL_STATS_DIM, dtype=np.float32)
+
+        num_total = len(gs.players)
+        active = [p for p in players if p.is_active]
+        opps = [p for i, p in enumerate(players) if i != player_idx]
+        active_opps = [p for p in opps if p.is_active]
+        folded_opps = [p for p in opps if not p.is_active]
+
+        if not opps:
+            return feats
+
+        pot = max(gs.pot_total, 1.0)
+
+        # 0: opp_aggression_ratio — opponents who bet/raised (have current bets > BB)
+        opp_with_bets = sum(1 for p in opps if p.bet_current_round > 1.0 or p.is_all_in)
+        opp_actions_est = max(len(opps), 1)
+        feats[0] = opp_with_bets / opp_actions_est
+
+        # 1: opp_fold_ratio — fraction of opponents who folded
+        feats[1] = len(folded_opps) / max(num_total - 1, 1)
+
+        # 2: avg_bet_sizing — average opp bet / pot (normalized by /3)
+        opp_bets = [p.bet_current_round for p in active_opps if p.bet_current_round > 0]
+        if opp_bets:
+            pot_for_sizing = max(pot - sum(opp_bets), 1.0)
+            avg_ratio = sum(b / pot_for_sizing for b in opp_bets) / len(opp_bets)
+            feats[2] = min(avg_ratio / 3.0, 1.0)
+
+        # 3: max_bet_sizing — max opp bet / pot (normalized by /3)
+        if opp_bets:
+            max_bet = max(opp_bets)
+            pot_for_sizing = max(pot - max_bet, 1.0)
+            feats[3] = min((max_bet / pot_for_sizing) / 3.0, 1.0)
+
+        # 4: num_raises_norm — estimate from max bet level / 6
+        max_bet_all = max((p.bet_current_round for p in players), default=0)
+        if max_bet_all > 1.0:
+            est_raises = math.log2(max(max_bet_all, 1))
+            feats[4] = min(est_raises / 6.0, 1.0)
+
+        # 5: street_aggression — are opponents betting on this street?
+        if active_opps:
+            agg_count = sum(1 for p in active_opps
+                           if p.bet_current_round > 0 or p.is_all_in)
+            feats[5] = agg_count / len(active_opps)
+
+        # 6: opp_check_ratio — opponents with zero current bet (checked)
+        if active_opps:
+            check_count = sum(1 for p in active_opps
+                             if p.bet_current_round == 0 and not p.is_all_in)
+            feats[6] = check_count / len(active_opps)
+
+        # 7: pot_escalation — pot / avg starting stack
+        avg_stack = max(sum(p.stack + p.total_invested for p in players) / max(num_total, 1), 1.0)
+        feats[7] = min(pot / avg_stack, 1.0)
+
+        return feats
