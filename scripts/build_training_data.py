@@ -79,12 +79,15 @@ def _prefilter_files(hh_files, players, hh_dir):
     if not players:
         return hh_files
 
+    if len(players) > 5000:
+        print(f'  Pre-filter skipped: {len(players)} players covers most files')
+        return hh_files
+
     rg_path = shutil.which('rg')
     if not rg_path:
         return hh_files
 
     t0 = time.time()
-    pattern = '|'.join(re.escape(p) for p in players)
 
     try:
         # Use -f - to pass pattern via stdin (avoids "Argument list too long")
@@ -528,6 +531,61 @@ def main():
                 avg_reward = np.array([f[2] for f in validated_folds])[mask].mean()
                 print(f'    {name:<12}: {count:>6} ({pct:>5.1f}%)  avg_reward={avg_reward:+.1f} BB')
 
+    # ── STEP 2b: Synthetic fold labels from equity vs pot odds ────────────
+
+    print(f'\n{"="*70}')
+    print(f'  STEP 2b: SYNTHETIC FOLD LABELS (equity < pot odds needed)')
+    print(f'{"="*70}')
+
+    # For good player non-fold spots where equity is clearly below pot odds
+    # and no draw — these are spots where calling was a mistake (got lucky)
+    # Obs indices (6p): pot_odds=10, hand_strength=18, made_hand=19,
+    #   flush_draw=20, str_draw=21
+    synthetic_folds = []
+    for spot in all_good:
+        obs, action, net_bb, street_idx, legal_mask, hand_id = spot
+        if action == FOLD:
+            continue  # already a fold
+        if legal_mask[FOLD] < 0.5:
+            continue  # fold not legal
+        if street_idx == 0:
+            continue  # skip preflop (handled by ranges)
+
+        pot_odds = float(obs[10]) if len(obs) > 10 else 0.0
+        equity = float(obs[18]) if len(obs) > 18 else 0.5
+        made_hand = float(obs[19]) if len(obs) > 19 else 0.0
+        has_flush_draw = float(obs[20]) > 0.5 if len(obs) > 20 else False
+        has_str_draw = float(obs[21]) > 0.5 if len(obs) > 21 else False
+
+        # Need to call: equity must exceed (1 - pot_odds) to be profitable
+        # pot_odds = pot / (pot + call), so we need equity > 1 - pot_odds = call/(pot+call)
+        equity_needed = 1.0 - pot_odds if pot_odds > 0 else 0.5
+
+        # Only create synthetic fold if:
+        # - equity is clearly below what's needed (with margin)
+        # - no draw (flush or straight)
+        # - weak hand (high card or low pair)
+        if (equity < equity_needed - 0.10
+                and not has_flush_draw and not has_str_draw
+                and made_hand < 0.20):  # high card or weak pair
+            synthetic_folds.append((
+                obs,
+                np.int64(FOLD),
+                np.float32(max(abs(float(net_bb)), 1.0)),
+                street_idx,
+                legal_mask,
+                hand_id,
+            ))
+
+    print(f'  Synthetic folds generated: {len(synthetic_folds)}')
+    print(f'  (from good player spots where equity << pot odds needed, no draws)')
+
+    # Add synthetic folds to validated folds
+    validated_folds.extend(synthetic_folds)
+    print(f'  Total fold labels: {len(validated_folds)} '
+          f'(DB-validated: {len(validated_folds) - len(synthetic_folds)}, '
+          f'synthetic: {len(synthetic_folds)})')
+
     # ── STEP 3: Merge with ratio control ─────────────────────────────────
 
     print(f'\n{"="*70}')
@@ -590,13 +648,24 @@ def main():
         streets[idx] = street
         legal_masks[idx] = legal_mask
 
+    # Append equity_vs_odds feature (equity - equity_needed)
+    # Positive = profitable call, negative = should fold
+    # Obs indices (6p): pot_odds=10, hand_strength=18
+    if obs_dim >= 19:
+        pot_odds = observations[:, 10]
+        equity = observations[:, 18]
+        equity_needed = 1.0 - pot_odds
+        equity_vs_odds = np.clip(equity - equity_needed, -1.0, 1.0).reshape(-1, 1)
+        observations = np.hstack([observations, equity_vs_odds.astype(np.float32)])
+        obs_dim = observations.shape[1]
+        print(f'  Added equity_vs_odds feature → obs_dim={obs_dim}')
+
     # Normalize weights to mean=1
     mean_w = weights.mean()
     if mean_w > 0:
         weights /= mean_w
 
-    # Shuffle (but keep hand ordering within groups? actually shuffle is fine
-    # since we're doing mini-batch SGD, ordering doesn't matter)
+    # Shuffle
     rng = np.random.RandomState(42)
     perm = rng.permutation(total_n)
     observations = observations[perm]

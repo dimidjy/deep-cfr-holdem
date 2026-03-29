@@ -149,7 +149,7 @@ def _make_engine(num_players: int, legacy_game_state: bool = False) -> EnhancedP
 
 
 def _is_cql_checkpoint(ckpt: dict) -> bool:
-    return ckpt.get('model_type') == 'cql'
+    return ckpt.get('model_type') in ('cql', 'iql')
 
 
 def _is_supervised_checkpoint(ckpt: dict) -> bool:
@@ -164,6 +164,7 @@ class _CQLWrapper:
                  iteration=0, temperature=1.0):
         self.action_size = action_size
         self.num_players = num_players
+        self.obs_size = obs_size
         self.device = torch.device('cpu')
         self.iteration = iteration
         self.temperature = temperature
@@ -172,6 +173,16 @@ class _CQLWrapper:
         self.advantage_networks = [q_net] * num_players
 
     def get_strategy(self, observation, player_idx, legal_actions):
+        # Pad observation if model expects more dims (e.g. equity_vs_odds)
+        if len(observation) < self.obs_size:
+            padded = np.zeros(self.obs_size, dtype=np.float32)
+            padded[:len(observation)] = observation
+            # Compute equity_vs_odds if we have the raw features
+            if len(observation) >= 19 and self.obs_size > len(observation):
+                pot_odds = observation[10]
+                equity = observation[18]
+                padded[len(observation)] = np.clip(equity - (1.0 - pot_odds), -1.0, 1.0)
+            observation = padded
         obs_t = torch.FloatTensor(observation).unsqueeze(0)
         with torch.no_grad():
             q_values = self.q_net(obs_t).numpy()[0]

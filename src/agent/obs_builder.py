@@ -68,10 +68,11 @@ class ObservationBuilder:
     """
 
     def __init__(self, num_players: int = 6, pad_to_6p: bool = False,
-                 behavioral_stats: bool = False):
+                 behavioral_stats: bool = False, equity_vs_odds: bool = False):
         self.num_players = num_players
         self.pad_to_6p = pad_to_6p and num_players < 6
         self.behavioral_stats = behavioral_stats
+        self.equity_vs_odds = equity_vs_odds
 
     def build(self, game_state: GameState) -> Optional[np.ndarray]:
         """Build observation vector from GameState. Returns None if hole cards missing."""
@@ -100,7 +101,8 @@ class ObservationBuilder:
         features.append(self._pot_odds_features(game_state, players, player_idx))
         features.append(self._hand_strength_features(hole_cards))
         features.append(self._stack_features(game_state, players, player_idx))
-        features.append(self._equity_features(hole_cards, community))
+        n_opponents = max(len([p for p in players if p.is_active]) - 1, 1)
+        features.append(self._equity_features(hole_cards, community, n_opponents))
         features.append(self._street_features(game_state.street))
         features.append(self._game_state_features(game_state, players, player_idx))
         features.append(self._betting_history_features(game_state, players, player_idx))
@@ -109,7 +111,17 @@ class ObservationBuilder:
             features.append(self._behavioral_stats_features(
                 game_state, players, player_idx))
 
-        return np.concatenate(features).astype(np.float32)
+        obs = np.concatenate(features).astype(np.float32)
+
+        # Equity vs pot odds: positive = profitable call, negative = fold
+        if self.equity_vs_odds and len(obs) > 18:
+            pot_odds = obs[10]  # pot / (pot + call)
+            equity = obs[18]   # hand_strength
+            equity_needed = 1.0 - pot_odds
+            evo = np.clip(equity - equity_needed, -1.0, 1.0)
+            obs = np.append(obs, np.float32(evo))
+
+        return obs
 
     def get_position_label(self, game_state: GameState) -> str:
         players = game_state.active_players
@@ -188,7 +200,8 @@ class ObservationBuilder:
         return np.array([m_ratio, relative_stack], dtype=np.float32)
 
     def _equity_features(self, hole_cards: List[str],
-                         community_cards: List[str]) -> np.ndarray:
+                         community_cards: List[str],
+                         n_opponents: int = 1) -> np.ndarray:
         if len(hole_cards) < 2:
             return np.zeros(8, dtype=np.float32)
 
@@ -200,9 +213,14 @@ class ObservationBuilder:
             try:
                 e7_hole = [_eval7.Card(c) for c in hole_cards[:2]]
                 e7_board = [_eval7.Card(c) for c in community_cards] if community_cards else []
-                n_samples = 1000 if not community_cards else 300
-                hand_strength = _eval7.py_hand_vs_range_monte_carlo(
-                    e7_hole, _EVAL7_RANDOM_RANGE, e7_board, n_samples)
+                if n_opponents <= 1:
+                    n_samples = 1000 if not community_cards else 300
+                    hand_strength = _eval7.py_hand_vs_range_monte_carlo(
+                        e7_hole, _EVAL7_RANDOM_RANGE, e7_board, n_samples)
+                else:
+                    # Multiway equity: simulate vs N random opponents
+                    hand_strength = self._multiway_equity(
+                        e7_hole, e7_board, n_opponents, 500)
             except Exception:
                 hand_strength = self._approx_preflop_equity(hole_cards)
         else:
@@ -218,6 +236,11 @@ class ObservationBuilder:
             treys_hole = [TreysCard.new(c[0] + c[1].lower()) for c in hole_cards[:2]]
             treys_board = [TreysCard.new(c[0] + c[1].lower()) for c in community_cards]
         except Exception:
+            return np.array([hand_strength, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
+
+        # Treys needs 5 or 7 total cards (2 hole + 3/4/5 board)
+        total_cards = len(treys_hole) + len(treys_board)
+        if total_cards not in (5, 6, 7):
             return np.array([hand_strength, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
 
         rank_int = _TREYS_EVALUATOR.evaluate(treys_board, treys_hole)
@@ -271,6 +294,42 @@ class ObservationBuilder:
              top_pair, board_is_paired, board_flush_texture,
              board_straight_texture],
             dtype=np.float32)
+
+    @staticmethod
+    def _multiway_equity(hole: list, board: list, n_opponents: int,
+                         n_samples: int = 500) -> float:
+        """Monte Carlo multiway equity: win rate vs N random opponents."""
+        import random as _rng
+        deck = [_eval7.Card(r + s) for r in '23456789TJQKA' for s in 'shdc']
+        used = set(str(c) for c in hole + board)
+        available = [c for c in deck if str(c) not in used]
+        cards_needed = n_opponents * 2 + (5 - len(board))  # opp cards + remaining board
+
+        if len(available) < cards_needed:
+            return 0.5
+
+        wins = 0
+        for _ in range(n_samples):
+            _rng.shuffle(available)
+            idx = 0
+            # Deal remaining board cards
+            full_board = list(board) + available[idx:idx + (5 - len(board))]
+            idx += 5 - len(board)
+            # Evaluate hero
+            my_score = _eval7.evaluate(list(hole) + full_board)
+            # Evaluate opponents
+            beat_all = True
+            for _ in range(n_opponents):
+                opp = [available[idx], available[idx + 1]]
+                idx += 2
+                opp_score = _eval7.evaluate(opp + full_board)
+                if opp_score < my_score:  # lower = better in eval7
+                    beat_all = False
+                    break
+            if beat_all:
+                wins += 1
+
+        return wins / max(n_samples, 1)
 
     @staticmethod
     def _approx_preflop_equity(hole_cards: List[str]) -> float:
@@ -331,7 +390,20 @@ class ObservationBuilder:
         max_bet = max((p.bet_current_round for p in players), default=0)
         big_blind = 1.0
 
-        my_pot_share = float(np.clip(player.total_invested / pot, 0.0, 1.0))
+        # Estimate total_invested: use explicit value if available,
+        # otherwise approximate from pot size and current bet
+        invested = player.total_invested
+        if invested <= 0:
+            active = max(sum(1 for p in players if p.is_active), 1)
+            all_bets = sum(p.bet_current_round for p in players)
+            prev_streets = max(pot - all_bets, 0)
+            invested = prev_streets / active + player.bet_current_round
+            # Preflop: hero posted blind but bet_current_round may be 0
+            # (parser reads it as 0 when blind is already in pot)
+            if gs.street == 'preflop' and invested <= 0:
+                invested = max(gs.small_blind, pot / active)
+
+        my_pot_share = float(np.clip(invested / pot, 0.0, 1.0))
 
         active_count = max(sum(1 for p in players if p.is_active), 1)
         not_raise_fraction = float(np.clip(
@@ -368,24 +440,27 @@ class ObservationBuilder:
         """
         feats = np.zeros(BEHAVIORAL_STATS_DIM, dtype=np.float32)
 
-        num_total = len(gs.players)
-        active = [p for p in players if p.is_active]
-        opps = [p for i, p in enumerate(players) if i != player_idx]
-        active_opps = [p for p in opps if p.is_active]
-        folded_opps = [p for p in opps if not p.is_active]
+        # Use ALL players (not just active) to detect folds
+        all_players = gs.players
+        num_total = len(all_players)
+        all_opps = [p for p in all_players if p.seat != gs.my_seat]
+        active_opps = [p for p in all_opps if p.is_active and not p.is_sitting_out]
+        folded_opps = [p for p in all_opps
+                       if not p.is_active and not p.is_sitting_out and p.stack > 0]
 
-        if not opps:
+        if not all_opps:
             return feats
 
         pot = max(gs.pot_total, 1.0)
 
         # 0: opp_aggression_ratio — opponents who bet/raised (have current bets > BB)
-        opp_with_bets = sum(1 for p in opps if p.bet_current_round > 1.0 or p.is_all_in)
-        opp_actions_est = max(len(opps), 1)
+        opp_with_bets = sum(1 for p in active_opps if p.bet_current_round > 1.0 or p.is_all_in)
+        opp_actions_est = max(len(active_opps), 1)
         feats[0] = opp_with_bets / opp_actions_est
 
-        # 1: opp_fold_ratio — fraction of opponents who folded
-        feats[1] = len(folded_opps) / max(num_total - 1, 1)
+        # 1: opp_fold_ratio — fraction of opponents who folded this hand
+        total_opps_in_hand = len(active_opps) + len(folded_opps)
+        feats[1] = len(folded_opps) / max(total_opps_in_hand, 1)
 
         # 2: avg_bet_sizing — average opp bet / pot (normalized by /3)
         opp_bets = [p.bet_current_round for p in active_opps if p.bet_current_round > 0]
@@ -419,7 +494,8 @@ class ObservationBuilder:
             feats[6] = check_count / len(active_opps)
 
         # 7: pot_escalation — pot / avg starting stack
-        avg_stack = max(sum(p.stack + p.total_invested for p in players) / max(num_total, 1), 1.0)
+        # Approximate starting stack: current stack + pot share (since total_invested may be 0)
+        avg_stack = max(sum(p.stack for p in all_players) / max(num_total, 1) + pot / max(num_total, 1), 1.0)
         feats[7] = min(pot / avg_stack, 1.0)
 
         return feats

@@ -126,11 +126,12 @@ def _make_engine(num_players):
 class PokerActionDataset(Dataset):
     """Dataset of (observation, action, legal_mask, weight) tuples."""
 
-    def __init__(self, observations, actions, legal_masks, weights):
+    def __init__(self, observations, actions, legal_masks, weights, streets=None):
         self.observations = torch.FloatTensor(observations)
         self.actions = torch.LongTensor(actions)
         self.legal_masks = torch.FloatTensor(legal_masks)
         self.weights = torch.FloatTensor(weights)
+        self.streets = streets  # numpy int8 array, kept for sampler
 
     def __len__(self):
         return len(self.actions)
@@ -138,6 +139,40 @@ class PokerActionDataset(Dataset):
     def __getitem__(self, idx):
         return (self.observations[idx], self.actions[idx],
                 self.legal_masks[idx], self.weights[idx])
+
+
+class StreetBalancedSampler(torch.utils.data.Sampler):
+    """Sampler that balances batches across streets (flop/turn/river).
+
+    Without this, if 55% of data is flop and 15% is river, the model
+    under-learns river play. This sampler ensures each epoch sees roughly
+    equal representation from each street.
+    """
+
+    def __init__(self, streets: np.ndarray, epoch_size: int = None):
+        self.streets = streets
+        self.epoch_size = epoch_size or len(streets)
+        # Build per-street index lists
+        self.street_indices = {}
+        for s in [1, 2, 3]:  # flop, turn, river
+            idx = np.where(streets == s)[0]
+            if len(idx) > 0:
+                self.street_indices[s] = idx
+        self.n_streets = len(self.street_indices)
+
+    def __iter__(self):
+        rng = np.random.RandomState()
+        per_street = self.epoch_size // max(self.n_streets, 1)
+        indices = []
+        for s, idx in self.street_indices.items():
+            chosen = rng.choice(idx, size=per_street, replace=True)
+            indices.append(chosen)
+        indices = np.concatenate(indices)
+        rng.shuffle(indices)
+        return iter(indices.tolist())
+
+    def __len__(self):
+        return self.epoch_size
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1110,6 +1145,11 @@ def main():
         observations, actions, legal_masks, weights = build_dataset(
             decision_points, action_size, True, weight_pot, use_reward_weight)
 
+        # Build streets array for balanced sampling
+        _smap = {'preflop': 0, 'flop': 1, 'turn': 2, 'river': 3}
+        streets = np.array([_smap.get(dp.street, 0) for dp in decision_points],
+                           dtype=np.int8)
+
         # Street distribution
         street_counts = defaultdict(int)
         action_counts = defaultdict(int)
@@ -1171,15 +1211,35 @@ def main():
         del decision_points
     import gc; gc.collect()
 
+    # Get streets array for balanced sampling
+    if 'streets' in dir() and streets is not None:
+        train_streets = streets[train_idx]
+    else:
+        train_streets = None
+
     train_dataset = PokerActionDataset(
         observations[train_idx], actions[train_idx],
-        legal_masks[train_idx], weights[train_idx])
+        legal_masks[train_idx], weights[train_idx],
+        streets=train_streets)
     val_dataset = PokerActionDataset(
         observations[val_idx], actions[val_idx],
         legal_masks[val_idx], weights[val_idx])
 
+    # Street-balanced sampling: ensures equal flop/turn/river representation
+    train_sampler = None
+    use_shuffle = True
+    if train_streets is not None and len(np.unique(train_streets)) > 1:
+        train_sampler = StreetBalancedSampler(train_streets, epoch_size=train_n)
+        use_shuffle = False
+        street_names = {1: 'flop', 2: 'turn', 3: 'river'}
+        for s in [1, 2, 3]:
+            c = (train_streets == s).sum()
+            print(f'    Street {street_names.get(s, s)}: {c} ({c/train_n*100:.1f}%)')
+        print(f'  Street-balanced sampling: ON (equal flop/turn/river per epoch)')
+
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
-                              shuffle=True, num_workers=4, pin_memory=True,
+                              shuffle=use_shuffle, sampler=train_sampler,
+                              num_workers=4, pin_memory=True,
                               persistent_workers=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size,
                             shuffle=False, num_workers=4, pin_memory=True,

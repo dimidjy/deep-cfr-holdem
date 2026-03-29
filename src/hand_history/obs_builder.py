@@ -502,7 +502,8 @@ class ObservationBuilder:
         if hole:
             features.append(self._hand_strength_features(hole))
             features.append(self._stack_features(players, player_idx))
-            features.append(self._equity_features(hole, community_cards))
+            n_opponents = max(sum(1 for p in players if p.active) - 1, 1)
+            features.append(self._equity_features(hole, community_cards, n_opponents))
         else:
             # Neutral card features for unknown hands
             features.append(np.array([0.5, 0.5, 0.5, 0.5, 0.2],
@@ -582,7 +583,8 @@ class ObservationBuilder:
         return np.array([m_ratio, relative_stack], dtype=np.float32)
 
     def _equity_features(self, hole_cards: List[str],
-                         community_cards: List[str]) -> np.ndarray:
+                         community_cards: List[str],
+                         n_opponents: int = 1) -> np.ndarray:
         """8 dims: equity (Monte Carlo) + board texture features."""
         if len(hole_cards) < 2:
             return np.zeros(8, dtype=np.float32)
@@ -591,15 +593,19 @@ class ObservationBuilder:
         r2 = _rank_val(hole_cards[1][0])
         hi, lo = max(r1, r2), min(r1, r2)
 
-        # Monte Carlo equity vs random range (eval7)
-        # Preflop needs more samples (5 community cards to simulate vs 0-2 postflop)
+        # Monte Carlo equity — multiway when >1 opponent
         if _EVAL7_AVAILABLE:
             try:
                 e7_hole = [_eval7.Card(c) for c in hole_cards[:2]]
                 e7_board = [_eval7.Card(c) for c in community_cards] if community_cards else []
-                n_samples = 1000 if not community_cards else 300
-                hand_strength = _eval7.py_hand_vs_range_monte_carlo(
-                    e7_hole, _EVAL7_RANDOM_RANGE, e7_board, n_samples)
+                if n_opponents <= 1:
+                    n_samples = 1000 if not community_cards else 300
+                    hand_strength = _eval7.py_hand_vs_range_monte_carlo(
+                        e7_hole, _EVAL7_RANDOM_RANGE, e7_board, n_samples)
+                else:
+                    # Multiway: fewer samples for speed (training processes millions)
+                    hand_strength = self._multiway_equity(
+                        e7_hole, e7_board, n_opponents, 200)
             except Exception:
                 hand_strength = self._approx_preflop_equity(hole_cards)
         else:
@@ -672,6 +678,35 @@ class ObservationBuilder:
              top_pair, board_is_paired, board_flush_texture,
              board_straight_texture],
             dtype=np.float32)
+
+    @staticmethod
+    def _multiway_equity(hole: list, board: list, n_opponents: int,
+                         n_samples: int = 500) -> float:
+        """Monte Carlo multiway equity: win rate vs N random opponents."""
+        import random as _rng
+        deck = [_eval7.Card(r + s) for r in '23456789TJQKA' for s in 'shdc']
+        used = set(str(c) for c in hole + board)
+        available = [c for c in deck if str(c) not in used]
+        cards_needed = n_opponents * 2 + (5 - len(board))
+        if len(available) < cards_needed:
+            return 0.5
+        wins = 0
+        for _ in range(n_samples):
+            _rng.shuffle(available)
+            idx = 0
+            full_board = list(board) + available[idx:idx + (5 - len(board))]
+            idx += 5 - len(board)
+            my_score = _eval7.evaluate(list(hole) + full_board)
+            beat_all = True
+            for _ in range(n_opponents):
+                opp = [available[idx], available[idx + 1]]
+                idx += 2
+                if _eval7.evaluate(opp + full_board) < my_score:
+                    beat_all = False
+                    break
+            if beat_all:
+                wins += 1
+        return wins / max(n_samples, 1)
 
     @staticmethod
     def _approx_preflop_equity(hole_cards: List[str]) -> float:

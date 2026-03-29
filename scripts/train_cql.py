@@ -83,6 +83,7 @@ class CQLModelWrapper:
                  iteration=0, temperature=1.0):
         self.action_size = action_size
         self.num_players = num_players
+        self.obs_size = obs_size
         self.device = torch.device(device)
         self.iteration = iteration
         self.temperature = temperature
@@ -94,11 +95,25 @@ class CQLModelWrapper:
 
     def get_strategy(self, observation: np.ndarray, player_idx: int,
                      legal_actions: list) -> np.ndarray:
+        # Pad observation if model expects more dims
+        if len(observation) < self.obs_size:
+            padded = np.zeros(self.obs_size, dtype=np.float32)
+            padded[:len(observation)] = observation
+            if len(observation) >= 19 and self.obs_size > len(observation):
+                pot_odds = observation[10]
+                equity = observation[18]
+                evo_idx = self.obs_size - 1
+                padded[evo_idx] = np.clip(equity - (1.0 - pot_odds), -1.0, 1.0)
+            observation = padded
         obs_t = torch.FloatTensor(observation).unsqueeze(0).to(self.device)
         with torch.no_grad():
             q_values = self.q_net(obs_t).cpu().numpy()[0]
 
-        # Softmax over legal Q-values
+        # Handle 6-action model (split check/call)
+        if self.action_size == 6:
+            return self._strategy_6to5(q_values, observation, legal_actions)
+
+        # Standard 5-action softmax
         masked = np.full(self.action_size, -1e9, dtype=np.float32)
         for a in legal_actions:
             masked[a] = q_values[a] / self.temperature
@@ -114,6 +129,47 @@ class CQLModelWrapper:
             strategy /= s
         else:
             strategy[legal_actions] = 1.0 / len(legal_actions)
+        return strategy
+
+    def _strategy_6to5(self, q_values: np.ndarray, observation: np.ndarray,
+                       legal_actions: list) -> np.ndarray:
+        """Convert 6-action Q-values to 5-action strategy for engine compatibility.
+
+        CQL 6-action: 0=fold, 1=check, 2=call, 3=raise_half, 4=raise_pot, 5=allin
+        Engine 5-action: 0=fold, 1=check/call, 2=raise_half, 3=raise_pot, 4=allin
+
+        Based on context (facing bet or not), use Q(check) or Q(call) for action 1.
+        """
+        # Determine if facing a bet
+        call_norm = float(observation[31]) if len(observation) > 31 else 0.0
+        facing_bet = call_norm > 0.01
+
+        # Map 6-action Q-values to the relevant ones for this context
+        # CQL action → engine action: 0→0, 1→1(check), 2→1(call), 3→2, 4→3, 5→4
+        mapped_q = np.full(5, -1e9, dtype=np.float32)
+        mapped_q[0] = q_values[0]                              # fold
+        mapped_q[1] = q_values[2] if facing_bet else q_values[1]  # call or check
+        mapped_q[2] = q_values[3]                              # raise_half
+        mapped_q[3] = q_values[4]                              # raise_pot
+        mapped_q[4] = q_values[5]                              # all_in
+
+        # Softmax over legal actions
+        masked = np.full(5, -1e9, dtype=np.float32)
+        for a in legal_actions:
+            masked[a] = mapped_q[a] / self.temperature
+        masked -= masked.max()
+        exp_s = np.exp(masked)
+        strategy = exp_s / exp_s.sum()
+
+        legal_mask = np.zeros(5, dtype=np.float32)
+        legal_mask[legal_actions] = 1.0
+        strategy *= legal_mask
+        s = strategy.sum()
+        if s > 0:
+            strategy /= s
+        else:
+            for a in legal_actions:
+                strategy[a] = 1.0 / len(legal_actions)
         return strategy
 
 
@@ -140,63 +196,66 @@ def _make_engine(num_players):
 # Offline Replay Dataset — stores (s, a, r, s', done, legal, legal_next)
 # ──────────────────────────────────────────────────────────────────────────────
 
-class OfflineReplayDataset(Dataset):
-    """Dataset of (state, action, reward, next_state, done, legal_mask, next_legal_mask)."""
+class _IndexedReplayDataset(Dataset):
+    """Zero-copy dataset that indexes into shared numpy arrays."""
 
     def __init__(self, states, actions, rewards, next_states, dones,
-                 legal_masks, next_legal_masks, weights):
-        self.states = torch.FloatTensor(states)
-        self.actions = torch.LongTensor(actions)
-        self.rewards = torch.FloatTensor(rewards)
-        self.next_states = torch.FloatTensor(next_states)
-        self.dones = torch.FloatTensor(dones)
-        self.legal_masks = torch.FloatTensor(legal_masks)
-        self.next_legal_masks = torch.FloatTensor(next_legal_masks)
-        self.weights = torch.FloatTensor(weights)
+                 legal_masks, next_legal_masks, weights, indices):
+        self.states = states
+        self.actions = actions
+        self.rewards = rewards
+        self.next_states = next_states
+        self.dones = dones
+        self.legal_masks = legal_masks
+        self.next_legal_masks = next_legal_masks
+        self.weights = weights
+        self.indices = indices
 
     def __len__(self):
-        return len(self.actions)
+        return len(self.indices)
 
     def __getitem__(self, idx):
-        return (self.states[idx], self.actions[idx], self.rewards[idx],
-                self.next_states[idx], self.dones[idx],
-                self.legal_masks[idx], self.next_legal_masks[idx],
-                self.weights[idx])
+        i = self.indices[idx]
+        return (torch.from_numpy(self.states[i]),
+                torch.tensor(self.actions[i], dtype=torch.long),
+                torch.tensor(self.rewards[i], dtype=torch.float32),
+                torch.from_numpy(self.next_states[i]),
+                torch.tensor(self.dones[i], dtype=torch.float32),
+                torch.from_numpy(self.legal_masks[i]),
+                torch.from_numpy(self.next_legal_masks[i]),
+                torch.tensor(self.weights[i], dtype=torch.float32))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Data collection (reuses parse infrastructure from train_supervised)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _prefilter_files(hh_files, good_players, hh_dir):
-    """Grep pre-filter — same as train_supervised."""
+def _prefilter_files(hh_files, players, hh_dir):
+    """Use ripgrep to quickly find files containing target player names."""
     import subprocess
     import shutil
     import re
 
-    if not good_players:
+    if not players:
         return hh_files
 
-    escaped = [re.escape(name) for name in good_players]
-    BATCH = 50
-    pattern_batches = [escaped[i:i+BATCH] for i in range(0, len(escaped), BATCH)]
-    matched_files = set()
-    use_rg = shutil.which('rg') is not None
+    rg_path = shutil.which('rg')
+    if not rg_path:
+        return hh_files
 
-    for batch in pattern_batches:
-        pattern = '|'.join(batch)
-        try:
-            if use_rg:
-                cmd = ['rg', '-l', '--no-ignore', '--glob', '*.txt',
-                       '-e', pattern, hh_dir]
-            else:
-                cmd = ['grep', '-rl', '-E', pattern, '--include=*.txt', hh_dir]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-            for line in result.stdout.strip().split('\n'):
-                line = line.strip()
-                if line:
-                    matched_files.add(os.path.abspath(line))
-        except Exception:
+    matched_files = set()
+    try:
+        # Use -f - to pass patterns via stdin (avoids "Argument list too long")
+        result = subprocess.run(
+            [rg_path, '-l', '--no-messages', '-f', '-', str(hh_dir)],
+            input='\n'.join(re.escape(p) for p in players),
+            capture_output=True, text=True, timeout=1200
+        )
+        for line in result.stdout.strip().split('\n'):
+            line = line.strip()
+            if line:
+                matched_files.add(os.path.abspath(line))
+    except Exception:
             return hh_files
 
     print(f'  Pre-filter: {len(matched_files)}/{len(hh_files)} files contain target players')
@@ -207,15 +266,18 @@ def _prefilter_files(hh_files, good_players, hh_dir):
 _PARSE_CFG = {}
 
 
-def _parse_worker_init(num_players, good_players, postflop_only):
+def _parse_worker_init(num_players, good_players, bad_players, postflop_only,
+                       use_behavioral_stats=False):
     _PARSE_CFG['num_players'] = num_players
     _PARSE_CFG['good_players'] = good_players
+    _PARSE_CFG['bad_players'] = bad_players
     _PARSE_CFG['postflop_only'] = postflop_only
     _PARSE_CFG['builder'] = ObservationBuilder(num_players=num_players)
+    _PARSE_CFG['behavioral_stats'] = use_behavioral_stats
 
 
 def _parse_single_file(file_path):
-    """Parse one HH file — returns list of (hand_id, player_name, dps_for_player).
+    """Parse one HH file — returns list of (hand_id, player_name, dps_for_player, net_dollars).
 
     For CQL we collect TWO types of data:
     1. Known-cards players (showdown): full obs with real equity, all their actions
@@ -226,8 +288,10 @@ def _parse_single_file(file_path):
     """
     num_players = _PARSE_CFG['num_players']
     good_players = _PARSE_CFG['good_players']
+    bad_players = _PARSE_CFG['bad_players']
     postflop_only = _PARSE_CFG['postflop_only']
     builder = _PARSE_CFG['builder']
+    use_bh = _PARSE_CFG['behavioral_stats']
 
     file_results = []  # list of (hand_id, player_name, sorted_dps, net_dollars)
     file_total = 0
@@ -254,103 +318,184 @@ def _parse_single_file(file_path):
         else:
             target_known = known_players
 
-        if not target_known:
+        # Also include bad players (their losing actions teach CQL what NOT to do)
+        target_bad = (known_players & bad_players) if bad_players else set()
+
+        if not target_known and not target_bad:
             continue
 
-        # Compute player net profit
+        # Compute player net profit (correct handling of raises)
         player_winnings = {}
         for w in hand.result.winners:
             name = w['name']
             player_winnings[name] = player_winnings.get(name, 0) + w['amount_dollars']
 
-        player_invested = {}
+        player_invested = defaultdict(float)
+        round_committed = defaultdict(float)
+        current_street = 'preflop'
         for action in hand.actions:
-            if action.is_blind or action.action_type in ('bet', 'raise', 'call'):
-                name = action.player_name
-                player_invested[name] = player_invested.get(name, 0) + action.amount_dollars
+            if action.street != current_street:
+                current_street = action.street
+                round_committed.clear()
+            name = action.player_name
+            if action.is_blind or action.action_type in ('bet', 'call'):
+                player_invested[name] += action.amount_dollars
+                round_committed[name] += action.amount_dollars
+            elif action.action_type == 'raise':
+                to_amt = action.amount_dollars
+                already = round_committed.get(name, 0)
+                delta = to_amt - already
+                if delta > 0:
+                    player_invested[name] += delta
+                round_committed[name] = to_amt
 
         file_used += 1
+        bb = hand.big_blind_dollars
 
         # ── 1) Known-cards players: full decision sequences ──────────────
+        all_targets = target_known | target_bad
         dps = builder.build_decision_points(hand, allow_unknown_cards=False,
-                                            source_file=str(file_path))
+                                            source_file=str(file_path),
+                                            behavioral_stats=use_bh)
         if dps:
             player_dps = defaultdict(list)
             for dp in dps:
                 if postflop_only and dp.street == 'preflop':
                     continue
-                if dp.player_name in target_known:
+                if dp.player_name in all_targets:
                     player_dps[dp.player_name].append(dp)
 
             for player_name, pdps in player_dps.items():
-                net = player_winnings.get(player_name, 0.0) - player_invested.get(player_name, 0.0)
+                won = player_winnings.get(player_name, 0.0)
+                invested = player_invested.get(player_name, 0.0)
+                net = won - invested
                 file_results.append((hand.hand_id, player_name, pdps, net))
 
-        # ── 2) Fold transitions from ALL players (unknown cards OK) ──────
-        # Parse again with allow_unknown_cards=True to get fold actions
-        # from players whose cards we don't know
-        dps_all = builder.build_decision_points(hand, allow_unknown_cards=True,
-                                                source_file=str(file_path))
-        if dps_all:
-            # Find players who folded (not in showdown known_players)
-            fold_players = set()
-            for dp in dps_all:
-                if dp.actual_action == 0:  # fold
-                    fold_players.add(dp.player_name)
+        # ── 2) Synthetic fold transitions from showdown LOSERS ────────────
+        # Two types of synthetic folds:
+        #
+        # A) EQUITY-BASED: equity < pot_odds_needed → call was mathematically
+        #    wrong. These get full weight (the decision was clearly bad).
+        #
+        # B) LOSS-BASED: equity >= needed (cooler/unlucky), but the loss was
+        #    large (>10 BB). These get reduced weight proportional to how much
+        #    the fold would save. This teaches the model that even "correct"
+        #    calls can be expensive, nudging it toward folding in big pots
+        #    with marginal hands — without hard-overriding coolers.
+        #
+        # No unknown-cards folds (section 2 removed — garbage equity data).
+        if dps:
+            for player_name in known_players:
+                won = player_winnings.get(player_name, 0.0)
+                invested = player_invested.get(player_name, 0.0)
+                net = won - invested
+                if net >= 0:
+                    continue  # winner, skip
 
-            for fold_player in fold_players:
-                # Skip players we already have full data for
-                if fold_player in target_known:
+                net_bb = net / bb
+
+                player_postflop = [dp for dp in dps
+                                   if dp.player_name == player_name
+                                   and dp.street != 'preflop'
+                                   and 0 in dp.legal_actions]
+                if not player_postflop:
                     continue
 
-                # Get only the LAST decision point (the fold itself)
-                fold_dps = [dp for dp in dps_all
-                            if dp.player_name == fold_player and dp.actual_action == 0]
-                if not fold_dps:
-                    continue
-                if postflop_only and all(dp.street == 'preflop' for dp in fold_dps):
-                    continue
+                # Track cumulative investment by street
+                invested_before = {}
+                cum = 0.0
+                prev_street = None
+                for action in hand.actions:
+                    if action.player_name != player_name:
+                        continue
+                    if action.street != prev_street:
+                        invested_before[action.street] = cum
+                        prev_street = action.street
+                    if action.is_blind or action.action_type in ('bet', 'call', 'raise'):
+                        cum += action.amount_dollars
 
-                # Fold reward = -amount invested (they lose what they put in)
-                fold_net = -player_invested.get(fold_player, 0.0)
-                # Only keep the fold action itself (terminal transition)
-                last_fold = fold_dps[-1]
-                if postflop_only and last_fold.street == 'preflop':
-                    continue
-                file_results.append((hand.hand_id, fold_player, [last_fold], fold_net))
+                for dp in player_postflop:
+                    obs = dp.observation
+                    if len(obs) <= 18:
+                        continue
+
+                    inv_before = invested_before.get(dp.street, 0.0)
+                    fold_net = -inv_before
+                    saved_bb = (fold_net - net) / bb  # how much fold saves in BB
+
+                    if saved_bb < 1.0:
+                        continue  # fold doesn't save enough
+
+                    pot_odds = float(obs[10])
+                    equity = float(obs[18])
+                    made_hand = float(obs[19]) if len(obs) > 19 else 0.0
+                    equity_needed = 1.0 - pot_odds
+
+                    # Never create fold labels for strong hands (two pair+)
+                    if made_hand >= 0.25:
+                        continue
+
+                    # Create fold when equity is below what's needed to call
+                    # No margin — if equity < needed, folding is mathematically correct
+                    if equity < equity_needed:
+                        fake_dp = copy.copy(dp)
+                        fake_dp.actual_action = 0
+                        file_results.append((hand.hand_id,
+                                             player_name + '_sf',
+                                             [fake_dp], fold_net))
+                    # Also fold when loss is large (>5 BB saved) even if equity was borderline
+                    # Pair or worse that lost big = should have folded
+                    elif saved_bb >= 5.0 and made_hand < 0.20:
+                        fake_dp = copy.copy(dp)
+                        fake_dp.actual_action = 0
+                        file_results.append((hand.hand_id,
+                                             player_name + '_sf',
+                                             [fake_dp], fold_net))
 
     return file_results, file_total, file_used
 
 
 def collect_transitions(hh_dir, num_players, max_hands, good_players,
-                        no_cache, postflop_only):
+                        bad_players, no_cache, postflop_only,
+                        use_behavioral_stats=False, workers=0):
     """Parse HH files and build offline RL transitions (s, a, r, s', done)."""
     hh_path = Path(hh_dir)
     all_hh_files = sorted(hh_path.rglob('*.txt'))
     print(f'  Found {len(all_hh_files)} .txt files in {hh_dir}')
 
-    hh_files = _prefilter_files(all_hh_files, good_players, hh_dir)
+    all_target_players = (good_players or set()) | (bad_players or set())
+    hh_files = _prefilter_files(all_hh_files, all_target_players, hh_dir)
     if not hh_files:
         return []
 
     # Cache
     player_key = '|'.join(sorted(good_players)) if good_players else 'all'
-    cache_key = f'cql1|{hh_dir}|{len(all_hh_files)}|flt{len(hh_files)}|np{num_players}|max{max_hands}|g{player_key}|pf{postflop_only}'
+    bad_key = '|'.join(sorted(bad_players))[:100] if bad_players else 'none'
+    bh_key = 'bh' if use_behavioral_stats else ''
+    cache_key = f'cql2|{hh_dir}|{len(all_hh_files)}|flt{len(hh_files)}|np{num_players}|max{max_hands}|g{player_key}|b{bad_key}|pf{postflop_only}|{bh_key}'
     cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:12]
     cache_dir = Path(__file__).parent.parent / 'data' / '.hh_cache'
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_file = cache_dir / f'cql_{cache_hash}.pkl'
 
-    if cache_file.exists() and not no_cache:
-        print(f'  Loading cached CQL data from {cache_file.name}...')
-        with open(cache_file, 'rb') as f:
-            data = pickle.load(f)
-        print(f'  Loaded {len(data["transitions"])} transitions from {data["hands_used"]} hands')
-        return data['transitions']
+    npz_cache = str(cache_file).replace('.pkl', '.npz')
+    if os.path.exists(npz_cache) and not no_cache:
+        print(f'  Loading cached CQL data from {npz_cache}...')
+        data = np.load(npz_cache)
+        n = len(data['actions'])
+        print(f'  Loaded {n} transitions')
+        return {
+            'states': data['states'], 'actions': data['actions'],
+            'rewards': data['rewards'], 'next_states': data['next_states'],
+            'dones': data['dones'], 'legal_masks': data['legal_masks'],
+            'next_legal_masks': data['next_legal_masks'],
+            'streets': data['streets'], 'source_files': [],
+            'obs_size': data['states'].shape[1],
+        }
 
     # Parallel parsing
     import multiprocessing as mp
-    parse_workers = min(120, max(1, mp.cpu_count() - 1))
+    parse_workers = workers if workers > 0 else min(120, max(1, mp.cpu_count() - 1))
 
     all_results = []
     total_hands = 0
@@ -360,7 +505,8 @@ def collect_transitions(hh_dir, num_players, max_hands, good_players,
     print(f'  Parsing {len(hh_files)} files with {parse_workers} workers...')
 
     with mp.Pool(processes=parse_workers, initializer=_parse_worker_init,
-                 initargs=(num_players, good_players, postflop_only)) as pool:
+                 initargs=(num_players, good_players, bad_players, postflop_only,
+                           use_behavioral_stats)) as pool:
         results = pool.imap_unordered(_parse_single_file, hh_files, chunksize=16)
         files_done = 0
         for file_results, file_total, file_used in results:
@@ -383,97 +529,131 @@ def collect_transitions(hh_dir, num_players, max_hands, good_players,
     print(f'  Parsed {files_done} files in {elapsed:.1f}s')
     print(f'  Player-hand sequences: {len(all_results)}')
 
-    # Convert to transitions: (s, a, r, s', done, legal, legal_next)
-    transitions = []
+    # Count total transitions for pre-allocation
+    print(f'  Building transitions...')
+    t_build = time.time()
+    total_trans = sum(len(dps) for _, _, dps, _ in all_results if dps)
+
+    obs_size = all_results[0][2][0].observation.shape[0] if all_results and all_results[0][2] else 41
+    action_size = 5
     bb = 0.05
+
+    # Pre-allocate numpy arrays
+    states = np.zeros((total_trans, obs_size), dtype=np.float32)
+    actions_arr = np.zeros(total_trans, dtype=np.int64)
+    rewards_arr = np.zeros(total_trans, dtype=np.float32)
+    next_states = np.zeros((total_trans, obs_size), dtype=np.float32)
+    dones_arr = np.zeros(total_trans, dtype=np.float32)
+    legal_masks = np.zeros((total_trans, action_size), dtype=np.float32)
+    next_legal_masks = np.zeros((total_trans, action_size), dtype=np.float32)
+    street_arr = np.zeros(total_trans, dtype=np.int8)
+    source_files = []
+
+    street_map = {'preflop': 0, 'flop': 1, 'turn': 2, 'river': 3}
+    idx = 0
 
     for hand_id, player_name, dps, net_dollars in all_results:
         n = len(dps)
         if n == 0:
             continue
 
-        # Reward: distribute hand outcome across actions with discounting
-        # Last action gets full reward, earlier actions get discounted
-        gamma = 0.99
+        net_bb = net_dollars / bb
+
         for i, dp in enumerate(dps):
-            # Discounted reward: later actions get more of the outcome
-            discount = gamma ** (n - 1 - i)
-            reward = (net_dollars / bb) * discount  # reward in BB units
+            is_terminal = (i + 1 >= n)
+            reward = net_bb if is_terminal else 0.0
 
-            # Next state
-            if i + 1 < n:
-                next_obs = dps[i + 1].observation
-                next_legal = dps[i + 1].legal_actions
-                done = 0.0
+            if dp.actual_action == 0:  # fold = always terminal
+                reward = net_bb
+                is_terminal = True
+
+
+            states[idx] = dp.observation
+            actions_arr[idx] = dp.actual_action
+            rewards_arr[idx] = np.clip(reward, -100, 100)
+            dones_arr[idx] = 1.0 if is_terminal else 0.0
+
+            if not is_terminal and i + 1 < n:
+                next_states[idx] = dps[i + 1].observation
+                for a in dps[i + 1].legal_actions:
+                    next_legal_masks[idx, a] = 1.0
             else:
-                # Terminal — use same obs as dummy (won't be used due to done=1)
-                next_obs = dp.observation
-                next_legal = dp.legal_actions
-                done = 1.0
+                next_states[idx] = dp.observation
+                for a in dp.legal_actions:
+                    next_legal_masks[idx, a] = 1.0
 
-            transitions.append({
-                'obs': dp.observation,
-                'action': dp.actual_action,
-                'reward': reward,
-                'next_obs': next_obs,
-                'done': done,
-                'legal': dp.legal_actions,
-                'next_legal': next_legal,
-                'street': dp.street,
-                'source_file': dp.source_file,
-            })
+            for a in dp.legal_actions:
+                legal_masks[idx, a] = 1.0
 
-    print(f'  Total transitions: {len(transitions)}')
+            street_arr[idx] = street_map.get(dp.street, 1)
+            source_files.append(dp.source_file or '')
+            idx += 1
 
-    # Cache
-    data = {'transitions': transitions, 'hands_used': hands_used}
+    # Trim to actual size (some may have been skipped)
+    states = states[:idx]
+    actions_arr = actions_arr[:idx]
+    rewards_arr = rewards_arr[:idx]
+    next_states = next_states[:idx]
+    dones_arr = dones_arr[:idx]
+    legal_masks = legal_masks[:idx]
+    next_legal_masks = next_legal_masks[:idx]
+    street_arr = street_arr[:idx]
+
+    print(f'  Total transitions: {idx} ({time.time() - t_build:.0f}s)')
+
+    # Cache as compressed npz (much faster than pickle for numpy arrays)
     try:
-        with open(cache_file, 'wb') as f:
-            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
-        mb = cache_file.stat().st_size / 1e6
-        print(f'  Cached to {cache_file.name} ({mb:.0f} MB)')
+        np.savez_compressed(
+            str(cache_file).replace('.pkl', '.npz'),
+            states=states, actions=actions_arr, rewards=rewards_arr,
+            next_states=next_states, dones=dones_arr,
+            legal_masks=legal_masks, next_legal_masks=next_legal_masks,
+            streets=street_arr,
+        )
+        npz_path = str(cache_file).replace('.pkl', '.npz')
+        mb = os.path.getsize(npz_path) / 1e6
+        print(f'  Cached to {npz_path} ({mb:.0f} MB)')
     except Exception as e:
         print(f'  Cache save failed: {e}')
 
-    return transitions
+    return {
+        'states': states, 'actions': actions_arr, 'rewards': rewards_arr,
+        'next_states': next_states, 'dones': dones_arr,
+        'legal_masks': legal_masks, 'next_legal_masks': next_legal_masks,
+        'streets': street_arr, 'source_files': source_files,
+        'obs_size': obs_size,
+    }
 
 
-def build_cql_dataset(transitions, action_size=5):
-    """Convert transitions to numpy arrays for the Dataset."""
-    n = len(transitions)
-    obs_size = transitions[0]['obs'].shape[0]
+def build_cql_dataset(trans_data):
+    """Process pre-built arrays: add equity_vs_odds, scale rewards, compute weights."""
+    states = trans_data['states']
+    actions = trans_data['actions']
+    rewards = trans_data['rewards'].astype(np.float32).copy()
+    next_states = trans_data['next_states']
+    dones = trans_data['dones']
+    legal_masks = trans_data['legal_masks']
+    next_legal_masks = trans_data['next_legal_masks']
+    streets = trans_data['streets']
 
-    states = np.zeros((n, obs_size), dtype=np.float32)
-    actions = np.zeros(n, dtype=np.int64)
-    rewards = np.zeros(n, dtype=np.float32)
-    next_states = np.zeros((n, obs_size), dtype=np.float32)
-    dones = np.zeros(n, dtype=np.float32)
-    legal_masks = np.zeros((n, action_size), dtype=np.float32)
-    next_legal_masks = np.zeros((n, action_size), dtype=np.float32)
-    weights = np.ones(n, dtype=np.float32)
+    # Street weights (vectorized)
+    street_w = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+    weights = street_w[streets]
+    weights /= weights.mean()
 
-    street_weights = {'preflop': 1.0, 'flop': 2.0, 'turn': 3.0, 'river': 4.0}
+    # Append equity_vs_odds feature
+    obs_size = states.shape[1]
+    if obs_size >= 19:
+        evo_s = np.clip(states[:, 18] - (1.0 - states[:, 10]), -1.0, 1.0).reshape(-1, 1)
+        evo_ns = np.clip(next_states[:, 18] - (1.0 - next_states[:, 10]), -1.0, 1.0).reshape(-1, 1)
+        states = np.hstack([states, evo_s.astype(np.float32)])
+        next_states = np.hstack([next_states, evo_ns.astype(np.float32)])
+        print(f'  Added equity_vs_odds feature → obs_dim={states.shape[1]}')
 
-    for i, t in enumerate(transitions):
-        states[i] = t['obs']
-        actions[i] = t['action']
-        rewards[i] = t['reward']
-        next_states[i] = t['next_obs']
-        dones[i] = t['done']
-        for a in t['legal']:
-            legal_masks[i, a] = 1.0
-        for a in t['next_legal']:
-            next_legal_masks[i, a] = 1.0
-        weights[i] = street_weights.get(t['street'], 1.0)
-
-    # Normalize rewards to have reasonable scale (mean~0, std~1)
-    r_std = rewards.std()
-    if r_std > 0:
-        rewards /= r_std
-    # Normalize weights
-    w_mean = weights.mean()
-    if w_mean > 0:
-        weights /= w_mean
+    # Scale rewards (÷10 so typical ±50BB → ±5)
+    rewards /= 10.0
+    print(f'  Reward stats (scaled): mean={rewards.mean():.3f}, std={rewards.std():.3f}, '
+          f'min={rewards.min():.1f}, max={rewards.max():.1f}')
 
     return states, actions, rewards, next_states, dones, legal_masks, next_legal_masks, weights
 
@@ -503,13 +683,16 @@ def cql_train_epoch(q_net, q_target, dataloader, optimizer, device, scaler,
             q_values = q_net(obs)  # (B, 5)
             q_taken = q_values.gather(1, acts.unsqueeze(1)).squeeze(1)  # (B,)
 
-            # Target Q-values (from target network)
+            # Double Q-learning: online net selects action, target net evaluates
+            # Reduces overestimation bias vs standard max-Q
             with torch.no_grad():
-                next_q = q_target(next_obs)  # (B, 5)
-                # Mask illegal next actions
-                next_q_masked = next_q + (1.0 - next_legal) * (-1e9)
-                # Use max for next-state value (standard Q-learning)
-                v_next = next_q_masked.max(dim=1).values
+                # Online net picks the best legal action
+                next_q_online = q_net(next_obs)
+                next_q_online_masked = next_q_online + (1.0 - next_legal) * (-1e9)
+                best_actions = next_q_online_masked.argmax(dim=1, keepdim=True)
+                # Target net evaluates that action
+                next_q_target = q_target(next_obs)
+                v_next = next_q_target.gather(1, best_actions).squeeze(1)
                 # Bellman target
                 target = rews + gamma * v_next * (1.0 - done)
 
@@ -571,11 +754,13 @@ def cql_eval_epoch(q_net, q_target, dataloader, device, alpha_cql=1.0, gamma=0.9
             q_values = q_net(obs)
             q_taken = q_values.gather(1, acts.unsqueeze(1)).squeeze(1)
 
-            with torch.no_grad():
-                next_q = q_target(next_obs)
-                next_q_masked = next_q + (1.0 - next_legal) * (-1e9)
-                v_next = next_q_masked.max(dim=1).values
-                target = rews + gamma * v_next * (1.0 - done)
+            # Double Q-learning (same as train)
+            next_q_online = q_net(next_obs)
+            next_q_online_masked = next_q_online + (1.0 - next_legal) * (-1e9)
+            best_actions = next_q_online_masked.argmax(dim=1, keepdim=True)
+            next_q_target = q_target(next_obs)
+            v_next = next_q_target.gather(1, best_actions).squeeze(1)
+            target = rews + gamma * v_next * (1.0 - done)
 
             td_loss = (wts * F.smooth_l1_loss(q_taken, target, reduction='none')).mean()
 
@@ -621,14 +806,26 @@ def main():
         description='CQL (Conservative Q-Learning) from hand histories')
 
     # Data
+    parser.add_argument('--config', type=str, default='',
+                        help='Path to supervised_config.json (loads data/training settings)')
     parser.add_argument('--hh-dir', type=str, default='data/poker_archive/')
     parser.add_argument('--good-players', type=str, default='')
+    parser.add_argument('--bad-players', type=str, default='')
     parser.add_argument('--max-hands', type=int, default=0)
     parser.add_argument('--no-cache', action='store_true')
+    parser.add_argument('--workers', type=int, default=0,
+                        help='Number of parsing workers (0=auto)')
+    parser.add_argument('--behavioral-stats', action='store_true',
+                        help='Append 8-dim behavioral stats to observations')
+    parser.add_argument('--training-data', type=str, default='',
+                        help='Pre-built CQL data (.npz from --build-data). Skips parsing.')
+    parser.add_argument('--build-data', type=str, default='',
+                        help='Build CQL data and save to this path, then exit. '
+                             'Use with --training-data to skip parsing on next run.')
 
     # CQL hyperparameters
-    parser.add_argument('--alpha-cql', type=float, default=0.1,
-                        help='CQL conservative regularizer strength (lower=more deviation from data)')
+    parser.add_argument('--alpha-cql', type=float, default=0.4,
+                        help='CQL conservative regularizer (0.4=balanced, lower=more deviation from data)')
     parser.add_argument('--gamma', type=float, default=0.99,
                         help='Discount factor')
     parser.add_argument('--tau', type=float, default=0.005,
@@ -650,24 +847,67 @@ def main():
 
     # Output
     parser.add_argument('--output', type=str, default='models/cql_model.pt')
+    parser.add_argument('--resume', type=str, default='',
+                        help='Resume from checkpoint (loads weights + optimizer state)')
     parser.add_argument('--device', type=str, default=None)
 
     args = parser.parse_args()
 
+    # Load config if provided
+    if args.config:
+        import json as _json
+        with open(args.config) as _f:
+            _cfg = _json.load(_f)
+        _data = _cfg.get('data', {})
+        _train = _cfg.get('train', {})
+        if not args.hh_dir or args.hh_dir == 'data/poker_archive/':
+            args.hh_dir = _data.get('hh_dir', args.hh_dir)
+        if not args.good_players:
+            args.good_players = _data.get('good_players', '')
+        if not args.bad_players:
+            args.bad_players = _data.get('bad_players', '')
+        if not args.behavioral_stats:
+            args.behavioral_stats = _train.get('behavioral_stats', False)
+        if args.hidden_layers == '512,512,256':
+            args.hidden_layers = ','.join(
+                str(x) for x in _train.get('hidden_layers', [512, 512, 256]))
+        if not hasattr(args, 'workers') or args.workers == 0:
+            args.workers = _data.get('workers', 0)
+        for key in ['epochs', 'lr', 'batch_size', 'dropout',
+                     'alpha_cql', 'gamma', 'tau', 'temperature']:
+            if key in _train and getattr(args, key.replace('-', '_'), None) is None:
+                pass  # CLI takes precedence
+            elif key in _train:
+                cli_default = parser.get_default(key.replace('_', '-') if '-' in key else key)
+                if getattr(args, key.replace('-', '_')) == cli_default:
+                    setattr(args, key.replace('-', '_'), _train[key])
+        if _train.get('output') and args.output == 'models/cql_model.pt':
+            args.output = _train['output']
+
     postflop_only = True
 
-    # Load player list
-    good_players = set()
-    if args.good_players:
-        p = Path(args.good_players)
+    # Load player lists
+    def _load_player_list(path):
+        if not path:
+            return set()
+        p = Path(path)
         if not p.exists():
-            print(f'Good players file not found: {p}')
-            sys.exit(1)
-        good_players = set(
-            line.strip() for line in p.read_text().splitlines()
-            if line.strip() and not line.strip().startswith('#')
-        )
-        print(f'Good players ({len(good_players)}): loaded from {p.name}')
+            print(f'Player file not found: {p}')
+            return set()
+        return set(line.strip() for line in p.read_text().splitlines()
+                   if line.strip() and not line.strip().startswith('#'))
+
+    good_players = _load_player_list(args.good_players)
+    bad_players = _load_player_list(args.bad_players)
+    if good_players:
+        print(f'Good players ({len(good_players)}): loaded')
+    if bad_players:
+        print(f'Bad players ({len(bad_players)}): loaded')
+
+    use_bh = bool(args.behavioral_stats)
+    if use_bh:
+        from src.hand_history import BEHAVIORAL_STATS_DIM
+        print(f'Behavioral stats: ENABLED (+{BEHAVIORAL_STATS_DIM} dims)')
 
     num_players = 6
     action_size = 5
@@ -690,6 +930,8 @@ def main():
     print(f'  gamma      : {args.gamma}')
     print(f'  tau        : {args.tau}')
     print(f'  temperature: {args.temperature}')
+    print(f'  behavioral : {use_bh}')
+    print(f'  bad players: {len(bad_players)}')
     print('=' * 60)
 
     # ── Collect data ─────────────────────────────────────────────────────
@@ -697,78 +939,104 @@ def main():
     print(f'  COLLECTING TRAINING DATA')
     print(f'{"="*60}')
 
-    transitions = collect_transitions(
-        args.hh_dir, num_players, args.max_hands,
-        good_players, args.no_cache, postflop_only)
+    if args.training_data:
+        # Load pre-built CQL data (skips parsing entirely)
+        print(f'  Loading pre-built data from {args.training_data}...')
+        t0 = time.time()
+        data = np.load(args.training_data)
+        trans_data = {
+            'states': data['states'], 'actions': data['actions'],
+            'rewards': data['rewards'], 'next_states': data['next_states'],
+            'dones': data['dones'], 'legal_masks': data['legal_masks'],
+            'next_legal_masks': data['next_legal_masks'],
+            'streets': data['streets'], 'source_files': [],
+            'obs_size': data['states'].shape[1],
+        }
+        print(f'  Loaded {len(trans_data["actions"])} transitions ({time.time()-t0:.0f}s)')
+    else:
+        transitions = collect_transitions(
+            args.hh_dir, num_players, args.max_hands,
+            good_players, bad_players, args.no_cache, postflop_only,
+            use_behavioral_stats=use_bh, workers=args.workers)
+        trans_data = transitions
 
-    if len(transitions) < 100:
-        print(f'Not enough data: {len(transitions)} transitions.')
+        # Save data if --build-data specified
+        if args.build_data:
+            out = Path(args.build_data)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            print(f'  Saving CQL data to {out}...')
+            np.savez_compressed(str(out),
+                states=trans_data['states'], actions=trans_data['actions'],
+                rewards=trans_data['rewards'], next_states=trans_data['next_states'],
+                dones=trans_data['dones'], legal_masks=trans_data['legal_masks'],
+                next_legal_masks=trans_data['next_legal_masks'],
+                streets=trans_data['streets'])
+            mb = out.stat().st_size / 1e6
+            print(f'  Saved ({mb:.0f} MB). Use --training-data {out} to skip parsing.')
+            if not args.epochs:
+                return  # build-data only mode
+
+    n_trans = len(trans_data['actions'])
+
+    if n_trans < 100:
+        print(f'Not enough data: {n_trans} transitions.')
         sys.exit(1)
 
     # ── Build dataset ────────────────────────────────────────────────────
     print(f'Building CQL dataset...')
-    obs_size = transitions[0]['obs'].shape[0]
-    arrays = build_cql_dataset(transitions, action_size)
+    obs_size = trans_data['obs_size']
+    arrays = build_cql_dataset(trans_data)
     states, actions, rewards, next_states, dones, legal_masks, next_legal_masks, weights = arrays
+    obs_size = states.shape[1]  # may have grown with equity_vs_odds
 
     # Stats
     print(f'  Observation size: {obs_size}')
     print(f'  Total transitions: {len(states)}')
-    print(f'  Reward stats: mean={rewards.mean():.3f}, std={rewards.std():.3f}, '
-          f'min={rewards.min():.1f}, max={rewards.max():.1f}')
-
-    action_counts = defaultdict(int)
-    street_counts = defaultdict(int)
-    for t in transitions:
-        action_counts[t['action']] += 1
-        street_counts[t['street']] += 1
 
     action_names = {0: 'fold', 1: 'call', 2: 'raise_half', 3: 'raise_pot', 4: 'all_in'}
     print(f'  Action distribution:')
     for a in range(action_size):
-        c = action_counts.get(a, 0)
-        print(f'    {action_names[a]:<12} {c:>8}  ({c/len(transitions)*100:.1f}%)')
+        c = int((trans_data['actions'] == a).sum())
+        print(f'    {action_names[a]:<12} {c:>8}  ({c/n_trans*100:.1f}%)')
 
-    # ── File-based train/val split ───────────────────────────────────────
-    file_to_indices = defaultdict(list)
-    for i, t in enumerate(transitions):
-        file_to_indices[t.get('source_file', f'unknown_{i}')].append(i)
+    street_names = {0: 'preflop', 1: 'flop', 2: 'turn', 3: 'river'}
+    print(f'  Street distribution:')
+    for s in range(4):
+        c = int((trans_data['streets'] == s).sum())
+        if c > 0:
+            print(f'    {street_names[s]:<12} {c:>8}  ({c/n_trans*100:.1f}%)')
 
-    unique_files = sorted(file_to_indices.keys())
+    # ── Random train/val split (fast, no file-based grouping needed) ────
+    print(f'  Splitting train/val...')
+    n = len(states)
     rng = np.random.RandomState(42)
-    rng.shuffle(unique_files)
+    perm = rng.permutation(n)
+    val_n = int(n * args.val_split)
+    val_idx = perm[:val_n]
+    train_idx = perm[val_n:]
 
-    val_target = int(len(states) * args.val_split)
-    val_indices, train_indices = [], []
-    val_count = 0
-    for f in unique_files:
-        idxs = file_to_indices[f]
-        if val_count < val_target:
-            val_indices.extend(idxs)
-            val_count += len(idxs)
-        else:
-            train_indices.extend(idxs)
+    # Convert to tensors and use DataLoader with pin_memory
+    print(f'  Converting to tensors...')
+    t_gpu = time.time()
 
-    train_idx = np.array(train_indices)
-    val_idx = np.array(val_indices)
+    train_dataset = _IndexedReplayDataset(
+        states, actions, rewards, next_states, dones,
+        legal_masks, next_legal_masks, weights, train_idx)
+    val_dataset = _IndexedReplayDataset(
+        states, actions, rewards, next_states, dones,
+        legal_masks, next_legal_masks, weights, val_idx)
 
-    train_dataset = OfflineReplayDataset(
-        states[train_idx], actions[train_idx], rewards[train_idx],
-        next_states[train_idx], dones[train_idx],
-        legal_masks[train_idx], next_legal_masks[train_idx], weights[train_idx])
-    val_dataset = OfflineReplayDataset(
-        states[val_idx], actions[val_idx], rewards[val_idx],
-        next_states[val_idx], dones[val_idx],
-        legal_masks[val_idx], next_legal_masks[val_idx], weights[val_idx])
+    train_n = len(train_idx)
+    val_n_count = len(val_idx)
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
-                              shuffle=True, num_workers=8, pin_memory=True,
-                              persistent_workers=True)
+                              shuffle=True, num_workers=24, pin_memory=True,
+                              persistent_workers=True, prefetch_factor=4)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size,
-                            shuffle=False, num_workers=8, pin_memory=True,
-                            persistent_workers=True)
+                            shuffle=False, num_workers=24, pin_memory=True,
+                            persistent_workers=True, prefetch_factor=4)
 
-    print(f'  Train: {len(train_idx)}, Val: {len(val_idx)}')
+    print(f'  Train: {train_n}, Val: {val_n_count}')
 
     # ── Model ────────────────────────────────────────────────────────────
     q_net = QNetwork(obs_size, action_size, hidden_layers, args.dropout).to(device)
@@ -784,6 +1052,24 @@ def main():
         optimizer, T_max=args.epochs, eta_min=args.lr * 0.01)
     scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
 
+    start_epoch = 0
+    best_val_loss = float('inf')
+    best_epoch = 0
+
+    # Resume from checkpoint
+    if args.resume:
+        resume_ckpt = torch.load(args.resume, map_location=device)
+        q_net.load_state_dict(resume_ckpt['model_state_dict'])
+        if 'target_state_dict' in resume_ckpt:
+            q_target.load_state_dict(resume_ckpt['target_state_dict'])
+        else:
+            q_target.load_state_dict(resume_ckpt['model_state_dict'])
+        start_epoch = resume_ckpt.get('epoch', 0)
+        print(f'  Resumed from {args.resume} (epoch {start_epoch})')
+        # Step scheduler to correct position
+        for _ in range(start_epoch):
+            scheduler.step()
+
     # Validation engine + preflop ranges
     engine = _make_engine(num_players)
     from src.preflop_ranges import PreflopRanges
@@ -795,15 +1081,13 @@ def main():
     print(f'  TRAINING CQL')
     print(f'{"="*60}')
 
-    best_val_loss = float('inf')
-    best_epoch = 0
     patience = 30
     patience_counter = 0
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch + 1, args.epochs + 1):
         t0 = time.time()
 
         train_metrics = cql_train_epoch(
@@ -841,6 +1125,7 @@ def main():
                 'gamma': args.gamma,
                 'temperature': args.temperature,
                 'model_type': 'cql',
+                'behavioral_stats': use_bh,
             }
             torch.save(save_dict, str(output_path))
         else:

@@ -1,0 +1,21 @@
+{
+  "data": {
+    "hh_dir": "data/poker_archive/",
+    "num_players": 6,
+    "workers": 47
+  },
+  "train": {
+    "device": "cuda",
+    "hidden_layers": [512, 512, 512, 256],
+    "epochs": 300,
+    "lr": 0.0003,
+    "batch_size": 65536,
+    "dropout": 0.1,
+    "alpha_cql": 0.15,
+    "gamma": 0.99,
+    "tau": 0.005,
+    "temperature": 1.0,
+    "behavioral_stats": true,
+    "output": "models/cql_6p_v4.pt"
+  }
+}
