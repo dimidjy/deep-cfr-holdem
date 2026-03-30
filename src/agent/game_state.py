@@ -8,6 +8,7 @@ ACTION_CALL = 1
 ACTION_RAISE_HALF = 2
 ACTION_RAISE_POT = 3
 ACTION_ALL_IN = 4
+ACTION_RAISE_MIN = 5
 
 ACTION_NAMES = {
     ACTION_FOLD: 'Fold',
@@ -15,9 +16,10 @@ ACTION_NAMES = {
     ACTION_RAISE_HALF: 'Raise Half Pot',
     ACTION_RAISE_POT: 'Raise Pot',
     ACTION_ALL_IN: 'All-In',
+    ACTION_RAISE_MIN: 'Raise Min',
 }
 
-NUM_ACTIONS = 5
+NUM_ACTIONS = 6
 
 
 @dataclass

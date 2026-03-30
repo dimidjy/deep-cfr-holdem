@@ -701,7 +701,7 @@ class ObservationBuilder:
             for _ in range(n_opponents):
                 opp = [available[idx], available[idx + 1]]
                 idx += 2
-                if _eval7.evaluate(opp + full_board) < my_score:
+                if _eval7.evaluate(opp + full_board) > my_score:  # higher = better in eval7
                     beat_all = False
                     break
             if beat_all:

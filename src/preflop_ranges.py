@@ -33,6 +33,7 @@ CALL = 1
 RAISE_HALF = 2
 RAISE_POT = 3
 ALL_IN = 4
+RAISE_MIN = 5  # min raise — min raise (2BB)
 
 _RANK_ORDER = '23456789TJQKA'
 
@@ -135,7 +136,7 @@ class PreflopRanges:
 
     def get_strategy(self, hole_cards: List[str], rel_pos: int,
                      pot_bb: float, legal_actions: List[int],
-                     action_size: int = 5) -> np.ndarray:
+                     action_size: int = 6) -> np.ndarray:
         """Get a strategy vector (probability distribution over actions).
 
         Returns a near-deterministic strategy based on the range chart.
@@ -171,10 +172,34 @@ class PreflopRanges:
 
     def _rfi_decision(self, combo: str, pos_key: str,
                       legal_actions: List[int]) -> int:
-        """RFI (raise first in) — no raise before us."""
+        """RFI (raise first in) — no raise before us.
+
+        Sizing logic:
+        - 3bet-range hands (premium): 80% pot raise, 20% min raise (2BB)
+        - Other RFI hands: 80% min raise (2BB), 20% pot raise
+        Min raise uses RAISE_MIN (action 5) = min raise.
+        """
         rfi_range = self.ranges.get('rfi', {}).get(pos_key, {})
         if _is_in_range(combo, rfi_range):
-            return self._best_raise(legal_actions)
+            # Check if hand is also in 3bet range (premium)
+            key_3b = f'{pos_key}_3b'
+            range_3b = self.ranges.get('3b', {}).get(key_3b, {})
+            is_premium = _is_in_range(combo, range_3b)
+
+            rng = np.random.random()
+            if is_premium:
+                # 80% pot, 20% min raise
+                action = RAISE_POT if rng < 0.8 else RAISE_MIN
+            else:
+                # 80% min raise, 20% pot
+                action = RAISE_MIN if rng < 0.8 else RAISE_POT
+
+            # Fall back if chosen raise not in legal actions
+            if action not in legal_actions:
+                for fallback in [RAISE_MIN, RAISE_HALF, RAISE_POT, CALL]:
+                    if fallback != action and fallback in legal_actions:
+                        return fallback
+            return action
 
         # SB defense: complete instead of fold
         if pos_key == 'SB':
