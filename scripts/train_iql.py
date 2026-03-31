@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import argparse
 import copy
+import math
 import time
 import json
 import numpy as np
@@ -223,7 +224,10 @@ def main():
     parser.add_argument('--no-cache', action='store_true')
     parser.add_argument('--workers', type=int, default=0)
     parser.add_argument('--behavioral-stats', action='store_true')
-    parser.add_argument('--training-data', type=str, default='')
+    parser.add_argument('--training-data', type=str, default='',
+                        help='Pre-built data (.npz from CQL --build-data). Skips parsing.')
+    parser.add_argument('--build-data', type=str, default='',
+                        help='Save parsed transitions to .npz file.')
 
     # IQL hyperparameters
     parser.add_argument('--expectile', type=float, default=0.7,
@@ -293,6 +297,24 @@ def main():
     print(f'  behavioral: {use_bh}')
     print('=' * 60)
 
+    # ── Load player lists ──
+    def _load_player_list(path):
+        if not path or not Path(path).exists():
+            return set()
+        names = set()
+        for line in open(path):
+            line = line.strip()
+            if line and not line.startswith('#'):
+                names.add(line)
+        return names
+
+    good_players = _load_player_list(args.good_players)
+    bad_players = _load_player_list(args.bad_players)
+    if good_players:
+        print(f'Good players ({len(good_players)}): loaded')
+    if bad_players:
+        print(f'Bad players ({len(bad_players)}): loaded')
+
     # ── Collect data (reuses CQL infrastructure) ──
     print(f'\n{"="*60}')
     print(f'  COLLECTING TRAINING DATA')
@@ -300,6 +322,7 @@ def main():
 
     if args.training_data:
         print(f'  Loading pre-built data from {args.training_data}...')
+        t0 = time.time()
         data = np.load(args.training_data)
         trans_data = {
             'states': data['states'], 'actions': data['actions'],
@@ -309,11 +332,28 @@ def main():
             'streets': data['streets'], 'source_files': [],
             'obs_size': data['states'].shape[1],
         }
+        print(f'  Loaded {len(trans_data["actions"])} transitions ({time.time()-t0:.0f}s)')
     else:
         trans_data = collect_transitions(
             args.hh_dir, num_players, args.max_hands,
-            set(), set(), args.no_cache, postflop_only,
+            good_players, bad_players, args.no_cache, postflop_only,
             use_behavioral_stats=use_bh, workers=args.workers)
+
+        # Save data if --build-data specified
+        if args.build_data:
+            out = Path(args.build_data)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            print(f'  Saving data to {out}...')
+            np.savez_compressed(str(out),
+                states=trans_data['states'], actions=trans_data['actions'],
+                rewards=trans_data['rewards'], next_states=trans_data['next_states'],
+                dones=trans_data['dones'], legal_masks=trans_data['legal_masks'],
+                next_legal_masks=trans_data['next_legal_masks'],
+                streets=trans_data['streets'])
+            mb = out.stat().st_size / 1e6
+            print(f'  Saved ({mb:.0f} MB). Use --training-data {out} to skip parsing.')
+            if not args.epochs:
+                return
 
     n_trans = len(trans_data['actions'])
     print(f'  Transitions: {n_trans}')

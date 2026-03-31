@@ -80,13 +80,14 @@ class CQLModelWrapper:
     """Wraps a QNetwork to mimic the DeepCFR interface for run_validation."""
 
     def __init__(self, q_net, obs_size, action_size, num_players, device,
-                 iteration=0, temperature=1.0):
+                 iteration=0, temperature=1.0, exclude_fold=False):
         self.action_size = action_size
         self.num_players = num_players
         self.obs_size = obs_size
         self.device = torch.device(device)
         self.iteration = iteration
         self.temperature = temperature
+        self.exclude_fold = exclude_fold
 
         # Wrap Q-net as a StrategyNetwork-like object for validation
         self.q_net = q_net
@@ -115,7 +116,8 @@ class CQLModelWrapper:
 
         # Standard 5-action softmax
         masked = np.full(self.action_size, -1e9, dtype=np.float32)
-        for a in legal_actions:
+        effective_legal = [a for a in legal_actions if not (self.exclude_fold and a == 0)] or [1]
+        for a in effective_legal:
             masked[a] = q_values[a] / self.temperature
         masked -= masked.max()
         exp_s = np.exp(masked)
@@ -436,15 +438,13 @@ def _parse_single_file(file_path):
                         continue
 
                     # Create fold when equity is below what's needed to call
-                    # No margin — if equity < needed, folding is mathematically correct
                     if equity < equity_needed:
                         fake_dp = copy.copy(dp)
                         fake_dp.actual_action = 0
                         file_results.append((hand.hand_id,
                                              player_name + '_sf',
                                              [fake_dp], fold_net))
-                    # Also fold when loss is large (>5 BB saved) even if equity was borderline
-                    # Pair or worse that lost big = should have folded
+                    # Also fold when loss is large (>5 BB saved)
                     elif saved_bb >= 5.0 and made_hand < 0.20:
                         fake_dp = copy.copy(dp)
                         fake_dp.actual_action = 0
@@ -625,8 +625,11 @@ def collect_transitions(hh_dir, num_players, max_hands, good_players,
     }
 
 
-def build_cql_dataset(trans_data):
-    """Process pre-built arrays: add equity_vs_odds, scale rewards, compute weights."""
+def build_cql_dataset(trans_data, spot_filter=None):
+    """Process pre-built arrays: add equity_vs_odds, scale rewards, compute weights.
+
+    spot_filter: None (all), 'facing_bet' (call_amount > 0), 'checked_to' (call_amount == 0)
+    """
     states = trans_data['states']
     actions = trans_data['actions']
     rewards = trans_data['rewards'].astype(np.float32).copy()
@@ -635,6 +638,39 @@ def build_cql_dataset(trans_data):
     legal_masks = trans_data['legal_masks']
     next_legal_masks = trans_data['next_legal_masks']
     streets = trans_data['streets']
+
+    # ── Filter by spot type if requested ──
+    if spot_filter and states.shape[1] > 10:
+        # obs[10] = pot_odds = pot/(pot+call). pot_odds > 0 means facing a bet.
+        pot_odds = states[:, 10]
+        if spot_filter == 'facing_bet':
+            mask = pot_odds > 0.001
+        elif spot_filter == 'checked_to':
+            mask = pot_odds <= 0.001
+        else:
+            mask = np.ones(len(states), dtype=bool)
+
+        n_before = len(states)
+        states = states[mask]
+        actions = actions[mask]
+        rewards = rewards[mask]
+        next_states = next_states[mask]
+        dones = dones[mask]
+        legal_masks = legal_masks[mask]
+        next_legal_masks = next_legal_masks[mask]
+        streets = streets[mask]
+        print(f'  Spot filter [{spot_filter}]: {n_before:,} → {len(states):,} '
+              f'({100*len(states)/n_before:.1f}%)')
+
+        # For checked_to: mask out fold action (folding when checked to is never correct)
+        # Keep all transitions but remap fold actions to check (action 1)
+        # and remove fold from legal masks so CQL never considers it
+        if spot_filter == 'checked_to':
+            n_folds = (actions == 0).sum()
+            actions[actions == 0] = 1  # remap fold → check
+            legal_masks[:, 0] = 0.0
+            next_legal_masks[:, 0] = 0.0
+            print(f'  Remapped {n_folds:,} fold→check, removed fold from legal masks')
 
     # Street weights (vectorized)
     street_w = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
@@ -654,6 +690,202 @@ def build_cql_dataset(trans_data):
     rewards /= 10.0
     print(f'  Reward stats (scaled): mean={rewards.mean():.3f}, std={rewards.std():.3f}, '
           f'min={rewards.min():.1f}, max={rewards.max():.1f}')
+
+    # ── Oversample folds to balance action distribution ──────────────
+    # Showdown data is heavily biased toward calls. Oversample folds,
+    # with extra weight on AIR folds (which are most underrepresented).
+    fold_mask = actions == 0
+    n_folds = fold_mask.sum()
+    n_total = len(actions)
+
+    if spot_filter == 'facing_bet':
+        target_fold_pct = 0.45
+    else:
+        target_fold_pct = 0.167
+    target_folds = int(target_fold_pct / (1.0 - target_fold_pct) * (n_total - n_folds))
+    extra_folds = max(0, target_folds - n_folds)
+
+    # For facing_bet: balance folds by hand strength.
+    # Problem: too many pair/overpair folds → model folds strong hands.
+    #          too few air folds → model calls with nothing.
+    # Fix: downsample pair folds, oversample air folds.
+    #
+    # Tuning knobs (adjust these to fix specific issues):
+    _FOLD_KEEP_AIR = 1.0       # keep 100% of air folds (no pair/draw)
+    _FOLD_KEEP_DRAW = 0.8      # keep 80% of draw folds (flush/straight draw)
+    _FOLD_KEEP_PAIR = 0.4      # keep 40% of one-pair folds (reduces overpair/TP fold)
+    _FOLD_KEEP_STRONG = 0.1    # keep 10% of two pair+ folds
+    _FOLD_OVERSAMPLE_AIR = 4.0 # oversample air folds 4x vs pair folds
+
+    if spot_filter == 'facing_bet' and n_folds > 0:
+        fold_indices = np.where(fold_mask)[0]
+        made_hand = states[:, 19] if states.shape[1] > 19 else np.zeros(len(states))
+        has_draw = np.zeros(len(states), dtype=bool)
+        if states.shape[1] > 21:
+            has_draw = (states[:, 20] > 0.5) | (states[:, 21] > 0.5)
+
+        # Step 1: Downsample problematic folds
+        rng_ds = np.random.RandomState(789)
+        keep_mask = np.ones(len(states), dtype=bool)
+        n_removed = {'air': 0, 'draw': 0, 'pair': 0, 'strong': 0}
+
+        for idx in fold_indices:
+            mh = made_hand[idx]
+            draw = has_draw[idx]
+            if mh < 0.01 and not draw:
+                keep = rng_ds.random() < _FOLD_KEEP_AIR
+                if not keep: n_removed['air'] += 1
+            elif mh < 0.01 and draw:
+                keep = rng_ds.random() < _FOLD_KEEP_DRAW
+                if not keep: n_removed['draw'] += 1
+            elif mh < 0.25:
+                keep = rng_ds.random() < _FOLD_KEEP_PAIR
+                if not keep: n_removed['pair'] += 1
+            else:
+                keep = rng_ds.random() < _FOLD_KEEP_STRONG
+                if not keep: n_removed['strong'] += 1
+            keep_mask[idx] = keep
+
+        states = states[keep_mask]
+        actions = actions[keep_mask]
+        rewards = rewards[keep_mask]
+        next_states = next_states[keep_mask]
+        dones = dones[keep_mask]
+        legal_masks = legal_masks[keep_mask]
+        next_legal_masks = next_legal_masks[keep_mask]
+        weights = weights[keep_mask]
+
+        print(f'  Fold downsample: removed pair={n_removed["pair"]} '
+              f'draw={n_removed["draw"]} strong={n_removed["strong"]} '
+              f'air={n_removed["air"]}')
+
+        # Recalculate fold stats after downsample
+        fold_mask = actions == 0
+        n_folds = fold_mask.sum()
+        n_total = len(actions)
+
+        # Step 2: Oversample remaining folds (mostly air now)
+        target_folds = int(target_fold_pct / (1.0 - target_fold_pct) * (n_total - n_folds))
+        extra_folds = max(0, target_folds - n_folds)
+
+        if extra_folds > 0:
+            fold_indices = np.where(fold_mask)[0]
+            made_hand = states[:, 19] if states.shape[1] > 19 else np.zeros(len(states))
+
+            # Weight: air folds get heavy oversample
+            weights_os = np.zeros(len(fold_indices), dtype=np.float64)
+            for i, fi in enumerate(fold_indices):
+                mh = made_hand[fi]
+                if mh < 0.01:
+                    weights_os[i] = _FOLD_OVERSAMPLE_AIR
+                elif mh < 0.25:
+                    weights_os[i] = 1.0
+                else:
+                    weights_os[i] = 0.1
+            weights_os /= weights_os.sum()
+
+            rng_os = np.random.RandomState(123)
+            oversample_idx = rng_os.choice(fold_indices, size=extra_folds,
+                                            replace=True, p=weights_os)
+
+            n_air_os = (made_hand[oversample_idx] < 0.01).sum()
+            n_pair_os = ((made_hand[oversample_idx] >= 0.01) &
+                         (made_hand[oversample_idx] < 0.25)).sum()
+            print(f'  Fold oversample: air={n_air_os} pair={n_pair_os} '
+                  f'strong={extra_folds - n_air_os - n_pair_os}')
+
+            states = np.concatenate([states, states[oversample_idx]], axis=0)
+            actions = np.concatenate([actions, actions[oversample_idx]])
+            rewards = np.concatenate([rewards, rewards[oversample_idx]])
+            next_states = np.concatenate([next_states, next_states[oversample_idx]], axis=0)
+            dones = np.concatenate([dones, dones[oversample_idx]])
+            legal_masks = np.concatenate([legal_masks, legal_masks[oversample_idx]], axis=0)
+            next_legal_masks = np.concatenate([next_legal_masks, next_legal_masks[oversample_idx]], axis=0)
+            weights = np.concatenate([weights, weights[oversample_idx]])
+
+        new_fold_pct = (actions == 0).sum() / len(actions)
+        print(f'  Fold final: {(actions==0).sum()}/{len(actions)} ({100*new_fold_pct:.1f}%)')
+        extra_folds = 0  # already done
+
+    # Skip fold oversampling for checked_to spots — oversample raises instead
+    if spot_filter == 'checked_to':
+        extra_folds = 0
+        # Good players bet/raise 36% when checked to, data has ~27%.
+        # Oversample raises weighted by hand strength:
+        # Strong hands should bet more, air bets (bluffs) less.
+        #
+        # Tuning knobs:
+        _RAISE_OS_STRONG = 4.0   # trips+: heavy oversample (should bet ~70%)
+        _RAISE_OS_TWO_PAIR = 3.0 # two pair: strong oversample
+        _RAISE_OS_PAIR = 2.0     # one pair: moderate (value bet sometimes)
+        _RAISE_OS_DRAW = 1.5     # draws: semi-bluff sometimes
+        _RAISE_OS_AIR = 0.5      # air: bluff rarely
+
+        raise_mask = (actions >= 2)
+        n_raises = raise_mask.sum()
+        target_raise_pct = 0.36
+        target_raises = int(target_raise_pct / (1.0 - target_raise_pct) * (n_total - n_raises))
+        extra_raises = max(0, target_raises - n_raises)
+        if extra_raises > 0 and n_raises > 0:
+            raise_indices = np.where(raise_mask)[0]
+            made_hand = states[:, 19] if states.shape[1] > 19 else np.zeros(len(states))
+            has_draw = np.zeros(len(states), dtype=bool)
+            if states.shape[1] > 21:
+                has_draw = (states[:, 20] > 0.5) | (states[:, 21] > 0.5)
+
+            weights_rs = np.zeros(len(raise_indices), dtype=np.float64)
+            for i, ri in enumerate(raise_indices):
+                mh = made_hand[ri]
+                if mh >= 0.375:
+                    weights_rs[i] = _RAISE_OS_STRONG
+                elif mh >= 0.25:
+                    weights_rs[i] = _RAISE_OS_TWO_PAIR
+                elif mh >= 0.01:
+                    weights_rs[i] = _RAISE_OS_PAIR
+                elif has_draw[ri]:
+                    weights_rs[i] = _RAISE_OS_DRAW
+                else:
+                    weights_rs[i] = _RAISE_OS_AIR
+            weights_rs /= weights_rs.sum()
+
+            rng_rs = np.random.RandomState(456)
+            raise_os_idx = rng_rs.choice(raise_indices, size=extra_raises,
+                                          replace=True, p=weights_rs)
+            n_strong = (made_hand[raise_os_idx] >= 0.375).sum()
+            n_pair = ((made_hand[raise_os_idx] >= 0.01) &
+                      (made_hand[raise_os_idx] < 0.25)).sum()
+            print(f'  Raise oversample: strong={n_strong} pair={n_pair} '
+                  f'air={extra_raises - n_strong - n_pair}')
+            states = np.concatenate([states, states[raise_os_idx]], axis=0)
+            actions = np.concatenate([actions, actions[raise_os_idx]])
+            rewards = np.concatenate([rewards, rewards[raise_os_idx]])
+            next_states = np.concatenate([next_states, next_states[raise_os_idx]], axis=0)
+            dones = np.concatenate([dones, dones[raise_os_idx]])
+            legal_masks = np.concatenate([legal_masks, legal_masks[raise_os_idx]], axis=0)
+            next_legal_masks = np.concatenate([next_legal_masks, next_legal_masks[raise_os_idx]], axis=0)
+            weights = np.concatenate([weights, weights[raise_os_idx]])
+            new_raise_pct = (actions >= 2).sum() / len(actions)
+            print(f'  Raise oversampling: {n_raises} → {(actions>=2).sum()} '
+                  f'({100*n_raises/n_total:.1f}% → {100*new_raise_pct:.1f}%)')
+
+    if extra_folds > 0 and n_folds > 0:
+        fold_indices = np.where(fold_mask)[0]
+        # Sample with replacement from existing folds
+        rng_os = np.random.RandomState(123)
+        oversample_idx = rng_os.choice(fold_indices, size=extra_folds, replace=True)
+
+        states = np.concatenate([states, states[oversample_idx]], axis=0)
+        actions = np.concatenate([actions, actions[oversample_idx]])
+        rewards = np.concatenate([rewards, rewards[oversample_idx]])
+        next_states = np.concatenate([next_states, next_states[oversample_idx]], axis=0)
+        dones = np.concatenate([dones, dones[oversample_idx]])
+        legal_masks = np.concatenate([legal_masks, legal_masks[oversample_idx]], axis=0)
+        next_legal_masks = np.concatenate([next_legal_masks, next_legal_masks[oversample_idx]], axis=0)
+        weights = np.concatenate([weights, weights[oversample_idx]])
+
+        new_fold_pct = (actions == 0).sum() / len(actions)
+        print(f'  Fold oversampling: {n_folds} → {(actions==0).sum()} '
+              f'({100*n_folds/n_total:.1f}% → {100*new_fold_pct:.1f}%)')
 
     return states, actions, rewards, next_states, dones, legal_masks, next_legal_masks, weights
 
@@ -770,10 +1002,21 @@ def cql_eval_epoch(q_net, q_target, dataloader, device, alpha_cql=1.0, gamma=0.9
 
             loss = td_loss + alpha_cql * cql_loss
 
-        # "Accuracy" = model's best action matches actual action
+        # Smart accuracy: reward-aware
+        # - Fold actions: always match (folds have negative reward by
+        #   definition since you lose invested chips, but they're correct)
+        # - Non-fold with reward >= 0: matching = correct (winning action)
+        # - Non-fold with reward < -0.5 (lost >5BB): NOT matching = correct
+        #   (model should deviate from bad calls/raises that lost big)
+        # - Non-fold with small loss (>-0.5): matching = correct (marginal)
         q_masked = q_values + (1.0 - legal) * (-1e9)
         preds = q_masked.argmax(dim=-1)
-        correct += (preds == acts).sum().item()
+        matches = (preds == acts)
+        is_fold = (acts == 0)
+        big_loss = (rews < -0.5) & ~is_fold  # lost >5BB, not a fold
+        # Correct = match folds + match non-big-loss + deviate from big loss
+        correct += (matches & ~big_loss).sum().item()
+        correct += (~matches & big_loss).sum().item()
 
         bs = obs.size(0)
         total_td_loss += td_loss.item() * bs
@@ -822,6 +1065,9 @@ def main():
     parser.add_argument('--build-data', type=str, default='',
                         help='Build CQL data and save to this path, then exit. '
                              'Use with --training-data to skip parsing on next run.')
+    parser.add_argument('--spot-filter', type=str, default='',
+                        choices=['', 'facing_bet', 'checked_to'],
+                        help='Train only on specific spot type: facing_bet or checked_to')
 
     # CQL hyperparameters
     parser.add_argument('--alpha-cql', type=float, default=0.4,
@@ -985,7 +1231,7 @@ def main():
     # ── Build dataset ────────────────────────────────────────────────────
     print(f'Building CQL dataset...')
     obs_size = trans_data['obs_size']
-    arrays = build_cql_dataset(trans_data)
+    arrays = build_cql_dataset(trans_data, spot_filter=args.spot_filter or None)
     states, actions, rewards, next_states, dones, legal_masks, next_legal_masks, weights = arrays
     obs_size = states.shape[1]  # may have grown with equity_vs_odds
 
@@ -1053,7 +1299,8 @@ def main():
     scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
 
     start_epoch = 0
-    best_val_loss = float('inf')
+    best_val_loss = 0.0  # tracks best val_acc (higher = better)
+    _val_acc_history = []  # smoothing window for noisy val_acc
     best_epoch = 0
 
     # Resume from checkpoint
@@ -1081,33 +1328,48 @@ def main():
     print(f'  TRAINING CQL')
     print(f'{"="*60}')
 
-    patience = 30
+    patience = 50
     patience_counter = 0
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # ── Random alpha: sample from range each epoch ──
+    # Different conservatism each epoch explores the alpha space naturally.
+    # The best checkpoint (by val_acc) selects the effective best alpha.
+    _ALPHA_MIN = 0.33
+    _ALPHA_MAX = 0.43
+    _alpha_rng = np.random.RandomState(42)
+    print(f'  Alpha range: [{_ALPHA_MIN:.2f}, {_ALPHA_MAX:.2f}] (random per epoch)')
+
     for epoch in range(start_epoch + 1, args.epochs + 1):
         t0 = time.time()
 
+        current_alpha = round(_alpha_rng.uniform(_ALPHA_MIN, _ALPHA_MAX), 3)
+
         train_metrics = cql_train_epoch(
             q_net, q_target, train_loader, optimizer, device, scaler,
-            args.alpha_cql, args.gamma)
+            current_alpha, args.gamma)
 
         # Soft update target network
         soft_update(q_target, q_net, args.tau)
 
         val_metrics = cql_eval_epoch(
-            q_net, q_target, val_loader, device, args.alpha_cql, args.gamma)
+            q_net, q_target, val_loader, device, current_alpha, args.gamma)
 
         scheduler.step()
         lr = optimizer.param_groups[0]['lr']
         elapsed = time.time() - t0
 
-        # Track best
+        # Track best (use smoothed val_acc to reduce noise from random alpha)
         improved = ''
-        if val_metrics['total_loss'] < best_val_loss:
-            best_val_loss = val_metrics['total_loss']
+        val_acc = val_metrics['accuracy']
+        _val_acc_history.append(val_acc)
+        # Use average of last 5 epochs as the smoothed metric
+        _smooth_window = min(5, len(_val_acc_history))
+        smoothed_acc = sum(_val_acc_history[-_smooth_window:]) / _smooth_window
+        if smoothed_acc > best_val_loss:
+            best_val_loss = smoothed_acc
             best_epoch = epoch
             patience_counter = 0
             improved = ' *best*'
@@ -1121,7 +1383,7 @@ def main():
                 'dropout': args.dropout,
                 'num_players': num_players,
                 'epoch': epoch,
-                'alpha_cql': args.alpha_cql,
+                'alpha_cql': current_alpha,
                 'gamma': args.gamma,
                 'temperature': args.temperature,
                 'model_type': 'cql',
@@ -1136,14 +1398,16 @@ def main():
               f'cql={train_metrics["cql_loss"]:.4f}  '
               f'Q={train_metrics["q_mean"]:.3f}  '
               f'val_td={val_metrics["td_loss"]:.4f}  '
-              f'val_acc={val_metrics["accuracy"]:.1%}  '
-              f'lr={lr:.6f}  {elapsed:.1f}s{improved}')
+              f'val_acc={val_acc:.1%}({smoothed_acc:.1%})  '
+              f'α={current_alpha:.3f}  lr={lr:.6f}  {elapsed:.1f}s{improved}')
 
         # Spot validation
         if args.val_interval > 0 and epoch % args.val_interval == 0:
+            _excl_fold = (args.spot_filter == 'checked_to')
             wrapper = CQLModelWrapper(
                 q_net, obs_size, action_size, num_players, device,
-                iteration=epoch, temperature=args.temperature)
+                iteration=epoch, temperature=args.temperature,
+                exclude_fold=_excl_fold)
             val_results = run_validation(wrapper, engine, num_games=args.val_games,
                                         verbose=False, preflop_ranges=preflop_ranges)
             print(f'  {validation_summary_line(val_results)}')
@@ -1155,9 +1419,11 @@ def main():
     # ── Final validation ─────────────────────────────────────────────────
     best_ckpt = torch.load(str(output_path), map_location=device)
     q_net.load_state_dict(best_ckpt['model_state_dict'])
+    _excl_fold = (args.spot_filter == 'checked_to')
     wrapper = CQLModelWrapper(
         q_net, obs_size, action_size, num_players, device,
-        iteration=best_epoch, temperature=args.temperature)
+        iteration=best_epoch, temperature=args.temperature,
+        exclude_fold=_excl_fold)
     final_results = run_validation(wrapper, engine, num_games=args.val_games,
                                    verbose=False, preflop_ranges=preflop_ranges)
 

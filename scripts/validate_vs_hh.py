@@ -1245,8 +1245,12 @@ def main():
     parser = argparse.ArgumentParser(
         description='Validate Deep CFR model against real NL5 hand histories'
     )
-    parser.add_argument('--model', type=str, required=True,
-                        help='Path to .pt checkpoint file')
+    parser.add_argument('--model', type=str, default='',
+                        help='Path to .pt checkpoint file (single model)')
+    parser.add_argument('--model-facing-bet', type=str, default='',
+                        help='Split model: facing bet situations')
+    parser.add_argument('--model-checked-to', type=str, default='',
+                        help='Split model: checked to situations')
     parser.add_argument('--hh-dir', type=str,
                         default='data/poker_archive/',
                         help='Directory with PokerStars HH files')
@@ -1283,25 +1287,68 @@ def main():
                         help='Path to bad players list (for split metrics)')
     args = parser.parse_args()
 
-    model_path = Path(args.model)
-    if not model_path.exists():
-        print(f'Model not found: {model_path}')
+    # ── Split model mode ──
+    if args.model_facing_bet and args.model_checked_to:
+        from train_cql import QNetwork, CQLModelWrapper
+
+        def _load_split(path, exclude_fold=False):
+            cp = torch.load(path, map_location='cpu')
+            q_net = QNetwork(cp['obs_size'], cp['action_size'],
+                             cp['hidden_layers'], cp['dropout'])
+            q_net.load_state_dict(cp['model_state_dict'])
+            q_net.eval()
+            return CQLModelWrapper(
+                q_net, cp['obs_size'], cp['action_size'], 6, 'cpu',
+                iteration=cp.get('epoch', 0),
+                temperature=cp.get('temperature', 1.0),
+                exclude_fold=exclude_fold), cp
+
+        fb_model, fb_cp = _load_split(args.model_facing_bet)
+        ct_model, ct_cp = _load_split(args.model_checked_to, exclude_fold=True)
+
+        class _SplitModelWrapper:
+            def __init__(self, fb, ct):
+                self.fb, self.ct = fb, ct
+                self.iteration = max(fb.iteration, ct.iteration)
+                self.obs_size = fb.obs_size
+                self.action_size = fb.action_size
+                self.num_players = fb.num_players
+                self.strategy_networks = fb.strategy_networks
+                self.advantage_networks = fb.advantage_networks
+            def get_strategy(self, obs, pidx, legal):
+                pot_odds = obs[10] if len(obs) > 10 else 0
+                if pot_odds > 0.001:
+                    return self.fb.get_strategy(obs, pidx, legal)
+                else:
+                    cl = [a for a in legal if a != 0] or [1]
+                    return self.ct.get_strategy(obs, pidx, cl)
+
+        deep_cfr = _SplitModelWrapper(fb_model, ct_model)
+        num_players = 6
+        legacy = False
+        args.behavioral_stats = True
+        print(f'Split model: facing_bet(e{fb_cp["epoch"]}) + checked_to(e{ct_cp["epoch"]})')
+
+    elif not args.model:
+        print('Error: --model or (--model-facing-bet + --model-checked-to) required')
         sys.exit(1)
+
+    else:
+        model_path = Path(args.model)
+        if not model_path.exists():
+            print(f'Model not found: {model_path}')
+            sys.exit(1)
 
     hh_dir = Path(args.hh_dir)
     if not hh_dir.exists():
         print(f'HH directory not found: {hh_dir}')
         sys.exit(1)
 
-    # Load config and model
-    config_path = Path(__file__).parent.parent / 'configs/training_config.json'
-    config = load_config(str(config_path))
-
-    legacy = args.legacy if hasattr(args, 'legacy') else False
-
-    game_players_override = args.game_players if args.game_players > 0 else 0
-
-    if args.blend:
+    # ── Standard single-model loading (skipped if split model) ──
+    _split_mode = bool(args.model_facing_bet and args.model_checked_to)
+    if _split_mode:
+        pass  # deep_cfr already set above
+    elif args.blend:
         blend_path = Path(args.blend)
         if not blend_path.exists():
             print(f'Blend model not found: {blend_path}')

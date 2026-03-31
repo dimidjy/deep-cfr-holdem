@@ -243,9 +243,13 @@ class ObservationBuilder:
         if total_cards not in (5, 6, 7):
             return np.array([hand_strength, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
 
-        rank_int = _TREYS_EVALUATOR.evaluate(treys_board, treys_hole)
-        rank_class = _TREYS_EVALUATOR.get_rank_class(rank_int)
-        made_hand_cat = (9 - rank_class) / 8.0
+        try:
+            rank_int = _TREYS_EVALUATOR.evaluate(treys_board, treys_hole)
+            rank_class = _TREYS_EVALUATOR.get_rank_class(rank_int)
+            made_hand_cat = (9 - rank_class) / 8.0
+        except (KeyError, Exception):
+            # Duplicate/invalid cards in the snapshot — no valid observation
+            return None
 
         all_ranks = [_rank_val(c[0]) for c in hole_cards[:2]] + \
                     [_rank_val(c[0]) for c in community_cards]
