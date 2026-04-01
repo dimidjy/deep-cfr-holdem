@@ -625,7 +625,7 @@ def collect_transitions(hh_dir, num_players, max_hands, good_players,
     }
 
 
-def build_cql_dataset(trans_data, spot_filter=None):
+def build_cql_dataset(trans_data, spot_filter=None, pot_filter=None):
     """Process pre-built arrays: add equity_vs_odds, scale rewards, compute weights.
 
     spot_filter: None (all), 'facing_bet' (call_amount > 0), 'checked_to' (call_amount == 0)
@@ -662,6 +662,32 @@ def build_cql_dataset(trans_data, spot_filter=None):
         print(f'  Spot filter [{spot_filter}]: {n_before:,} → {len(states):,} '
               f'({100*len(states)/n_before:.1f}%)')
 
+    # ── Filter by pot size (normal vs 3-bet pots) ──
+    if pot_filter and states.shape[1] > 8:
+        # obs[8] = pot_normalized = pot / (6 * 100)
+        # 12BB = 12/600 = 0.02
+        pot_norm = states[:, 8]
+        _3BET_THRESHOLD = 0.02  # 12BB in normalized units
+        if pot_filter == 'normal_pot':
+            mask = pot_norm <= _3BET_THRESHOLD
+        elif pot_filter == '3bet_pot':
+            mask = pot_norm > _3BET_THRESHOLD
+        else:
+            mask = np.ones(len(states), dtype=bool)
+
+        n_before = len(states)
+        states = states[mask]
+        actions = actions[mask]
+        rewards = rewards[mask]
+        next_states = next_states[mask]
+        dones = dones[mask]
+        legal_masks = legal_masks[mask]
+        next_legal_masks = next_legal_masks[mask]
+        streets = streets[mask]
+        print(f'  Pot filter [{pot_filter}]: {n_before:,} → {len(states):,} '
+              f'({100*len(states)/n_before:.1f}%)')
+
+    if spot_filter:
         # For checked_to: mask out fold action (folding when checked to is never correct)
         # Keep all transitions but remap fold actions to check (action 1)
         # and remove fold from legal masks so CQL never considers it
@@ -1068,6 +1094,9 @@ def main():
     parser.add_argument('--spot-filter', type=str, default='',
                         choices=['', 'facing_bet', 'checked_to'],
                         help='Train only on specific spot type: facing_bet or checked_to')
+    parser.add_argument('--pot-filter', type=str, default='',
+                        choices=['', 'normal_pot', '3bet_pot'],
+                        help='Train only on pot size: normal_pot (<=12BB) or 3bet_pot (>12BB)')
 
     # CQL hyperparameters
     parser.add_argument('--alpha-cql', type=float, default=0.4,
@@ -1231,7 +1260,8 @@ def main():
     # ── Build dataset ────────────────────────────────────────────────────
     print(f'Building CQL dataset...')
     obs_size = trans_data['obs_size']
-    arrays = build_cql_dataset(trans_data, spot_filter=args.spot_filter or None)
+    arrays = build_cql_dataset(trans_data, spot_filter=args.spot_filter or None,
+                               pot_filter=args.pot_filter or None)
     states, actions, rewards, next_states, dones, legal_masks, next_legal_masks, weights = arrays
     obs_size = states.shape[1]  # may have grown with equity_vs_odds
 

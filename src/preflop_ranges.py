@@ -101,7 +101,8 @@ class PreflopRanges:
             self.ranges = json.load(f)
 
     def get_action(self, hole_cards: List[str], rel_pos: int,
-                   pot_bb: float, legal_actions: List[int]) -> Optional[int]:
+                   pot_bb: float, legal_actions: List[int],
+                   num_limpers: int = 0, effective_stack: float = 100.0) -> Optional[int]:
         """Determine preflop action from range charts.
 
         Args:
@@ -109,6 +110,8 @@ class PreflopRanges:
             rel_pos: 0=BTN, 1=SB, 2=BB, 3=UTG, 4=MP, 5=CO
             pot_bb: current pot size in big blinds
             legal_actions: list of legal action indices [0,1,2,3,4]
+            num_limpers: number of players who limped before us
+            effective_stack: smallest relevant stack in BB
 
         Returns:
             Action index (0-4), or None if ranges don't cover this situation.
@@ -119,13 +122,17 @@ class PreflopRanges:
         combo = _cards_to_combo(hole_cards[0], hole_cards[1])
         pos_key = self.pos_map.get(rel_pos, 'BTN')
 
-        # Determine scenario based on pot size (in BB)
-        # pot_bb < 4: no raise yet → check RFI range
-        # pot_bb < 18: facing single raise (may include callers) → 3bet / call
-        # pot_bb < 50: facing 3bet → check 4bet / call range
-        # pot_bb >= 50: facing 4bet+ → check all-in range
+        # ── Short stack mode: <25BB → shove or fold with premium ──
+        if effective_stack < 25:
+            return self._short_stack_decision(combo, pos_key, legal_actions,
+                                               effective_stack)
 
+        # Determine scenario based on pot size (in BB)
         if pot_bb < 4:
+            # Check for limpers: if players limped, adjust strategy
+            if num_limpers > 0:
+                return self._facing_limpers_decision(combo, pos_key,
+                                                      legal_actions, num_limpers)
             return self._rfi_decision(combo, pos_key, legal_actions)
         elif pot_bb < 18:
             return self._facing_raise_decision(combo, pos_key, legal_actions)
@@ -136,15 +143,14 @@ class PreflopRanges:
 
     def get_strategy(self, hole_cards: List[str], rel_pos: int,
                      pot_bb: float, legal_actions: List[int],
-                     action_size: int = 6) -> np.ndarray:
-        """Get a strategy vector (probability distribution over actions).
-
-        Returns a near-deterministic strategy based on the range chart.
-        Uses 95% on the chosen action, 5% spread across other legal actions
-        to maintain some exploration.
-        """
+                     action_size: int = 6,
+                     num_limpers: int = 0,
+                     effective_stack: float = 100.0) -> np.ndarray:
+        """Get a strategy vector (probability distribution over actions)."""
         strategy = np.zeros(action_size, dtype=np.float32)
-        action = self.get_action(hole_cards, rel_pos, pot_bb, legal_actions)
+        action = self.get_action(hole_cards, rel_pos, pot_bb, legal_actions,
+                                 num_limpers=num_limpers,
+                                 effective_stack=effective_stack)
 
         if action is None or action not in legal_actions:
             # Fallback: uniform over legal actions
@@ -242,6 +248,108 @@ class PreflopRanges:
         if _is_in_range(combo, call_range):
             if CALL in legal_actions:
                 return CALL
+
+        return FOLD if FOLD in legal_actions else CALL
+
+    def _facing_limpers_decision(self, combo: str, pos_key: str,
+                                 legal_actions: List[int],
+                                 num_limpers: int) -> int:
+        """Facing limpers (callers before us, no raise).
+
+        Strategy vs limpers:
+        - Premium hands: raise bigger (pot-size to punish limpers)
+        - Good hands still in RFI range: raise (iso-raise)
+        - Speculative hands (small pairs, suited connectors): limp behind
+        - Trash: fold
+        """
+        rfi_range = self.ranges.get('rfi', {}).get(pos_key, {})
+        key_3b = f'{pos_key}_3b'
+        range_3b = self.ranges.get('3b', {}).get(key_3b, {})
+        is_premium = _is_in_range(combo, range_3b)
+
+        if is_premium:
+            # Premium vs limpers: always pot-raise (punish the limpers)
+            if RAISE_POT in legal_actions:
+                return RAISE_POT
+            return self._best_raise(legal_actions)
+
+        # Speculative hands: limp behind instead of raising (better multiway)
+        r1 = _RANK_ORDER.index(combo[0]) if combo[0] in _RANK_ORDER else 0
+        r2_char = combo[1] if len(combo) >= 2 and combo[1] in _RANK_ORDER else combo[0]
+        r2 = _RANK_ORDER.index(r2_char) if r2_char in _RANK_ORDER else 0
+        is_pair = len(combo) == 2 and combo[0] == combo[1]
+        is_suited = combo.endswith('S')
+        gap = abs(r1 - r2)
+
+        # Limp with: small/medium pairs, suited connectors/gappers
+        if is_pair and r1 <= _RANK_ORDER.index('7'):
+            if CALL in legal_actions:
+                return CALL
+        if is_suited and gap <= 2 and min(r1, r2) >= _RANK_ORDER.index('3'):
+            if CALL in legal_actions:
+                return CALL
+
+        if _is_in_range(combo, rfi_range):
+            # Standard RFI hand (not speculative): iso-raise
+            rng = np.random.random()
+            if num_limpers >= 2:
+                action = RAISE_POT if rng < 0.7 else RAISE_HALF
+            else:
+                action = RAISE_POT if rng < 0.4 else RAISE_MIN
+            if action not in legal_actions:
+                for fb in [RAISE_POT, RAISE_HALF, RAISE_MIN, CALL]:
+                    if fb in legal_actions:
+                        return fb
+            return action
+
+        return FOLD if FOLD in legal_actions else CALL
+
+    def _short_stack_decision(self, combo: str, pos_key: str,
+                              legal_actions: List[int],
+                              effective_stack: float) -> int:
+        """Short stack (<25BB): push/fold strategy.
+
+        With short stacks, raising small is bad (committed anyway).
+        Either shove all-in or fold.
+        """
+        # Very short (<10BB): shove wider
+        if effective_stack < 10:
+            # Shove range: any pair, Ax, Kx suited, broadways
+            r1 = _RANK_ORDER.index(combo[0]) if combo[0] in _RANK_ORDER else 0
+            is_pair = len(combo) == 2 and combo[0] == combo[1]
+            has_ace = combo[0] == 'A'
+            has_king = combo[0] == 'K'
+            is_suited = combo.endswith('S')
+            is_broadway = r1 >= _RANK_ORDER.index('T') and (
+                len(combo) < 3 or _RANK_ORDER.index(combo[1]) >= _RANK_ORDER.index('T'))
+
+            if is_pair or has_ace or (has_king and is_suited) or is_broadway:
+                if ALL_IN in legal_actions:
+                    return ALL_IN
+                return self._best_raise(legal_actions)
+
+        # Short (10-25BB): shove with strong range only
+        else:
+            # Use 3bet range as shove range (strong hands)
+            key_3b = f'{pos_key}_3b'
+            range_3b = self.ranges.get('3b', {}).get(key_3b, {})
+            rfi_range = self.ranges.get('rfi', {}).get(pos_key, {})
+
+            if _is_in_range(combo, range_3b):
+                # Premium: shove
+                if ALL_IN in legal_actions:
+                    return ALL_IN
+                return self._best_raise(legal_actions)
+
+            if _is_in_range(combo, rfi_range):
+                # Standard open hand: raise small (still viable at 15-25BB)
+                if effective_stack > 15:
+                    action = RAISE_MIN if RAISE_MIN in legal_actions else RAISE_HALF
+                    if action in legal_actions:
+                        return action
+                # 10-15BB: shove or fold, no small raises
+                if ALL_IN in legal_actions:
+                    return ALL_IN
 
         return FOLD if FOLD in legal_actions else CALL
 
