@@ -49,3 +49,4 @@ poker/*
 lasts/*
 *.png
 logs/*
+scripts/analysis/results/*.txt

@@ -737,11 +737,13 @@ def build_cql_dataset(trans_data, spot_filter=None, pot_filter=None):
     # Fix: downsample pair folds, oversample air folds.
     #
     # Tuning knobs (adjust these to fix specific issues):
-    _FOLD_KEEP_AIR = 1.0       # keep 100% of air folds (no pair/draw)
-    _FOLD_KEEP_DRAW = 0.8      # keep 80% of draw folds (flush/straight draw)
-    _FOLD_KEEP_PAIR = 0.4      # keep 40% of one-pair folds (reduces overpair/TP fold)
+    # v2: reduced air fold emphasis, model was folding too much with air/draws
+    # Analysis showed 88% fold air vs winners' ~50% actual fold rate
+    _FOLD_KEEP_AIR = 0.7       # keep 70% of air folds (was 1.0 — too many air folds)
+    _FOLD_KEEP_DRAW = 0.6      # keep 60% of draw folds (was 0.8 — draws should call more)
+    _FOLD_KEEP_PAIR = 0.4      # keep 40% of one-pair folds
     _FOLD_KEEP_STRONG = 0.1    # keep 10% of two pair+ folds
-    _FOLD_OVERSAMPLE_AIR = 4.0 # oversample air folds 4x vs pair folds
+    _FOLD_OVERSAMPLE_AIR = 2.0 # oversample air folds 2x (was 4.0 — too aggressive)
 
     if spot_filter == 'facing_bet' and n_folds > 0:
         fold_indices = np.where(fold_mask)[0]
@@ -833,6 +835,58 @@ def build_cql_dataset(trans_data, spot_filter=None, pot_filter=None):
         print(f'  Fold final: {(actions==0).sum()}/{len(actions)} ({100*new_fold_pct:.1f}%)')
         extra_folds = 0  # already done
 
+        # Step 3: Oversample RAISES for facing_bet (model never re-raises)
+        # Analysis: model raises 0% with air/draws, 2% with two pair+
+        # Winners raise 5-13% with air, 24% with two pair+
+        _RAISE_FB_STRONG = 4.0   # two pair+: heavy re-raise oversample
+        _RAISE_FB_PAIR = 2.0     # one pair: moderate
+        _RAISE_FB_DRAW = 2.0     # draws: semi-bluff raise
+        _RAISE_FB_AIR = 1.0      # air: bluff raise
+
+        raise_mask_fb = (actions >= 2)
+        n_raises_fb = raise_mask_fb.sum()
+        # Target: winners raise ~15% when facing bets
+        target_raise_fb = 0.15
+        target_r = int(target_raise_fb / (1.0 - target_raise_fb) * (len(actions) - n_raises_fb))
+        extra_r = max(0, target_r - n_raises_fb)
+
+        if extra_r > 0 and n_raises_fb > 0:
+            raise_idx_fb = np.where(raise_mask_fb)[0]
+            made_hand = states[:, 19] if states.shape[1] > 19 else np.zeros(len(states))
+            has_draw_fb = np.zeros(len(states), dtype=bool)
+            if states.shape[1] > 21:
+                has_draw_fb = (states[:, 20] > 0.5) | (states[:, 21] > 0.5)
+
+            w_fb = np.zeros(len(raise_idx_fb), dtype=np.float64)
+            for i, ri in enumerate(raise_idx_fb):
+                mh = made_hand[ri]
+                if mh >= 0.25:
+                    w_fb[i] = _RAISE_FB_STRONG
+                elif mh >= 0.01:
+                    w_fb[i] = _RAISE_FB_PAIR
+                elif has_draw_fb[ri]:
+                    w_fb[i] = _RAISE_FB_DRAW
+                else:
+                    w_fb[i] = _RAISE_FB_AIR
+            w_fb /= w_fb.sum()
+
+            rng_rfb = np.random.RandomState(321)
+            raise_os_fb = rng_rfb.choice(raise_idx_fb, size=extra_r,
+                                          replace=True, p=w_fb)
+
+            states = np.concatenate([states, states[raise_os_fb]], axis=0)
+            actions = np.concatenate([actions, actions[raise_os_fb]])
+            rewards = np.concatenate([rewards, rewards[raise_os_fb]])
+            next_states = np.concatenate([next_states, next_states[raise_os_fb]], axis=0)
+            dones = np.concatenate([dones, dones[raise_os_fb]])
+            legal_masks = np.concatenate([legal_masks, legal_masks[raise_os_fb]], axis=0)
+            next_legal_masks = np.concatenate([next_legal_masks, next_legal_masks[raise_os_fb]], axis=0)
+            weights = np.concatenate([weights, weights[raise_os_fb]])
+
+            new_raise_pct = (actions >= 2).sum() / len(actions)
+            print(f'  Raise oversample (facing_bet): {n_raises_fb} → {(actions>=2).sum()} '
+                  f'({100*n_raises_fb/n_total:.1f}% → {100*new_raise_pct:.1f}%)')
+
     # Skip fold oversampling for checked_to spots — oversample raises instead
     if spot_filter == 'checked_to':
         extra_folds = 0
@@ -841,11 +895,13 @@ def build_cql_dataset(trans_data, spot_filter=None, pot_filter=None):
         # Strong hands should bet more, air bets (bluffs) less.
         #
         # Tuning knobs:
+        # v2: increased draw/air to add more semi-bluffs and bluffs
+        # Analysis: model bets 4% with air (winners: 14%), 14% with draws (winners: 25%)
         _RAISE_OS_STRONG = 4.0   # trips+: heavy oversample (should bet ~70%)
         _RAISE_OS_TWO_PAIR = 3.0 # two pair: strong oversample
         _RAISE_OS_PAIR = 2.0     # one pair: moderate (value bet sometimes)
-        _RAISE_OS_DRAW = 1.5     # draws: semi-bluff sometimes
-        _RAISE_OS_AIR = 0.5      # air: bluff rarely
+        _RAISE_OS_DRAW = 2.5     # draws: semi-bluff more (was 1.5)
+        _RAISE_OS_AIR = 1.5      # air: bluff more often (was 0.5)
 
         raise_mask = (actions >= 2)
         n_raises = raise_mask.sum()
