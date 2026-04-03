@@ -455,6 +455,205 @@ def _parse_single_file(file_path):
     return file_results, file_total, file_used
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Self-play data generation (teaches correct folding)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def generate_selfplay_data(num_hands, num_players=6, model_fb='', model_ct='',
+                           model_fb3='', target_obs_size=50):
+    """Play hands using current best model, record all decisions with real rewards.
+
+    This generates training data that showdown-only HH data is missing:
+    - Players who correctly fold and save money (80% of real poker)
+    - Full hand outcomes including folds, not just showdowns
+
+    Returns: dict with same structure as collect_transitions output.
+    """
+    from src.engine import FastEnhancedPokerEngine
+    from src.decision_engine import (
+        DecisionEngine, DecisionConfig, SpotContext,
+        IDX_POT_ODDS, IDX_EQUITY, NUM_ACTIONS,
+    )
+
+    eng = FastEnhancedPokerEngine(
+        num_players=num_players, add_position_features=True,
+        add_pot_odds_features=True, add_hand_strength_features=True,
+        add_stack_features=True, add_equity_features=True,
+        add_street_features=True, add_game_state_features=True,
+        add_betting_history_features=True)
+
+    # Load model for decision making
+    dc = DecisionConfig(use_preflop_ranges=True, style_tuning=True,
+                        strong_hand_guard=True, allin_filter=True,
+                        raise_randomize=True)
+    de = DecisionEngine(dc)
+    if model_fb:
+        de.load_models(facing_bet=model_fb, checked_to=model_ct,
+                       facing_bet_3bet=model_fb3)
+    de.load_preflop_ranges()
+
+    engine_obs_size = eng.get_observation_space_size()  # 41
+    action_size = 5
+    bb_chips = 2.0  # engine uses chips, BB = 2 chips
+
+    # Collect decision points: (obs, action, seat, hand_idx, street)
+    all_decisions = []  # list of dicts per hand
+    t0 = time.time()
+
+    for hand_idx in range(num_hands):
+        state = eng.reset()
+        button = eng._button
+        hand_decisions = []  # [(seat, obs_padded, action, street, legal_actions)]
+
+        if hand_idx % 5000 == 0 and hand_idx > 0:
+            elapsed = time.time() - t0
+            print(f'  Self-play [{hand_idx}/{num_hands}] {hand_idx/elapsed:.0f} hands/s, '
+                  f'{sum(len(d) for d in all_decisions)} decisions')
+
+        while not eng.is_done():
+            agent = eng.current_agent
+            if agent is None:
+                break
+            legal = eng.get_legal_actions()
+            if not legal:
+                break
+
+            seat = eng.agents.index(agent)
+            stage = eng.get_stage()
+            obs = eng.get_observation()
+            cards = eng.get_player_cards(agent)
+            rel_pos = (seat - button) % num_players
+
+            # Pad obs to target size (add zeros for behavioral stats + equity_vs_odds)
+            padded = np.zeros(target_obs_size, dtype=np.float32)
+            padded[:len(obs)] = obs
+            # Compute equity_vs_odds for the last dim
+            if len(obs) >= 19 and target_obs_size > len(obs):
+                pot_odds = obs[10] if len(obs) > 10 else 0
+                equity = obs[18] if len(obs) > 18 else 0
+                padded[target_obs_size - 1] = np.clip(equity - (1.0 - pot_odds), -1.0, 1.0)
+
+            # Skip preflop (handled by GTO ranges, not model)
+            is_postflop = stage != 'Preflop'
+
+            # Get action from DecisionEngine
+            facing_bet = float(obs[10]) > 0.001 if len(obs) > 10 else False
+            pot_bb = obs[8] * 600 if len(obs) > 8 else 0
+            hole_cards = cards if stage == 'Preflop' else None
+
+            ctx = SpotContext(
+                obs=padded, legal_actions=legal, facing_bet=facing_bet,
+                street=stage.lower() if stage != 'Preflop' else 'preflop',
+                hole_cards=hole_cards, rel_pos=rel_pos, pot_bb=pot_bb,
+                num_players=num_players,
+                effective_stack=eng.get_player_chips(agent) / bb_chips)
+
+            if de.has_models:
+                action, _ = de.decide(ctx)
+            else:
+                # Random policy if no models
+                action = int(np.random.choice(legal))
+
+            # Record postflop decisions only
+            if is_postflop:
+                street_map = {'Flop': 1, 'Turn': 2, 'River': 3}
+                hand_decisions.append({
+                    'seat': seat,
+                    'obs': padded.copy(),
+                    'action': action,
+                    'street': street_map.get(stage, 1),
+                    'legal': legal,
+                })
+
+            eng.step(action)
+
+        # Hand finished — get rewards
+        rewards = eng.get_rewards()
+        if hand_decisions:
+            all_decisions.append((hand_decisions, rewards, eng.agents))
+
+    elapsed = time.time() - t0
+    n_decisions = sum(len(d) for d, _, _ in all_decisions)
+    print(f'  Self-play: {num_hands} hands, {n_decisions} postflop decisions in {elapsed:.0f}s')
+
+    # Convert to arrays matching collect_transitions format
+    states = np.zeros((n_decisions, target_obs_size), dtype=np.float32)
+    actions_arr = np.zeros(n_decisions, dtype=np.int64)
+    rewards_arr = np.zeros(n_decisions, dtype=np.float32)
+    next_states = np.zeros((n_decisions, target_obs_size), dtype=np.float32)
+    dones_arr = np.zeros(n_decisions, dtype=np.float32)
+    legal_masks = np.zeros((n_decisions, action_size), dtype=np.float32)
+    next_legal_masks = np.zeros((n_decisions, action_size), dtype=np.float32)
+    street_arr = np.zeros(n_decisions, dtype=np.int8)
+
+    idx = 0
+    for hand_decisions, rewards, agents in all_decisions:
+        n = len(hand_decisions)
+        for i, dec in enumerate(hand_decisions):
+            seat = dec['seat']
+            agent_name = agents[seat]
+            reward_chips = rewards.get(agent_name, 0)
+            net_bb = reward_chips / bb_chips
+
+            is_last = (i + 1 >= n)
+            is_fold = (dec['action'] == 0)
+
+            states[idx] = dec['obs']
+            actions_arr[idx] = dec['action']
+
+            if is_last or is_fold:
+                rewards_arr[idx] = np.clip(net_bb, -100, 100)
+                dones_arr[idx] = 1.0
+            else:
+                rewards_arr[idx] = 0.0
+                dones_arr[idx] = 0.0
+
+            # Next state
+            if not is_last and not is_fold and i + 1 < n:
+                next_states[idx] = hand_decisions[i + 1]['obs']
+                for a in hand_decisions[i + 1]['legal']:
+                    if a < action_size:
+                        next_legal_masks[idx, a] = 1.0
+            else:
+                next_states[idx] = dec['obs']
+                for a in dec['legal']:
+                    if a < action_size:
+                        next_legal_masks[idx, a] = 1.0
+
+            for a in dec['legal']:
+                if a < action_size:
+                    legal_masks[idx, a] = 1.0
+
+            street_arr[idx] = dec['street']
+            idx += 1
+
+    states = states[:idx]
+    actions_arr = actions_arr[:idx]
+    rewards_arr = rewards_arr[:idx]
+    next_states = next_states[:idx]
+    dones_arr = dones_arr[:idx]
+    legal_masks = legal_masks[:idx]
+    next_legal_masks = next_legal_masks[:idx]
+    street_arr = street_arr[:idx]
+
+    # Stats
+    n_folds = (actions_arr == 0).sum()
+    n_calls = (actions_arr == 1).sum()
+    n_raises = (actions_arr >= 2).sum()
+    print(f'  Self-play data: {idx} transitions')
+    print(f'    Folds: {n_folds} ({100*n_folds/idx:.1f}%)')
+    print(f'    Calls: {n_calls} ({100*n_calls/idx:.1f}%)')
+    print(f'    Raises: {n_raises} ({100*n_raises/idx:.1f}%)')
+    print(f'    Rewards: mean={rewards_arr.mean():.2f}, std={rewards_arr.std():.2f}')
+
+    return {
+        'states': states, 'actions': actions_arr, 'rewards': rewards_arr,
+        'next_states': next_states, 'dones': dones_arr,
+        'legal_masks': legal_masks, 'next_legal_masks': next_legal_masks,
+        'streets': street_arr, 'source_files': [], 'obs_size': target_obs_size,
+    }
+
+
 def collect_transitions(hh_dir, num_players, max_hands, good_players,
                         bad_players, no_cache, postflop_only,
                         use_behavioral_stats=False, workers=0):
@@ -495,7 +694,15 @@ def collect_transitions(hh_dir, num_players, max_hands, good_players,
 
     # Parallel parsing
     import multiprocessing as mp
-    parse_workers = workers if workers > 0 else min(120, max(1, mp.cpu_count() - 1))
+    parse_workers = workers if workers > 0 else min(48, max(1, mp.cpu_count() - 1))
+
+    # Limit files upfront to avoid pool.terminate() deadlock
+    # Estimate ~50 showdown hands per file
+    if max_hands > 0:
+        max_files = max_hands // 50 + 200
+        if len(hh_files) > max_files:
+            print(f'  Limiting to {max_files} files (est. enough for {max_hands} hands)')
+            hh_files = hh_files[:max_files]
 
     all_results = []
     total_hands = 0
@@ -504,9 +711,10 @@ def collect_transitions(hh_dir, num_players, max_hands, good_players,
 
     print(f'  Parsing {len(hh_files)} files with {parse_workers} workers...')
 
-    with mp.Pool(processes=parse_workers, initializer=_parse_worker_init,
-                 initargs=(num_players, good_players, bad_players, postflop_only,
-                           use_behavioral_stats)) as pool:
+    pool = mp.Pool(processes=parse_workers, initializer=_parse_worker_init,
+                   initargs=(num_players, good_players, bad_players, postflop_only,
+                             use_behavioral_stats))
+    try:
         results = pool.imap_unordered(_parse_single_file, hh_files, chunksize=16)
         files_done = 0
         for file_results, file_total, file_used in results:
@@ -521,9 +729,11 @@ def collect_transitions(hh_dir, num_players, max_hands, good_players,
                       f'{len(all_results)} player-hands ({elapsed:.0f}s)')
 
             if max_hands > 0 and hands_used >= max_hands:
-                pool.terminate()
                 print(f'  Reached {max_hands} hands limit')
                 break
+    finally:
+        pool.close()
+        pool.join()
 
     elapsed = time.time() - t0
     print(f'  Parsed {files_done} files in {elapsed:.1f}s')
@@ -1147,6 +1357,15 @@ def main():
     parser.add_argument('--build-data', type=str, default='',
                         help='Build CQL data and save to this path, then exit. '
                              'Use with --training-data to skip parsing on next run.')
+    parser.add_argument('--selfplay-hands', type=int, default=0,
+                        help='Generate this many self-play hands and mix into training data. '
+                             'Adds fold examples missing from showdown-only data.')
+    parser.add_argument('--selfplay-model-fb', type=str,
+                        default='models/cql_6p_facing_bet_v8.pt',
+                        help='Facing-bet model for self-play generation')
+    parser.add_argument('--selfplay-model-ct', type=str,
+                        default='models/cql_6p_checked_to_v4.pt',
+                        help='Checked-to model for self-play generation')
     parser.add_argument('--spot-filter', type=str, default='',
                         choices=['', 'facing_bet', 'checked_to'],
                         help='Train only on specific spot type: facing_bet or checked_to')
@@ -1312,6 +1531,28 @@ def main():
     if n_trans < 100:
         print(f'Not enough data: {n_trans} transitions.')
         sys.exit(1)
+
+    # ── Mix in self-play data (teaches correct folding) ──────────────────
+    if args.selfplay_hands > 0:
+        print(f'\n{"="*60}')
+        print(f'  GENERATING SELF-PLAY DATA ({args.selfplay_hands:,} hands)')
+        print(f'{"="*60}')
+        sp_data = generate_selfplay_data(
+            num_hands=args.selfplay_hands,
+            model_fb=args.selfplay_model_fb,
+            model_ct=args.selfplay_model_ct,
+            model_fb3='',
+            target_obs_size=trans_data['obs_size'],
+        )
+        # Merge: concatenate self-play transitions into HH transitions
+        for key in ['states', 'actions', 'rewards', 'next_states', 'dones',
+                    'legal_masks', 'next_legal_masks', 'streets']:
+            trans_data[key] = np.concatenate([trans_data[key], sp_data[key]], axis=0)
+        n_sp = len(sp_data['actions'])
+        n_total = len(trans_data['actions'])
+        print(f'  Mixed: {n_trans:,} HH + {n_sp:,} self-play = {n_total:,} total '
+              f'({100*n_sp/n_total:.1f}% self-play)')
+        n_trans = n_total
 
     # ── Build dataset ────────────────────────────────────────────────────
     print(f'Building CQL dataset...')

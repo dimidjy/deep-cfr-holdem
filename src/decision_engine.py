@@ -227,22 +227,22 @@ _STYLE = {
     'facing_bet_raise_min_hand': HAND_TWO_PAIR,
 
     # Facing bet: fold more with weak hands (WTSD too high)
-    'facing_bet_fold_boost': 0.18,
-    'facing_bet_fold_max_hand': HAND_ONE_PAIR - 0.01,  # fold air and draws
+    'facing_bet_fold_boost': 0.10,
+    'facing_bet_fold_max_hand': 0.01,       # only air (no pair, no draw)
 
     # Checked-to: bet with strong hands (value bet) — scales by street
     # Flop: full boost (CBet), Turn: moderate, River: thin value only
-    'value_bet_boost_flop': 0.18,
-    'value_bet_boost_turn': 0.06,
-    'value_bet_boost_river': 0.05,
+    'value_bet_boost_flop': 0.12,
+    'value_bet_boost_turn': 0.04,
+    'value_bet_boost_river': 0.03,
     'value_bet_min_hand': HAND_ONE_PAIR,
 
     # Checked-to: add bluff frequency with air
-    'bluff_boost': 0.18,
+    'bluff_boost': 0.12,
     'bluff_max_hand': 0.01,
 
     # Checked-to: add semi-bluff with draws
-    'semi_bluff_boost': 0.16,
+    'semi_bluff_boost': 0.12,
 }
 
 

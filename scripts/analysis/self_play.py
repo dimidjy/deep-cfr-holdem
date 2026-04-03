@@ -138,9 +138,11 @@ class PlayerStats:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_self_play(engine: DecisionEngine, num_hands: int,
-                  num_players: int = 6) -> Dict[int, PlayerStats]:
-    """Play num_hands of 6-max poker, all seats using the same DecisionEngine.
+                  num_players: int = 6,
+                  engine_b: DecisionEngine = None) -> Dict[int, PlayerStats]:
+    """Play num_hands of 6-max poker.
 
+    If engine_b is provided: seats 0,2,4 use engine (A), seats 1,3,5 use engine_b (B).
     Returns dict of seat_index → PlayerStats.
     """
     eng = FastEnhancedPokerEngine(
@@ -241,7 +243,9 @@ def run_self_play(engine: DecisionEngine, num_hands: int,
             )
 
             # Get action from DecisionEngine (same pipeline as runtime agent)
-            action, strategy_list = engine.decide(ctx)
+            # In vs mode: even seats (0,2,4) = engine A, odd seats (1,3,5) = engine B
+            active_engine = engine if (engine_b is None or seat % 2 == 0) else engine_b
+            action, strategy_list = active_engine.decide(ctx)
 
             # ── Record preflop stats ──
             if stage == 'Preflop':
@@ -635,9 +639,94 @@ def generate_json(all_stats: Dict[int, PlayerStats], num_players: int,
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _generate_vs_report(stats: Dict[int, PlayerStats], num_players: int,
+                        num_hands: int, label_a: str, label_b: str) -> str:
+    """Generate head-to-head report: A (seats 0,2,4) vs B (seats 1,3,5)."""
+    lines = []
+    w = lines.append
+
+    seats_a = [i for i in range(num_players) if i % 2 == 0]
+    seats_b = [i for i in range(num_players) if i % 2 == 1]
+
+    def _agg(seat_list):
+        a = PlayerStats()
+        for i in seat_list:
+            s = stats[i]
+            a.hands += s.hands
+            a.total_won_bb += s.total_won_bb
+            a.vpip += s.vpip
+            a.pfr += s.pfr
+            a.postflop_bets += s.postflop_bets
+            a.postflop_calls += s.postflop_calls
+            a.postflop_folds += s.postflop_folds
+            a.postflop_checks += s.postflop_checks
+            a.saw_flop += s.saw_flop
+            a.went_to_showdown += s.went_to_showdown
+            a.won_at_showdown += s.won_at_showdown
+            a.cbet_opps += s.cbet_opps
+            a.cbet += s.cbet
+        return a
+
+    a = _agg(seats_a)
+    b = _agg(seats_b)
+
+    bb100_a = a.total_won_bb / a.hands * 100 if a.hands > 0 else 0
+    bb100_b = b.total_won_bb / b.hands * 100 if b.hands > 0 else 0
+    af_a = a.postflop_bets / a.postflop_calls if a.postflop_calls > 0 else 0
+    af_b = b.postflop_bets / b.postflop_calls if b.postflop_calls > 0 else 0
+
+    w('HEAD-TO-HEAD RESULTS')
+    w('=' * 70)
+    w(f'Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}')
+    w(f'Hands: {num_hands:,}  |  Players: {num_players}')
+    w(f'  A (seats 0,2,4): {label_a}')
+    w(f'  B (seats 1,3,5): {label_b}')
+    w('')
+    w('─' * 70)
+    w(f'  {"Metric":<20} {"Model A":>12} {"Model B":>12} {"Diff":>10}')
+    w(f'  {"-"*20} {"-"*12} {"-"*12} {"-"*10}')
+    w(f'  {"BB/100":<20} {bb100_a:>+12.1f} {bb100_b:>+12.1f} '
+      f'{bb100_a - bb100_b:>+10.1f}')
+    w(f'  {"Total BB won":<20} {a.total_won_bb:>+12.0f} {b.total_won_bb:>+12.0f} '
+      f'{a.total_won_bb - b.total_won_bb:>+10.0f}')
+    w(f'  {"VPIP":<20} {_pct(a.vpip, a.hands):>12} {_pct(b.vpip, b.hands):>12}')
+    w(f'  {"PFR":<20} {_pct(a.pfr, a.hands):>12} {_pct(b.pfr, b.hands):>12}')
+    w(f'  {"AF":<20} {af_a:>12.2f} {af_b:>12.2f}')
+    w(f'  {"CBet":<20} {_pct(a.cbet, a.cbet_opps):>12} {_pct(b.cbet, b.cbet_opps):>12}')
+    w(f'  {"WTSD":<20} {_pct(a.went_to_showdown, a.saw_flop):>12} '
+      f'{_pct(b.went_to_showdown, b.saw_flop):>12}')
+    w(f'  {"W$SD":<20} {_pct(a.won_at_showdown, a.went_to_showdown):>12} '
+      f'{_pct(b.won_at_showdown, b.went_to_showdown):>12}')
+    w('')
+
+    if bb100_a > bb100_b + 5:
+        w(f'  >>> Model A wins by {bb100_a - bb100_b:+.1f} BB/100')
+    elif bb100_b > bb100_a + 5:
+        w(f'  >>> Model B wins by {bb100_b - bb100_a:+.1f} BB/100')
+    else:
+        w(f'  >>> Too close to call (diff = {bb100_a - bb100_b:+.1f} BB/100)')
+    w('')
+
+    # Per-seat breakdown
+    w('─' * 70)
+    w('PER-SEAT BREAKDOWN')
+    w('─' * 70)
+    w(f'  {"Seat":>4} {"Model":>7} {"Hands":>7} {"BB/100":>8} {"Won BB":>10}')
+    w(f'  {"-"*4} {"-"*7} {"-"*7} {"-"*8} {"-"*10}')
+    for i in range(num_players):
+        s = stats[i]
+        label = 'A' if i % 2 == 0 else 'B'
+        sbb = s.total_won_bb / s.hands * 100 if s.hands > 0 else 0
+        w(f'  {i:>4} {label:>7} {s.hands:>7} {sbb:>+8.1f} {s.total_won_bb:>+10.0f}')
+
+    w('')
+    w('=' * 70)
+    return '\n'.join(lines)
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description='Self-play analysis: model vs itself, compute poker metrics')
+        description='Self-play analysis: model vs itself or model A vs model B')
     parser.add_argument('--hands', type=int, default=10000,
                         help='Number of hands to play (default: 10000)')
     parser.add_argument('--players', type=int, default=6,
@@ -648,17 +737,26 @@ def main():
                         default='models/cql_6p_checked_to_v4.pt')
     parser.add_argument('--model-facing-bet-3bet', type=str,
                         default='models/cql_6p_facing_bet_3bet.pt')
+    # VS mode: second model (only facing_bet differs)
+    parser.add_argument('--vs-facing-bet', type=str, default='',
+                        help='Model B facing_bet (vs mode: A vs B)')
+    parser.add_argument('--vs-checked-to', type=str, default='',
+                        help='Model B checked_to (default: same as A)')
+    parser.add_argument('--vs-facing-bet-3bet', type=str, default='',
+                        help='Model B 3bet (default: same as A)')
     parser.add_argument('--no-guards', action='store_true',
                         help='Disable guards and style tuning (raw model)')
     parser.add_argument('--no-preflop-ranges', action='store_true',
                         help='Disable GTO preflop ranges (model plays preflop too)')
     args = parser.parse_args()
 
+    vs_mode = bool(args.vs_facing_bet)
+
     print('=' * 70)
-    print('SELF-PLAY ANALYSIS')
+    print('SELF-PLAY ANALYSIS' + (' — VS MODE' if vs_mode else ''))
     print('=' * 70)
 
-    # Setup DecisionEngine
+    # Setup DecisionEngine A
     dc = DecisionConfig(
         strong_hand_guard=not args.no_guards,
         allin_filter=not args.no_guards,
@@ -674,17 +772,37 @@ def main():
             if Path(args.model_facing_bet_3bet).exists() else '',
     )
     engine.load_preflop_ranges()
-    print(f'  DecisionEngine: {engine.info()}')
+    print(f'  Engine A: {engine.info()}')
+
+    # Setup DecisionEngine B (vs mode)
+    engine_b = None
+    if vs_mode:
+        engine_b = DecisionEngine(dc)
+        engine_b.load_models(
+            facing_bet=args.vs_facing_bet,
+            checked_to=args.vs_checked_to or args.model_checked_to,
+            facing_bet_3bet=(args.vs_facing_bet_3bet or args.model_facing_bet_3bet)
+                if Path(args.vs_facing_bet_3bet or args.model_facing_bet_3bet).exists() else '',
+        )
+        engine_b.load_preflop_ranges()
+        print(f'  Engine B: {engine_b.info()}')
+
     print(f'  Guards: {"ON" if not args.no_guards else "OFF"}')
     print(f'  Hands to play: {args.hands:,}')
     print('=' * 70)
 
     # Run self-play
-    print(f'\nRunning {args.hands:,} hands of {args.players}-max self-play...')
-    stats = run_self_play(engine, args.hands, args.players)
+    print(f'\nRunning {args.hands:,} hands of {args.players}-max '
+          f'{"A vs B" if vs_mode else "self-play"}...')
+    stats = run_self_play(engine, args.hands, args.players, engine_b=engine_b)
 
     # Generate report
-    report = generate_report(stats, args.players, args.hands)
+    if vs_mode:
+        label_a = Path(args.model_facing_bet).stem
+        label_b = Path(args.vs_facing_bet).stem
+        report = _generate_vs_report(stats, args.players, args.hands, label_a, label_b)
+    else:
+        report = generate_report(stats, args.players, args.hands)
     print(f'\n{report}')
 
     # Save results
