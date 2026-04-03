@@ -49,65 +49,12 @@ from validate_spots import (
 # ──────────────────────────────────────────────────────────────────────────────
 # Observation layout for 6p: Position(8) + PotOdds(3) + HandStrength(5) + Stack(2) + Equity(8)
 # Equity block: [hand_strength, made_hand_cat, flush_draw, straight_draw, ...]
-# made_hand_cat at index 19:  0.0=high card, 0.125=pair, 0.25=two pair,
-#   0.375=trips/set, 0.5=straight, 0.625=flush, 0.75=full house, 0.875=quads, 1.0=SF
-
-_MADE_HAND_IDX = 19   # index of made_hand_cat in observation vector
-_HAND_STRENGTH_IDX = 18  # eval7 hand_strength (equity vs random)
-
-# Fold cap per hand category: (min_made_hand_cat, max_fold_prob)
-_FOLD_CAPS = [
-    (0.75, 0.00),   # full house+ → never fold
-    (0.625, 0.01),  # flush → 1% max fold
-    (0.5, 0.02),    # straight → 2% max fold
-    (0.375, 0.03),  # set/trips → 3% max fold
-    (0.25, 0.05),   # two pair → 5% max fold
-]
-
-
-def apply_strong_hand_guard(strategy, observation, legal_actions):
-    """Cap fold probability for strong made hands, redistribute to other actions.
-
-    This is a post-hoc adjustment to prevent the model from folding
-    strong hands (two pair+) too often — a known weakness in supervised
-    and CQL models trained on showdown-biased data.
-    """
-    if 0 not in legal_actions:
-        return strategy  # fold not legal, nothing to do
-
-    made_hand = observation[_MADE_HAND_IDX] if len(observation) > _MADE_HAND_IDX else 0.0
-
-    max_fold = 1.0  # no cap by default
-    for min_cat, cap in _FOLD_CAPS:
-        if made_hand >= min_cat - 0.01:  # small epsilon for float comparison
-            max_fold = cap
-            break
-
-    if max_fold >= 1.0:
-        return strategy  # no cap needed
-
-    fold_prob = strategy[0]
-    if fold_prob <= max_fold:
-        return strategy  # already below cap
-
-    # Redistribute excess fold probability to non-fold legal actions
-    excess = fold_prob - max_fold
-    strategy = strategy.copy()
-    strategy[0] = max_fold
-
-    # Distribute proportionally to existing non-fold probabilities
-    non_fold_legal = [a for a in legal_actions if a != 0]
-    non_fold_sum = sum(strategy[a] for a in non_fold_legal)
-
-    if non_fold_sum > 0:
-        for a in non_fold_legal:
-            strategy[a] += excess * (strategy[a] / non_fold_sum)
-    else:
-        # All weight was on fold — distribute evenly
-        for a in non_fold_legal:
-            strategy[a] = excess / len(non_fold_legal)
-
-    return strategy
+# ── Shared constants and guards from DecisionEngine ──────────────────────────
+from src.decision_engine import (
+    _apply_strong_hand_guard as apply_strong_hand_guard,
+    IDX_MADE_HAND as _MADE_HAND_IDX,
+    IDX_EQUITY as _HAND_STRENGTH_IDX,
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1295,141 +1242,53 @@ def main():
                         help='Path to bad players list (for split metrics)')
     args = parser.parse_args()
 
-    # ── Split model mode ──
+    # ── Split model mode (uses DecisionEngine — same logic as runtime agent) ──
     if args.model_facing_bet and args.model_checked_to:
-        from train_cql import QNetwork, CQLModelWrapper
+        from src.decision_engine import DecisionEngine, DecisionConfig, SpotContext
 
-        def _load_split(path, exclude_fold=False):
-            cp = torch.load(path, map_location='cpu')
-            q_net = QNetwork(cp['obs_size'], cp['action_size'],
-                             cp['hidden_layers'], cp['dropout'])
-            q_net.load_state_dict(cp['model_state_dict'])
-            q_net.eval()
-            return CQLModelWrapper(
-                q_net, cp['obs_size'], cp['action_size'], 6, 'cpu',
-                iteration=cp.get('epoch', 0),
-                temperature=cp.get('temperature', 1.0),
-                exclude_fold=exclude_fold), cp
+        dc = DecisionConfig(
+            strong_hand_guard=args.strong_hand_guard,
+            style_tuning=not args.no_style,
+            reraise_classifier_path=getattr(args, 'reraise_classifier', ''),
+            reraise_threshold=getattr(args, 'reraise_threshold', 0.25),
+            raise_randomize=not args.no_style,
+            use_preflop_ranges=False,  # validation doesn't use preflop ranges
+        )
+        _de = DecisionEngine(dc)
+        _de.load_models(
+            facing_bet=args.model_facing_bet,
+            checked_to=args.model_checked_to,
+            facing_bet_3bet=args.model_facing_bet_3bet or '',
+            reraise=getattr(args, 'reraise_classifier', ''),
+        )
+        print(f'  DecisionEngine: {_de.info()}')
 
-        fb_model, fb_cp = _load_split(args.model_facing_bet)
-        ct_model, ct_cp = _load_split(args.model_checked_to, exclude_fold=True)
-        fb3_model = None
-        if args.model_facing_bet_3bet:
-            fb3_model, fb3_cp = _load_split(args.model_facing_bet_3bet)
-
-        # Import style tuning from agent
-        from src.agent.policy_core import _apply_style_tuning
-
-        # Load reraise classifier if provided
-        reraise_clf = None
-        reraise_obs_size = 0
-        if args.reraise_classifier:
-            import torch as _torch
-            from scripts.train_reraise import ReRaiseClassifier
-            _rr_ckpt = _torch.load(args.reraise_classifier, map_location='cpu')
-            reraise_obs_size = _rr_ckpt['obs_size']
-            reraise_clf = ReRaiseClassifier(
-                reraise_obs_size,
-                _rr_ckpt.get('hidden_layers', [256, 128, 64]),
-                _rr_ckpt.get('dropout', 0.15))
-            reraise_clf.load_state_dict(_rr_ckpt['model_state_dict'])
-            reraise_clf.eval()
-            print(f'  Reraise classifier loaded: {args.reraise_classifier} '
-                  f'(F1={_rr_ckpt.get("f1", 0):.1%}, threshold={args.reraise_threshold})')
-
-        class _SplitModelWrapper:
-            def __init__(self, fb, ct, fb3=None, use_style=True,
-                         rr_clf=None, rr_obs_size=0, rr_threshold=0.25):
-                self.fb, self.ct, self.fb3 = fb, ct, fb3
-                self.use_style = use_style
-                self.rr_clf = rr_clf
-                self.rr_obs_size = rr_obs_size
-                self.rr_threshold = rr_threshold
-                self.iteration = max(fb.iteration, ct.iteration)
-                self.obs_size = fb.obs_size
-                self.action_size = fb.action_size
-                self.num_players = fb.num_players
-                self.strategy_networks = fb.strategy_networks
-                self.advantage_networks = fb.advantage_networks
+        class _DecisionEngineWrapper:
+            """Wraps DecisionEngine to match the get_strategy(obs, pidx, legal) interface."""
+            def __init__(self, engine):
+                self._engine = engine
+                self.iteration = 0
+                self.obs_size = engine._obs_size_fb
+                self.action_size = 5
+                self.num_players = 6
+                # Dummy attributes for validate_vs_hh compatibility
+                self.strategy_networks = [None] * 6
+                self.advantage_networks = [None] * 6
             def get_strategy(self, obs, pidx, legal):
                 pot_odds = obs[10] if len(obs) > 10 else 0
-                pot_bb = obs[8] * 600 if len(obs) > 8 else 0
                 facing_bet = pot_odds > 0.001
-                if facing_bet:
-                    if pot_bb > 12 and self.fb3:
-                        strategy = self.fb3.get_strategy(obs, pidx, legal)
-                    else:
-                        strategy = self.fb.get_strategy(obs, pidx, legal)
-                else:
-                    cl = [a for a in legal if a != 0] or [1]
-                    strategy = self.ct.get_strategy(obs, pidx, cl)
-                # Apply style tuning + raise randomization (same as runtime agent)
-                if self.use_style:
-                    import numpy as _np
-                    import random as _rng
-                    import torch as _torch
-                    s = _np.array([float(strategy[i]) if i < len(strategy) else 0.0
-                                   for i in range(5)], dtype=_np.float32)
-                    # Reraise classifier (replaces facing_bet_raise_boost)
-                    skip_fb_raise = False
-                    if facing_bet and self.rr_clf is not None:
-                        best = max(legal, key=lambda a: s[a])
-                        if best == 1 and any(a >= 2 for a in legal):
-                            _obs = obs
-                            if len(_obs) < self.rr_obs_size:
-                                _obs = _np.zeros(self.rr_obs_size, dtype=_np.float32)
-                                _obs[:len(obs)] = obs
-                            elif len(_obs) > self.rr_obs_size:
-                                _obs = _obs[:self.rr_obs_size]
-                            with _torch.no_grad():
-                                logit = self.rr_clf(
-                                    _torch.FloatTensor(_obs).unsqueeze(0)).item()
-                                p_raise = 1.0 / (1.0 + _np.exp(-logit))
-                            if p_raise >= self.rr_threshold:
-                                move = min(p_raise, 0.6) * s[1]
-                                if move >= 0.01:
-                                    s[1] -= move
-                                    r_acts = [a for a in legal if a >= 2]
-                                    if r_acts:
-                                        each = move / len(r_acts)
-                                        for a in r_acts:
-                                            s[a] += each
-                            skip_fb_raise = True
-                    s = _apply_style_tuning(s, obs, legal, facing_bet,
-                                            skip_facing_bet_raise=skip_fb_raise)
-                    # 80% keep model's top raise, 20% randomize sizing
-                    best = max(legal, key=lambda a: s[a])
-                    if best >= 2:
-                        raise_acts = [a for a in legal if a >= 2 and s[a] > 0.01]
-                        if len(raise_acts) > 1 and _rng.random() > 0.80:
-                            others = [a for a in raise_acts if a != best]
-                            if others:
-                                probs = [float(s[a]) for a in others]
-                                total = sum(probs)
-                                if total > 0:
-                                    r = _rng.random() * total
-                                    cum = 0.0
-                                    for a, p in zip(others, probs):
-                                        cum += p
-                                        if r <= cum:
-                                            s[:] = 0
-                                            s[a] = 1.0
-                                            break
-                    return s
-                return strategy
+                pot_bb = obs[8] * 600 if len(obs) > 8 else 0
+                ctx = SpotContext(
+                    obs=obs, legal_actions=legal,
+                    facing_bet=facing_bet, street='postflop',
+                    pot_bb=pot_bb)
+                return self._engine.get_strategy(ctx)
 
-        deep_cfr = _SplitModelWrapper(fb_model, ct_model, fb3_model,
-                                       use_style=not args.no_style,
-                                       rr_clf=reraise_clf,
-                                       rr_obs_size=reraise_obs_size,
-                                       rr_threshold=args.reraise_threshold)
+        deep_cfr = _DecisionEngineWrapper(_de)
         num_players = 6
         legacy = False
         args.behavioral_stats = True
-        msg = f'Split model: facing_bet(e{fb_cp["epoch"]}) + checked_to(e{ct_cp["epoch"]})'
-        if fb3_model:
-            msg += f' + 3bet(e{fb3_cp["epoch"]})'
-        print(msg)
+        print(f'Split model via DecisionEngine (same pipeline as runtime agent)')
 
     elif not args.model:
         print('Error: --model or (--model-facing-bet + --model-checked-to) required')

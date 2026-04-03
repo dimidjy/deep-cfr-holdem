@@ -156,57 +156,9 @@ class LiveBehavioralTracker:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Strong-hand fold guard
+# Strong-hand fold guard — use shared implementation from DecisionEngine
 # ──────────────────────────────────────────────────────────────────────────────
-# Obs layout (6p): Position(8) + PotOdds(3) + HandStrength(5) + Stack(2) + Equity(8)
-# made_hand_cat at index 19:  0.0=high card, 0.125=pair, 0.25=two pair,
-#   0.375=trips/set, 0.5=straight, 0.625=flush, 0.75=full house, 0.875=quads
-
-_MADE_HAND_IDX = 19
-_FOLD_CAPS = [
-    (0.75, 0.00),   # full house+ → never fold
-    (0.625, 0.01),  # flush → 1% max fold
-    (0.5, 0.02),    # straight → 2% max fold
-    (0.375, 0.03),  # set/trips → 3% max fold
-    (0.25, 0.05),   # two pair → 5% max fold
-]
-
-
-def apply_strong_hand_guard(strategy, observation, legal_actions):
-    """Cap fold probability for strong made hands, redistribute to other actions."""
-    if 0 not in legal_actions:
-        return strategy
-
-    made_hand = observation[_MADE_HAND_IDX] if len(observation) > _MADE_HAND_IDX else 0.0
-
-    max_fold = 1.0
-    for min_cat, cap in _FOLD_CAPS:
-        if made_hand >= min_cat - 0.01:
-            max_fold = cap
-            break
-
-    if max_fold >= 1.0:
-        return strategy
-
-    fold_prob = strategy[0]
-    if fold_prob <= max_fold:
-        return strategy
-
-    excess = fold_prob - max_fold
-    strategy = strategy.copy()
-    strategy[0] = max_fold
-
-    non_fold_legal = [a for a in legal_actions if a != 0]
-    non_fold_sum = sum(strategy[a] for a in non_fold_legal)
-
-    if non_fold_sum > 0:
-        for a in non_fold_legal:
-            strategy[a] += excess * (strategy[a] / non_fold_sum)
-    else:
-        for a in non_fold_legal:
-            strategy[a] = excess / len(non_fold_legal)
-
-    return strategy
+from src.decision_engine import _apply_strong_hand_guard as apply_strong_hand_guard
 
 
 def _make_engine(num_players: int) -> FastEnhancedPokerEngine:
