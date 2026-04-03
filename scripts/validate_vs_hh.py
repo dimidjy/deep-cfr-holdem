@@ -1251,6 +1251,14 @@ def main():
                         help='Split model: facing bet situations')
     parser.add_argument('--model-checked-to', type=str, default='',
                         help='Split model: checked to situations')
+    parser.add_argument('--model-facing-bet-3bet', type=str, default='',
+                        help='Split model: facing bet in 3bet pots (>12BB)')
+    parser.add_argument('--reraise-classifier', type=str, default='',
+                        help='Re-raise binary classifier model (.pt)')
+    parser.add_argument('--reraise-threshold', type=float, default=0.25,
+                        help='Min P(raise) to upgrade call→raise (default 0.25)')
+    parser.add_argument('--no-style', action='store_true',
+                        help='Disable style tuning (raw model output only)')
     parser.add_argument('--hh-dir', type=str,
                         default='data/poker_archive/',
                         help='Directory with PokerStars HH files')
@@ -1305,10 +1313,38 @@ def main():
 
         fb_model, fb_cp = _load_split(args.model_facing_bet)
         ct_model, ct_cp = _load_split(args.model_checked_to, exclude_fold=True)
+        fb3_model = None
+        if args.model_facing_bet_3bet:
+            fb3_model, fb3_cp = _load_split(args.model_facing_bet_3bet)
+
+        # Import style tuning from agent
+        from src.agent.policy_core import _apply_style_tuning
+
+        # Load reraise classifier if provided
+        reraise_clf = None
+        reraise_obs_size = 0
+        if args.reraise_classifier:
+            import torch as _torch
+            from scripts.train_reraise import ReRaiseClassifier
+            _rr_ckpt = _torch.load(args.reraise_classifier, map_location='cpu')
+            reraise_obs_size = _rr_ckpt['obs_size']
+            reraise_clf = ReRaiseClassifier(
+                reraise_obs_size,
+                _rr_ckpt.get('hidden_layers', [256, 128, 64]),
+                _rr_ckpt.get('dropout', 0.15))
+            reraise_clf.load_state_dict(_rr_ckpt['model_state_dict'])
+            reraise_clf.eval()
+            print(f'  Reraise classifier loaded: {args.reraise_classifier} '
+                  f'(F1={_rr_ckpt.get("f1", 0):.1%}, threshold={args.reraise_threshold})')
 
         class _SplitModelWrapper:
-            def __init__(self, fb, ct):
-                self.fb, self.ct = fb, ct
+            def __init__(self, fb, ct, fb3=None, use_style=True,
+                         rr_clf=None, rr_obs_size=0, rr_threshold=0.25):
+                self.fb, self.ct, self.fb3 = fb, ct, fb3
+                self.use_style = use_style
+                self.rr_clf = rr_clf
+                self.rr_obs_size = rr_obs_size
+                self.rr_threshold = rr_threshold
                 self.iteration = max(fb.iteration, ct.iteration)
                 self.obs_size = fb.obs_size
                 self.action_size = fb.action_size
@@ -1317,17 +1353,83 @@ def main():
                 self.advantage_networks = fb.advantage_networks
             def get_strategy(self, obs, pidx, legal):
                 pot_odds = obs[10] if len(obs) > 10 else 0
-                if pot_odds > 0.001:
-                    return self.fb.get_strategy(obs, pidx, legal)
+                pot_bb = obs[8] * 600 if len(obs) > 8 else 0
+                facing_bet = pot_odds > 0.001
+                if facing_bet:
+                    if pot_bb > 12 and self.fb3:
+                        strategy = self.fb3.get_strategy(obs, pidx, legal)
+                    else:
+                        strategy = self.fb.get_strategy(obs, pidx, legal)
                 else:
                     cl = [a for a in legal if a != 0] or [1]
-                    return self.ct.get_strategy(obs, pidx, cl)
+                    strategy = self.ct.get_strategy(obs, pidx, cl)
+                # Apply style tuning + raise randomization (same as runtime agent)
+                if self.use_style:
+                    import numpy as _np
+                    import random as _rng
+                    import torch as _torch
+                    s = _np.array([float(strategy[i]) if i < len(strategy) else 0.0
+                                   for i in range(5)], dtype=_np.float32)
+                    # Reraise classifier (replaces facing_bet_raise_boost)
+                    skip_fb_raise = False
+                    if facing_bet and self.rr_clf is not None:
+                        best = max(legal, key=lambda a: s[a])
+                        if best == 1 and any(a >= 2 for a in legal):
+                            _obs = obs
+                            if len(_obs) < self.rr_obs_size:
+                                _obs = _np.zeros(self.rr_obs_size, dtype=_np.float32)
+                                _obs[:len(obs)] = obs
+                            elif len(_obs) > self.rr_obs_size:
+                                _obs = _obs[:self.rr_obs_size]
+                            with _torch.no_grad():
+                                logit = self.rr_clf(
+                                    _torch.FloatTensor(_obs).unsqueeze(0)).item()
+                                p_raise = 1.0 / (1.0 + _np.exp(-logit))
+                            if p_raise >= self.rr_threshold:
+                                move = min(p_raise, 0.6) * s[1]
+                                if move >= 0.01:
+                                    s[1] -= move
+                                    r_acts = [a for a in legal if a >= 2]
+                                    if r_acts:
+                                        each = move / len(r_acts)
+                                        for a in r_acts:
+                                            s[a] += each
+                            skip_fb_raise = True
+                    s = _apply_style_tuning(s, obs, legal, facing_bet,
+                                            skip_facing_bet_raise=skip_fb_raise)
+                    # 80% keep model's top raise, 20% randomize sizing
+                    best = max(legal, key=lambda a: s[a])
+                    if best >= 2:
+                        raise_acts = [a for a in legal if a >= 2 and s[a] > 0.01]
+                        if len(raise_acts) > 1 and _rng.random() > 0.80:
+                            others = [a for a in raise_acts if a != best]
+                            if others:
+                                probs = [float(s[a]) for a in others]
+                                total = sum(probs)
+                                if total > 0:
+                                    r = _rng.random() * total
+                                    cum = 0.0
+                                    for a, p in zip(others, probs):
+                                        cum += p
+                                        if r <= cum:
+                                            s[:] = 0
+                                            s[a] = 1.0
+                                            break
+                    return s
+                return strategy
 
-        deep_cfr = _SplitModelWrapper(fb_model, ct_model)
+        deep_cfr = _SplitModelWrapper(fb_model, ct_model, fb3_model,
+                                       use_style=not args.no_style,
+                                       rr_clf=reraise_clf,
+                                       rr_obs_size=reraise_obs_size,
+                                       rr_threshold=args.reraise_threshold)
         num_players = 6
         legacy = False
         args.behavioral_stats = True
-        print(f'Split model: facing_bet(e{fb_cp["epoch"]}) + checked_to(e{ct_cp["epoch"]})')
+        msg = f'Split model: facing_bet(e{fb_cp["epoch"]}) + checked_to(e{ct_cp["epoch"]})'
+        if fb3_model:
+            msg += f' + 3bet(e{fb3_cp["epoch"]})'
+        print(msg)
 
     elif not args.model:
         print('Error: --model or (--model-facing-bet + --model-checked-to) required')
