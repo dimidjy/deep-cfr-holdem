@@ -49,9 +49,9 @@ logging.disable(logging.WARNING)
 
 
 # ── Default model paths ────────────────────────────────────────────────────
-DEFAULT_MODEL_FB = 'models/best/cql_6p_facing_bet_v7.pt'
-DEFAULT_MODEL_CT = 'models/best/cql_6p_checked_to_v3.pt'
-DEFAULT_MODEL_FB_3BET = 'models/cql_6p_facing_bet_3bet.pt'
+DEFAULT_MODEL_FB = 'models/cql_6p_facing_bet_v9.pt'
+DEFAULT_MODEL_CT = 'models/cql_6p_checked_to_v5.pt'
+DEFAULT_MODEL_FB_3BET = 'models/cql_6p_facing_bet_3bet_v2.pt'
 DEFAULT_HH_DIR = 'data/poker_archive/'
 DEFAULT_GOOD_PLAYERS = 'data/good_players.txt'
 DEFAULT_BAD_PLAYERS = 'data/bad_players.txt'

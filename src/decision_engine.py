@@ -48,9 +48,10 @@ IDX_POT_NORM = 8       # obs[8]  = pot / (6 * 100)
 IDX_POT_ODDS = 10      # obs[10] = pot / (pot + call)   — 0 when not facing bet
 IDX_EQUITY = 18         # obs[18] = hand_strength (equity vs random)
 IDX_MADE_HAND = 19      # obs[19] = made_hand_cat (0.0=highcard .. 0.875=quads)
-IDX_FLUSH_DRAW = 20     # obs[20] = has_flush_draw (0 or 1)
-IDX_STRAIGHT_DRAW = 21  # obs[21] = has_straight_draw (0 or 1)
+IDX_FLUSH_DRAW = 20     # obs[20] = hero_flush_participation (0/0.5/1.0)
+IDX_STRAIGHT_DRAW = 21  # obs[21] = hero_straight_participation (0/0.5/1.0)
 IDX_TOP_PAIR = 22       # obs[22] = top_pair (0 or 1)
+IDX_RANK_WITHIN_CAT = 26  # obs[26] = hand_rank_within_cat (0=worst..1=best in category)
 
 # Made hand categories
 HAND_HIGH_CARD = 0.0
@@ -192,8 +193,8 @@ def _apply_allin_filter(strategy: np.ndarray, obs: np.ndarray,
     made_hand = float(obs[IDX_MADE_HAND])
     if made_hand >= HAND_TWO_PAIR - 0.01:
         return strategy  # two pair+ — allow
-    has_flush_draw = float(obs[IDX_FLUSH_DRAW]) > 0.5
-    has_straight_draw = float(obs[IDX_STRAIGHT_DRAW]) > 0.5
+    has_flush_draw = float(obs[IDX_FLUSH_DRAW]) > 0.0
+    has_straight_draw = float(obs[IDX_STRAIGHT_DRAW]) > 0.0
     if has_flush_draw or has_straight_draw:
         return strategy  # semi-bluff — allow
 
@@ -226,9 +227,8 @@ _STYLE = {
     'facing_bet_raise_boost': 0.20,
     'facing_bet_raise_min_hand': HAND_TWO_PAIR,
 
-    # Facing bet: fold more with weak hands (WTSD too high)
-    'facing_bet_fold_boost': 0.10,
-    'facing_bet_fold_max_hand': 0.01,       # only air (no pair, no draw)
+    # Facing bet: fold boost — now handled by _facing_bet_fold_boost()
+    # (old flat 10% boost for air only was too weak — WTSD 37-42%)
 
     # Checked-to: bet with strong hands (value bet) — scales by street
     # Flop: full boost (CBet), Turn: moderate, River: thin value only
@@ -246,6 +246,54 @@ _STYLE = {
 }
 
 
+def _facing_bet_fold_boost(obs: np.ndarray, made_hand: float,
+                           has_draw: bool, street: str) -> float:
+    """Compute fold probability boost when facing a bet.
+
+    Considers:
+    - Hand strength (air folds most, bottom pair folds a lot, top pair less)
+    - Bet size (bigger bet = fold more)
+    - Street (later streets = fold more, draws lose equity)
+    - Draws (still have equity on flop/turn, not river)
+    """
+    # Street multiplier: fold more on later streets
+    street_mult = {'flop': 0.5, 'Flop': 0.5,
+                   'turn': 0.8, 'Turn': 0.8,
+                   'river': 1.0, 'River': 1.0}.get(street, 0.5)
+
+    # Bet size: obs[35] = bet_to_pot = call / (pot - call), normalized /2
+    # Higher = bigger bet = should fold more
+    bet_size = float(obs[35]) if len(obs) > 35 else 0.3
+    bet_mult = 0.5 + bet_size  # range ~0.5 (min bet) to ~1.5 (overbet)
+
+    # Base fold boost by hand strength
+    if made_hand < 0.01:
+        # Pure air: fold a lot
+        if has_draw and street in ('flop', 'Flop'):
+            return 0.0  # don't fold draws on flop
+        base = 0.25
+    elif made_hand < 0.125:
+        # High card (A-high, K-high): weak, fold most of the time
+        if has_draw and street in ('flop', 'Flop', 'turn', 'Turn'):
+            return 0.0  # draws with overcards have equity
+        base = 0.20
+    elif made_hand < 0.20:
+        # Bottom/middle pair: fold facing big bets on later streets
+        if street in ('flop', 'Flop'):
+            return 0.0  # keep calling on flop (could improve)
+        base = 0.15
+    elif made_hand < 0.25:
+        # Top pair: only fold facing big bets on river
+        if street not in ('river', 'River'):
+            return 0.0
+        base = 0.08
+    else:
+        # Two pair+: don't boost folding (strong hand guard handles this)
+        return 0.0
+
+    return min(base * street_mult * bet_mult, 0.35)
+
+
 def _apply_style_tuning(strategy: np.ndarray, obs: np.ndarray,
                          legal_actions: List[int], facing_bet: bool,
                          skip_facing_bet_raise: bool = False,
@@ -255,8 +303,8 @@ def _apply_style_tuning(strategy: np.ndarray, obs: np.ndarray,
         return strategy
 
     made_hand = float(obs[IDX_MADE_HAND])
-    has_flush_draw = float(obs[IDX_FLUSH_DRAW]) > 0.5 if len(obs) > IDX_FLUSH_DRAW else False
-    has_straight_draw = float(obs[IDX_STRAIGHT_DRAW]) > 0.5 if len(obs) > IDX_STRAIGHT_DRAW else False
+    has_flush_draw = float(obs[IDX_FLUSH_DRAW]) > 0.0 if len(obs) > IDX_FLUSH_DRAW else False
+    has_straight_draw = float(obs[IDX_STRAIGHT_DRAW]) > 0.0 if len(obs) > IDX_STRAIGHT_DRAW else False
     has_draw = has_flush_draw or has_straight_draw
 
     strategy = strategy.copy()
@@ -271,19 +319,13 @@ def _apply_style_tuning(strategy: np.ndarray, obs: np.ndarray,
                 strategy[ALL_IN] += boost * 0.1
                 strategy[CALL] -= boost
 
-        # Fold more with weak hands facing bets (WTSD too high — calling station fix)
-        # Fold air always; fold weak draws on turn/river (not flop — draws have equity)
-        is_late_street = street in ('turn', 'Turn', 'river', 'River')
-        should_fold_boost = (
-            made_hand < _STYLE['facing_bet_fold_max_hand']
-            and FOLD in legal_actions
-            and strategy[CALL] > _STYLE['facing_bet_fold_boost']
-            and (not has_draw or is_late_street)
-        )
-        if should_fold_boost:
-            boost = _STYLE['facing_bet_fold_boost']
-            strategy[FOLD] += boost
-            strategy[CALL] -= boost
+        # Fold boost: scale by hand strength, bet size, and street.
+        # The model under-folds everything (trained on showdown-only data).
+        if FOLD in legal_actions and strategy[CALL] > 0.05:
+            boost = _facing_bet_fold_boost(obs, made_hand, has_draw, street)
+            if boost > 0 and strategy[CALL] > boost:
+                strategy[FOLD] += boost
+                strategy[CALL] -= boost
     else:
         # Value bet boost: bet with one pair+ when checked to — scales by street
         # Flop: bet often (CBet), Turn: moderate, River: selective
@@ -308,13 +350,14 @@ def _apply_style_tuning(strategy: np.ndarray, obs: np.ndarray,
             strategy[RAISE_HALF] -= upgrade
             strategy[RAISE_POT] += upgrade
 
-        # Bluff boost: bet with air when checked to
-        if (made_hand < _STYLE['bluff_max_hand']
+        # Bluff boost: bet with air when checked to (flop only — model
+        # already bluffs 40-50% on turn/river, boosting makes it too high)
+        if (street in ('flop', 'Flop')
+                and made_hand < _STYLE['bluff_max_hand']
                 and not has_draw and RAISE_HALF in legal_actions
                 and strategy[CALL] > _STYLE['bluff_boost'] * 2):
-            boost = _STYLE['bluff_boost']
-            strategy[RAISE_HALF] += boost
-            strategy[CALL] -= boost
+            strategy[RAISE_HALF] += _STYLE['bluff_boost']
+            strategy[CALL] -= _STYLE['bluff_boost']
 
         # Semi-bluff boost: bet with draws when checked to
         if (has_draw and made_hand < HAND_ONE_PAIR

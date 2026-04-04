@@ -732,11 +732,11 @@ def main():
     parser.add_argument('--players', type=int, default=6,
                         help='Number of players (default: 6)')
     parser.add_argument('--model-facing-bet', type=str,
-                        default='models/cql_6p_facing_bet_v8.pt')
+                        default='models/cql_6p_facing_bet_v9.pt')
     parser.add_argument('--model-checked-to', type=str,
-                        default='models/cql_6p_checked_to_v4.pt')
+                        default='models/cql_6p_checked_to_v5.pt')
     parser.add_argument('--model-facing-bet-3bet', type=str,
-                        default='models/cql_6p_facing_bet_3bet.pt')
+                        default='models/cql_6p_facing_bet_3bet_v2.pt')
     # VS mode: second model (only facing_bet differs)
     parser.add_argument('--vs-facing-bet', type=str, default='',
                         help='Model B facing_bet (vs mode: A vs B)')

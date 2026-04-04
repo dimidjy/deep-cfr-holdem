@@ -78,8 +78,8 @@ SPOT_NAMES = {
 def _classify_spot(obs, facing_bet):
     """Classify a postflop decision into a spot category."""
     made_hand = float(obs[_MADE_HAND_IDX]) if len(obs) > _MADE_HAND_IDX else 0.0
-    has_flush_draw = float(obs[20]) > 0.5 if len(obs) > 20 else False
-    has_straight_draw = float(obs[21]) > 0.5 if len(obs) > 21 else False
+    has_flush_draw = float(obs[20]) > 0.0 if len(obs) > 20 else False
+    has_straight_draw = float(obs[21]) > 0.0 if len(obs) > 21 else False
 
     prefix = 'facing_bet' if facing_bet else 'checked_to'
 

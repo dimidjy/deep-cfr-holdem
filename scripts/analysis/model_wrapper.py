@@ -8,9 +8,9 @@ agent (model routing, guards, style tuning).
 Usage:
     from scripts.analysis.model_wrapper import ModelWrapper
     model = ModelWrapper(
-        model_fb_path='models/cql_6p_facing_bet_v8.pt',
-        model_ct_path='models/cql_6p_checked_to_v4.pt',
-        model_fb_3bet_path='models/cql_6p_facing_bet_3bet.pt',
+        model_fb_path='models/cql_6p_facing_bet_v9.pt',
+        model_ct_path='models/cql_6p_checked_to_v5.pt',
+        model_fb_3bet_path='models/cql_6p_facing_bet_3bet_v2.pt',
         use_guards=True,   # same pipeline as agent
     )
     action, strategy = model.get_action(obs, legal_actions)

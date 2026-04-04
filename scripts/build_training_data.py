@@ -49,7 +49,7 @@ MADE_HAND_NAMES = {
 
 # All-in quality filter: minimum made hand category for postflop all-in labels.
 # 0.25 = two pair.  Also allow strong draws (flush/straight draw features).
-# Obs layout: made_hand_cat at idx 19, has_flush_draw idx 20, has_straight_draw idx 21
+# Obs layout: made_hand_cat at idx 19, hero_flush_part idx 20, hero_straight_part idx 21
 _MADE_HAND_IDX = 19
 _FLUSH_DRAW_IDX = 20
 _STRAIGHT_DRAW_IDX = 21
@@ -62,8 +62,8 @@ def _is_quality_allin(obs, min_allin_hand=0.25):
     made_hand = float(obs[_MADE_HAND_IDX])
     if made_hand >= min_allin_hand - 0.01:  # two pair or better
         return True
-    has_flush_draw = float(obs[_FLUSH_DRAW_IDX]) > 0.5
-    has_straight_draw = float(obs[_STRAIGHT_DRAW_IDX]) > 0.5
+    has_flush_draw = float(obs[_FLUSH_DRAW_IDX]) > 0.0
+    has_straight_draw = float(obs[_STRAIGHT_DRAW_IDX]) > 0.0
     if has_flush_draw or has_straight_draw:
         return True  # semi-bluff shove is valid
     return False
@@ -554,8 +554,8 @@ def main():
         pot_odds = float(obs[10]) if len(obs) > 10 else 0.0
         equity = float(obs[18]) if len(obs) > 18 else 0.5
         made_hand = float(obs[19]) if len(obs) > 19 else 0.0
-        has_flush_draw = float(obs[20]) > 0.5 if len(obs) > 20 else False
-        has_str_draw = float(obs[21]) > 0.5 if len(obs) > 21 else False
+        has_flush_draw = float(obs[20]) > 0.0 if len(obs) > 20 else False
+        has_str_draw = float(obs[21]) > 0.0 if len(obs) > 21 else False
 
         # Need to call: equity must exceed (1 - pot_odds) to be profitable
         # pot_odds = pot / (pot + call), so we need equity > 1 - pot_odds = call/(pot+call)

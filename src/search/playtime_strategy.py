@@ -86,14 +86,14 @@ class PlaytimeStrategy:
         self._idx_low_card       = N + 8
         self._idx_equity         = N + 12   # hand_strength / treys percentile
         self._idx_made_hand_cat  = N + 13   # 0=high card .. 1=straight flush
-        self._idx_has_flush_draw = N + 14
-        self._idx_has_str_draw   = N + 15
+        self._idx_has_flush_draw = N + 14   # now hero_flush_participation (0/0.5/1.0)
+        self._idx_has_str_draw   = N + 15   # now hero_straight_participation (0/0.5/1.0)
         self._idx_top_pair       = N + 16
-        self._idx_street_preflop = N + 20
-        self._idx_street_flop    = N + 21
-        self._idx_street_turn    = N + 22
-        self._idx_street_river   = N + 23
-        self._idx_aggression     = N + 26  # aggression_level from GameState
+        self._idx_street_preflop = N + 21   # shifted +1 due to new hand_rank_within_cat dim
+        self._idx_street_flop    = N + 22
+        self._idx_street_turn    = N + 23
+        self._idx_street_river   = N + 24
+        self._idx_aggression     = N + 27  # aggression_level from GameState
 
     def get_strategy(self, observation: np.ndarray, player_idx: int,
                      legal_actions: List[int]) -> np.ndarray:
@@ -235,7 +235,7 @@ class PlaytimeStrategy:
             return 0.8
 
         # --- Draws: moderate leniency for semi-bluffs ---
-        has_draw = has_flush_draw > 0.5 or has_str_draw > 0.5
+        has_draw = has_flush_draw > 0.0 or has_str_draw > 0.0
         if has_draw:
             # Allow semi-bluff all-in when not a huge overbet
             if stack_to_pot < 0.35:   # SPR < ~3
@@ -293,8 +293,8 @@ class PlaytimeStrategy:
 
         hand_strength = observation[self._idx_equity]
         made_hand_cat = observation[self._idx_made_hand_cat]
-        has_flush_draw = observation[self._idx_has_flush_draw] > 0.5
-        has_str_draw = observation[self._idx_has_str_draw] > 0.5
+        has_flush_draw = observation[self._idx_has_flush_draw] > 0.0
+        has_str_draw = observation[self._idx_has_str_draw] > 0.0
         top_pair = observation[self._idx_top_pair] > 0.5
         is_preflop = observation[self._idx_street_preflop] > 0.5
         is_river = observation[self._idx_street_river] > 0.5

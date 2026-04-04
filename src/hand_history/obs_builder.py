@@ -44,6 +44,19 @@ _RANK_MAP = {
     '9': 9, 'T': 10, 'J': 11, 'Q': 12, 'K': 13, 'A': 14,
 }
 
+# Treys rank_class → (best_rank_int, worst_rank_int) for within-category ranking
+_TREYS_RANK_BOUNDS = {
+    1: (1, 10),       # Straight Flush
+    2: (11, 166),     # Four of a Kind
+    3: (167, 322),    # Full House
+    4: (323, 1599),   # Flush
+    5: (1600, 1609),  # Straight
+    6: (1610, 2467),  # Three of a Kind
+    7: (2468, 3325),  # Two Pair
+    8: (3326, 6185),  # One Pair
+    9: (6186, 7462),  # High Card
+}
+
 _POS_LABELS_6 = {0: 'BTN', 1: 'SB', 2: 'BB', 3: 'UTG', 4: 'MP', 5: 'CO'}
 
 
@@ -509,7 +522,7 @@ class ObservationBuilder:
             features.append(np.array([0.5, 0.5, 0.5, 0.5, 0.2],
                                      dtype=np.float32))  # avg hand
             features.append(self._stack_features(players, player_idx))
-            features.append(np.array([0.45, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            features.append(np.array([0.45, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
                                      dtype=np.float32))  # avg equity
 
         features.append(self._street_features(street))
@@ -587,7 +600,7 @@ class ObservationBuilder:
                          n_opponents: int = 1) -> np.ndarray:
         """8 dims: equity (Monte Carlo) + board texture features."""
         if len(hole_cards) < 2:
-            return np.zeros(8, dtype=np.float32)
+            return np.zeros(9, dtype=np.float32)
 
         r1 = _rank_val(hole_cards[0][0])
         r2 = _rank_val(hole_cards[1][0])
@@ -612,55 +625,86 @@ class ObservationBuilder:
             hand_strength = self._approx_preflop_equity(hole_cards)
 
         if not community_cards:
-            return np.array([hand_strength, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
+            return np.zeros(9, dtype=np.float32)
 
         if not _TREYS_AVAILABLE:
-            return np.array([hand_strength, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
+            return np.array([hand_strength, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
 
         # Postflop: treys for made hand category + texture features
         try:
             treys_hole = [TreysCard.new(c[0] + c[1].lower()) for c in hole_cards[:2]]
             treys_board = [TreysCard.new(c[0] + c[1].lower()) for c in community_cards]
         except Exception:
-            return np.array([hand_strength, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
+            return np.array([hand_strength, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
 
         rank_int = _TREYS_EVALUATOR.evaluate(treys_board, treys_hole)
         rank_class = _TREYS_EVALUATOR.get_rank_class(rank_int)
         made_hand_cat = (9 - rank_class) / 8.0
 
-        # Flush/straight draws
-        all_ranks = [_rank_val(c[0]) for c in hole_cards[:2]] + \
-                    [_rank_val(c[0]) for c in community_cards]
-        all_suits = [c[1] for c in hole_cards[:2]] + \
-                    [c[1] for c in community_cards]
+        # Within-category rank: how good is this hand within its category?
+        # 1.0 = best in category (e.g. nut flush), 0.0 = worst
+        lower, upper = _TREYS_RANK_BOUNDS.get(rank_class, (1, 7462))
+        if upper > lower:
+            hand_rank_within_cat = float((upper - rank_int) / (upper - lower))
+        else:
+            hand_rank_within_cat = 1.0
 
-        suit_counts = {}
-        for s in all_suits:
-            suit_counts[s] = suit_counts.get(s, 0) + 1
-        has_flush_draw = 1.0 if any(v == 4 for v in suit_counts.values()) else 0.0
-
-        ranks_all = sorted(set(all_ranks))
-        if 14 in ranks_all:
-            ranks_all = sorted(set([1] + ranks_all))
-        has_straight_draw = 0.0
-        for start in range(1, 12):
-            if len(set(range(start, start + 5)) & set(ranks_all)) >= 4:
-                has_straight_draw = 1.0
-                break
-
-        # Top pair
         board_ranks = [_rank_val(c[0]) for c in community_cards]
         hole_ranks = [r1, r2]
         max_board = max(board_ranks)
         top_pair = 1.0 if max_board in hole_ranks else 0.0
 
-        # Board texture
-        board_is_paired = 1.0 if len(board_ranks) != len(set(board_ranks)) else 0.0
-
+        # Hero flush participation: how many hero cards match the board's
+        # dominant suit? Replaces has_flush_draw which falsely triggered on
+        # 4-flush boards where hero had no matching cards.
         board_suit_counts = {}
         for c in community_cards:
             s = c[1]
             board_suit_counts[s] = board_suit_counts.get(s, 0) + 1
+        dominant_suit = max(board_suit_counts, key=board_suit_counts.get)
+        max_board_suited = board_suit_counts[dominant_suit]
+        if max_board_suited >= 2:
+            hero_match = sum(1 for c in hole_cards[:2] if c[1] == dominant_suit)
+            hero_flush_part = hero_match / 2.0
+        else:
+            hero_flush_part = 0.0
+
+        # Hero straight participation: does hero's card contribute to a
+        # straight? Replaces has_straight_draw which triggered for ALL hands
+        # on 4-straight boards.
+        board_ranks_set = set(board_ranks)
+        if 14 in board_ranks_set:
+            board_ranks_set.add(1)
+        hero_ranks_set = set(hole_ranks)
+        if 14 in hero_ranks_set:
+            hero_ranks_set.add(1)
+        hero_straight_part = 0.0
+        for start in range(1, 11):
+            window = set(range(start, start + 5))
+            combined_in = len(window & (board_ranks_set | hero_ranks_set))
+            hero_adds = combined_in - len(window & board_ranks_set)
+            if combined_in >= 4 and hero_adds > 0:
+                if combined_in == 5:
+                    hero_straight_part = 1.0
+                    break
+                else:
+                    hero_straight_part = max(hero_straight_part, 0.5)
+
+        # Board pairing level: 0=unpaired, 0.33=single pair, 0.67=double
+        # paired, 1.0=trips on board.
+        from collections import Counter
+        board_rank_counts = Counter(board_ranks)
+        max_rank_count = max(board_rank_counts.values())
+        num_pairs = sum(1 for c in board_rank_counts.values() if c >= 2)
+        if max_rank_count >= 3:
+            board_pairing_level = 1.0
+        elif num_pairs >= 2:
+            board_pairing_level = 0.67
+        elif num_pairs == 1:
+            board_pairing_level = 0.33
+        else:
+            board_pairing_level = 0.0
+
         max_bs = max(board_suit_counts.values()) if board_suit_counts else 1
         board_flush_texture = float(np.clip((max_bs - 1) / 3.0, 0.0, 1.0))
 
@@ -674,9 +718,9 @@ class ObservationBuilder:
         board_straight_texture = float(consecutive / max_possible)
 
         return np.array(
-            [hand_strength, made_hand_cat, has_flush_draw, has_straight_draw,
-             top_pair, board_is_paired, board_flush_texture,
-             board_straight_texture],
+            [hand_strength, made_hand_cat, hero_flush_part, hero_straight_part,
+             top_pair, board_pairing_level, board_flush_texture,
+             board_straight_texture, hand_rank_within_cat],
             dtype=np.float32)
 
     @staticmethod

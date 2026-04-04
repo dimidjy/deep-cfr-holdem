@@ -1361,10 +1361,10 @@ def main():
                         help='Generate this many self-play hands and mix into training data. '
                              'Adds fold examples missing from showdown-only data.')
     parser.add_argument('--selfplay-model-fb', type=str,
-                        default='models/cql_6p_facing_bet_v8.pt',
+                        default='models/cql_6p_facing_bet_v9.pt',
                         help='Facing-bet model for self-play generation')
     parser.add_argument('--selfplay-model-ct', type=str,
-                        default='models/cql_6p_checked_to_v4.pt',
+                        default='models/cql_6p_checked_to_v5.pt',
                         help='Checked-to model for self-play generation')
     parser.add_argument('--spot-filter', type=str, default='',
                         choices=['', 'facing_bet', 'checked_to'],
@@ -1655,7 +1655,7 @@ def main():
     print(f'  TRAINING CQL')
     print(f'{"="*60}')
 
-    patience = 50
+    patience = 20
     patience_counter = 0
 
     output_path = Path(args.output)

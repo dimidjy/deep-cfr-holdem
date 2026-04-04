@@ -174,7 +174,7 @@ def classify_hand_strength(obs):
             return label
 
     # Check draws if air
-    if has_flush_draw > 0.5 or has_straight_draw > 0.5:
+    if has_flush_draw > 0.0 or has_straight_draw > 0.0:
         return 'draw'
     return 'air'
 

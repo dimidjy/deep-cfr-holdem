@@ -39,6 +39,20 @@ except ImportError:
     _EVAL7_AVAILABLE = False
 
 
+# Treys rank_class → (best_rank_int, worst_rank_int) for within-category ranking
+_TREYS_RANK_BOUNDS = {
+    1: (1, 10),       # Straight Flush
+    2: (11, 166),     # Four of a Kind
+    3: (167, 322),    # Full House
+    4: (323, 1599),   # Flush
+    5: (1600, 1609),  # Straight
+    6: (1610, 2467),  # Three of a Kind
+    7: (2468, 3325),  # Two Pair
+    8: (3326, 6185),  # One Pair
+    9: (6186, 7462),  # High Card
+}
+
+
 class FastEnhancedPokerEngine(FastPokerEngine):
     """
     Drop-in replacement for EnhancedPokerEngine using the fast pokers backend.
@@ -218,7 +232,7 @@ class FastEnhancedPokerEngine(FastPokerEngine):
             board_pkrs = self._state.public_cards
 
             if len(hole) < 2:
-                return np.zeros(8, dtype=np.float32)
+                return np.zeros(9, dtype=np.float32)
 
             r1 = self._rank_to_value(_pkrs_card_rank(hole[0]))
             r2 = self._rank_to_value(_pkrs_card_rank(hole[1]))
@@ -241,7 +255,7 @@ class FastEnhancedPokerEngine(FastPokerEngine):
                 hand_strength = self._approx_preflop_equity(hole)
 
             if not board_pkrs:
-                return np.array([hand_strength, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
+                return np.zeros(9, dtype=np.float32)
 
             # Postflop: treys for made hand category + texture features
             def _to_treys(c):
@@ -255,27 +269,12 @@ class FastEnhancedPokerEngine(FastPokerEngine):
             rank_class = _TREYS_EVALUATOR.get_rank_class(rank_int)
             made_hand_cat = (9 - rank_class) / 8.0
 
-            # Flush / straight draws
-            all_ranks_str = (
-                [_pkrs_card_rank(c) for c in hole[:2]]
-                + [_pkrs_card_rank(c) for c in board_pkrs])
-            all_suits_str = (
-                [_pkrs_card_suit(c) for c in hole[:2]]
-                + [_pkrs_card_suit(c) for c in board_pkrs])
-
-            suit_counts = {}
-            for s in all_suits_str:
-                suit_counts[s] = suit_counts.get(s, 0) + 1
-            has_flush_draw = 1.0 if any(v == 4 for v in suit_counts.values()) else 0.0
-
-            ranks_all = sorted(set(self._rank_to_value(r) for r in all_ranks_str))
-            if 14 in ranks_all:
-                ranks_all = sorted(set([1] + ranks_all))
-            has_straight_draw = 0.0
-            for start in range(1, 12):
-                if len(set(range(start, start + 5)) & set(ranks_all)) >= 4:
-                    has_straight_draw = 1.0
-                    break
+            # Within-category rank: how good within its hand category?
+            lower, upper = _TREYS_RANK_BOUNDS.get(rank_class, (1, 7462))
+            if upper > lower:
+                hand_rank_within_cat = float((upper - rank_int) / (upper - lower))
+            else:
+                hand_rank_within_cat = 1.0
 
             # Top pair
             board_ranks = [self._rank_to_value(_pkrs_card_rank(c))
@@ -284,13 +283,53 @@ class FastEnhancedPokerEngine(FastPokerEngine):
             max_board = max(board_ranks)
             top_pair = 1.0 if max_board in hole_ranks else 0.0
 
-            # Board texture
-            board_is_paired = 1.0 if len(board_ranks) != len(set(board_ranks)) else 0.0
-
+            # Hero flush participation
             board_suit_counts = {}
             for c in board_pkrs:
                 s = _pkrs_card_suit(c)
                 board_suit_counts[s] = board_suit_counts.get(s, 0) + 1
+            dominant_suit = max(board_suit_counts, key=board_suit_counts.get)
+            max_board_suited = board_suit_counts[dominant_suit]
+            hero_suits = [_pkrs_card_suit(c) for c in hole[:2]]
+            if max_board_suited >= 2:
+                hero_match = sum(1 for s in hero_suits if s == dominant_suit)
+                hero_flush_part = hero_match / 2.0
+            else:
+                hero_flush_part = 0.0
+
+            # Hero straight participation
+            board_ranks_set = set(board_ranks)
+            if 14 in board_ranks_set:
+                board_ranks_set.add(1)
+            hero_ranks_set = set(hole_ranks)
+            if 14 in hero_ranks_set:
+                hero_ranks_set.add(1)
+            hero_straight_part = 0.0
+            for start in range(1, 11):
+                window = set(range(start, start + 5))
+                combined_in = len(window & (board_ranks_set | hero_ranks_set))
+                hero_adds = combined_in - len(window & board_ranks_set)
+                if combined_in >= 4 and hero_adds > 0:
+                    if combined_in == 5:
+                        hero_straight_part = 1.0
+                        break
+                    else:
+                        hero_straight_part = max(hero_straight_part, 0.5)
+
+            # Board pairing level
+            from collections import Counter
+            board_rank_counts = Counter(board_ranks)
+            max_rank_count = max(board_rank_counts.values())
+            num_pairs = sum(1 for c in board_rank_counts.values() if c >= 2)
+            if max_rank_count >= 3:
+                board_pairing_level = 1.0
+            elif num_pairs >= 2:
+                board_pairing_level = 0.67
+            elif num_pairs == 1:
+                board_pairing_level = 0.33
+            else:
+                board_pairing_level = 0.0
+
             max_bs = max(board_suit_counts.values()) if board_suit_counts else 1
             board_flush_texture = float(np.clip((max_bs - 1) / 3.0, 0.0, 1.0))
 
@@ -304,12 +343,12 @@ class FastEnhancedPokerEngine(FastPokerEngine):
             board_straight_texture = float(consecutive / max_possible)
 
             return np.array(
-                [hand_strength, made_hand_cat, has_flush_draw, has_straight_draw,
-                 top_pair, board_is_paired, board_flush_texture,
-                 board_straight_texture],
+                [hand_strength, made_hand_cat, hero_flush_part, hero_straight_part,
+                 top_pair, board_pairing_level, board_flush_texture,
+                 board_straight_texture, hand_rank_within_cat],
                 dtype=np.float32)
         except Exception:
-            return np.zeros(8, dtype=np.float32)
+            return np.zeros(9, dtype=np.float32)
 
     def _approx_preflop_equity(self, hole) -> float:
         """Fallback preflop equity when eval7 is unavailable."""
