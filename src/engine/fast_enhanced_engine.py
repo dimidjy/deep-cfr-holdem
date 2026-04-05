@@ -59,6 +59,8 @@ class FastEnhancedPokerEngine(FastPokerEngine):
     Produces identical feature vectors for the same game state.
     """
 
+    BEHAVIORAL_STATS_DIM = 8
+
     def __init__(self, num_players: int = 6,
                  add_position_features: bool = True,
                  add_pot_odds_features: bool = True,
@@ -68,7 +70,8 @@ class FastEnhancedPokerEngine(FastPokerEngine):
                  add_street_features: bool = True,
                  add_game_state_features: bool = True,
                  add_betting_history_features: bool = True,
-                 legacy_game_state: bool = False):
+                 legacy_game_state: bool = False,
+                 behavioral_stats: bool = False):
         self.add_position_features = add_position_features
         self.add_pot_odds_features = add_pot_odds_features
         self.add_hand_strength_features = add_hand_strength_features
@@ -78,8 +81,10 @@ class FastEnhancedPokerEngine(FastPokerEngine):
         self.add_game_state_features = add_game_state_features
         self.add_betting_history_features = add_betting_history_features
         self.legacy_game_state = legacy_game_state  # 3 dims instead of 6
+        self.add_behavioral_stats = behavioral_stats
 
         self.num_players = num_players
+        self._bh = None  # behavioral tracking state (must be before super().__init__)
         self.enhanced_obs_size = self._calculate_enhanced_size()
         super().__init__(num_players)
 
@@ -94,13 +99,15 @@ class FastEnhancedPokerEngine(FastPokerEngine):
         if self.add_stack_features:
             size += 2
         if self.add_equity_features:
-            size += 8
+            size += 9
         if self.add_street_features:
             size += 4
         if self.add_game_state_features:
             size += 3 if self.legacy_game_state else 6
         if self.add_betting_history_features:
             size += 5
+        if self.add_behavioral_stats:
+            size += self.BEHAVIORAL_STATS_DIM
         return size
 
     def get_observation_space_size(self) -> int:
@@ -127,6 +134,8 @@ class FastEnhancedPokerEngine(FastPokerEngine):
             features.append(self._get_game_state_features())
         if self.add_betting_history_features:
             features.append(self._get_betting_history_features())
+        if self.add_behavioral_stats:
+            features.append(self._get_behavioral_stats_features())
 
         if features:
             return np.concatenate(features).astype(np.float32)
@@ -469,3 +478,152 @@ class FastEnhancedPokerEngine(FastPokerEngine):
                 dtype=np.float32)
         except Exception:
             return np.zeros(5, dtype=np.float32)
+
+    # ── Behavioral stats: within-hand action tracking ───────────────────────
+
+    def reset(self):
+        result = super().reset()
+        if self.add_behavioral_stats:
+            avg_stack = 100.0  # default starting stack
+            self._bh = {
+                'pot_committed': 0,
+                'street_bets': {},           # player_idx → chips bet this street
+                'player_agg': {},            # player_idx → aggressive action count
+                'player_total': {},          # player_idx → total action count
+                'player_fold': {},           # player_idx → fold count
+                'sizing_ratios': [],         # (player_idx, ratio) tuples
+                'raise_count': 0,
+                'street_actions': [],        # (player_idx, action_type) tuples
+                'avg_stack': avg_stack,
+                'last_stage': 'Preflop',
+            }
+        return result
+
+    def step(self, action: int):
+        if self.add_behavioral_stats and self._bh is not None and not self._done:
+            self._bh_track_action(action)
+        return super().step(action)
+
+    def _bh_track_action(self, action: int):
+        """Track action for behavioral stats before it's applied."""
+        bh = self._bh
+        if bh is None:
+            return
+
+        # Detect street transition
+        stage = str(self._state.stage)
+        if stage != bh['last_stage']:
+            bh['pot_committed'] += sum(bh['street_bets'].values())
+            bh['street_bets'] = {}
+            bh['street_actions'] = []
+            bh['last_stage'] = stage
+
+        pidx = self._state.current_player
+        ps = self._state.players_state[pidx]
+
+        # Classify action
+        max_bet = max(p.bet_chips for p in self._state.players_state)
+        call_amount = max(0, max_bet - ps.bet_chips)
+
+        # action: 0=fold, 1=call/check, 2=raise_half, 3=raise_pot, 4=all_in
+        is_aggressive = action >= 2  # raise/all-in
+        is_fold = (action == 0)
+
+        bh['player_total'][pidx] = bh['player_total'].get(pidx, 0) + 1
+        if is_aggressive:
+            bh['player_agg'][pidx] = bh['player_agg'].get(pidx, 0) + 1
+            bh['raise_count'] += 1
+        if is_fold:
+            bh['player_fold'][pidx] = bh['player_fold'].get(pidx, 0) + 1
+
+        # Track bet sizing for aggressive actions
+        if is_aggressive:
+            current_pot = bh['pot_committed'] + sum(bh['street_bets'].values())
+            if current_pot > 0:
+                # Estimate bet amount based on action type
+                if action == 2:  # raise half
+                    est_bet = current_pot * 0.5
+                elif action == 3:  # raise pot
+                    est_bet = current_pot
+                elif action == 4:  # all-in
+                    est_bet = ps.stake
+                else:
+                    est_bet = current_pot * 0.5
+                ratio = est_bet / max(current_pot, 1)
+                bh['sizing_ratios'].append((pidx, ratio))
+
+        # Track street bets
+        if action == 1:  # call
+            bh['street_bets'][pidx] = bh['street_bets'].get(pidx, 0) + call_amount
+        elif is_aggressive:
+            # Approximate: raise adds to street bets
+            bh['street_bets'][pidx] = max_bet + (max_bet if action == 3 else max_bet // 2)
+
+        bh['street_actions'].append((pidx, 'agg' if is_aggressive else ('fold' if is_fold else 'passive')))
+
+    def _get_behavioral_stats_features(self) -> np.ndarray:
+        """Compute 8-dim behavioral stats from tracked within-hand actions.
+
+        Mirrors src/agent/obs_builder.py behavioral stats:
+          0. opp_aggression_ratio
+          1. opp_fold_ratio
+          2. avg_bet_sizing (normalized /3)
+          3. max_bet_sizing (normalized /3)
+          4. num_raises_norm (/6)
+          5. street_aggression
+          6. opp_check_ratio
+          7. pot_escalation
+        """
+        feats = np.zeros(self.BEHAVIORAL_STATS_DIM, dtype=np.float32)
+        bh = self._bh
+        if bh is None:
+            return feats
+
+        try:
+            hero_idx = self._cur_idx()
+
+            # Opponent totals (exclude hero)
+            opp_total = sum(c for p, c in bh['player_total'].items() if p != hero_idx)
+            opp_agg = sum(c for p, c in bh['player_agg'].items() if p != hero_idx)
+            opp_fold = sum(c for p, c in bh['player_fold'].items() if p != hero_idx)
+            opp_sizing = [r for p, r in bh['sizing_ratios'] if p != hero_idx]
+
+            opp_denom = max(opp_total, 1)
+
+            # 0: opp aggression ratio
+            feats[0] = opp_agg / opp_denom
+
+            # 1: opp fold ratio
+            feats[1] = opp_fold / opp_denom
+
+            # 2: avg bet sizing (normalized: /3 so 3x pot → 1.0)
+            if opp_sizing:
+                feats[2] = min(sum(opp_sizing) / len(opp_sizing) / 3.0, 1.0)
+
+            # 3: max bet sizing
+            if opp_sizing:
+                feats[3] = min(max(opp_sizing) / 3.0, 1.0)
+
+            # 4: num raises normalized (/6)
+            feats[4] = min(bh['raise_count'] / 6.0, 1.0)
+
+            # 5: current street aggression (all players)
+            sa = bh['street_actions']
+            if sa:
+                agg_count = sum(1 for _, a in sa if a == 'agg')
+                feats[5] = agg_count / len(sa)
+
+            # 6: opp check ratio on current street
+            opp_street = [(p, a) for p, a in sa if p != hero_idx]
+            if opp_street:
+                check_count = sum(1 for _, a in opp_street if a == 'passive')
+                feats[6] = check_count / len(opp_street)
+
+            # 7: pot escalation (total pot / avg starting stack)
+            total_pot = bh['pot_committed'] + sum(bh['street_bets'].values())
+            feats[7] = min(total_pot / max(bh['avg_stack'], 1), 1.0)
+
+        except Exception:
+            pass
+
+        return feats

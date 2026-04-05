@@ -80,7 +80,8 @@ def _current_strategy(deep_cfr, obs, player_idx, legal):
 # Model loading (reused from validate_spots.py)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _make_engine(num_players: int, legacy_game_state: bool = False) -> EnhancedPokerEngine:
+def _make_engine(num_players: int, legacy_game_state: bool = False,
+                  behavioral_stats: bool = False) -> EnhancedPokerEngine:
     return EnhancedPokerEngine(
         num_players=num_players,
         add_position_features=True,
@@ -92,6 +93,7 @@ def _make_engine(num_players: int, legacy_game_state: bool = False) -> EnhancedP
         add_game_state_features=True,
         add_betting_history_features=True,
         legacy_game_state=legacy_game_state,
+        behavioral_stats=behavioral_stats,
     )
 
 
@@ -195,7 +197,8 @@ def _autodetect_players(model_path: Path, default: int = 6, force_legacy: bool =
 
 
 def _load_model(model_path: Path, config: dict, num_players: int,
-                legacy: bool = False, model_num_players: int = None):
+                legacy: bool = False, model_num_players: int = None,
+                behavioral_stats: bool = False):
     """Load model. If model_num_players is set and differs from num_players,
     observations will be padded from num_players to model_num_players format."""
     ckpt = torch.load(str(model_path), map_location='cpu')
@@ -215,7 +218,8 @@ def _load_model(model_path: Path, config: dict, num_players: int,
     if _is_supervised_checkpoint(ckpt):
         # Use model's trained player count for obs_size/action_size
         model_np = mnp or ckpt.get('num_players', num_players)
-        engine_for_model = _make_engine(model_np, legacy_game_state=legacy)
+        engine_for_model = _make_engine(model_np, legacy_game_state=legacy,
+                                         behavioral_stats=behavioral_stats)
         obs_size = ckpt.get('obs_size', engine_for_model.get_observation_space_size())
         action_size = ckpt.get('action_size', engine_for_model.get_action_space_size())
         hidden = ckpt.get('hidden_layers', config['network']['hidden_layers'])
@@ -227,7 +231,8 @@ def _load_model(model_path: Path, config: dict, num_players: int,
             model, obs_size, action_size, num_players,
             ckpt.get('epoch', 0),
             model_num_players=model_np if model_np != num_players else None)
-    engine = _make_engine(num_players, legacy_game_state=legacy)
+    engine = _make_engine(num_players, legacy_game_state=legacy,
+                          behavioral_stats=behavioral_stats)
     deep_cfr = DeepCFR(
         observation_size=engine.get_observation_space_size(),
         action_size=engine.get_action_space_size(),
@@ -1242,6 +1247,10 @@ def main():
                         help='Path to bad players list (for split metrics)')
     args = parser.parse_args()
 
+    game_players_override = args.game_players if args.game_players > 0 else None
+
+    config = load_config(str(Path(__file__).parent.parent / 'configs/training_config.json'))
+
     # ── Split model mode (uses DecisionEngine — same logic as runtime agent) ──
     if args.model_facing_bet and args.model_checked_to:
         from src.decision_engine import DecisionEngine, DecisionConfig, SpotContext
@@ -1354,7 +1363,8 @@ def main():
               (' (legacy obs)' if legacy else ''))
 
         deep_cfr = _load_model(model_path, config, num_players, legacy,
-                               model_num_players=model_np if num_players != model_np else None)
+                               model_num_players=model_np if num_players != model_np else None,
+                               behavioral_stats=args.behavioral_stats)
         for net in deep_cfr.advantage_networks + deep_cfr.strategy_networks:
             net.eval()
         print(f'Loaded model: {model_path.name}  (iteration {deep_cfr.iteration})')

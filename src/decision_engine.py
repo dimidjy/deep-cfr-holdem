@@ -432,62 +432,10 @@ class DecisionEngine:
                 self._load_reraise(rr_path)
 
     def _load_one(self, path: str, exclude_fold: bool = False):
-        """Load a CQL/Supervised/DeepCFR checkpoint. Returns (wrapper, obs_size)."""
-        import torch
-        checkpoint = torch.load(path, map_location='cpu')
-
-        # CQL / IQL model
-        if checkpoint.get('model_type') in ('cql', 'iql'):
-            from scripts.train_cql import QNetwork, CQLModelWrapper
-            obs_size = checkpoint['obs_size']
-            action_size = checkpoint['action_size']
-            hidden = checkpoint.get('hidden_layers', [512, 512, 256])
-            dropout = checkpoint.get('dropout', 0.1)
-            temp = checkpoint.get('temperature', 1.0)
-            num_players = checkpoint.get('num_players', 6)
-
-            q_net = QNetwork(obs_size, action_size, hidden, dropout)
-            q_net.load_state_dict(checkpoint['model_state_dict'])
-            q_net.eval()
-
-            wrapper = CQLModelWrapper(
-                q_net, obs_size, action_size, num_players, 'cpu',
-                iteration=checkpoint.get('epoch', 0),
-                temperature=temp, exclude_fold=exclude_fold)
-            return wrapper, obs_size
-
-        # Supervised model
-        if 'model_state_dict' in checkpoint and 'advantage_networks' not in checkpoint:
-            from src.training.deep_cfr import StrategyNetwork
-            obs_size = checkpoint.get('obs_size', 38)
-            action_size = checkpoint.get('action_size', 5)
-            hidden = checkpoint.get('hidden_layers', [512, 512, 256])
-            dropout = checkpoint.get('dropout', 0.1)
-            num_players = checkpoint.get('num_players', 6)
-            net = StrategyNetwork(obs_size, action_size, hidden, dropout)
-            net.load_state_dict(checkpoint['model_state_dict'])
-            net.eval()
-            wrapper = _SupervisedWrapper(net, obs_size, action_size, num_players,
-                                          checkpoint.get('epoch', 0))
-            return wrapper, obs_size
-
-        # Deep CFR model
-        from src.training import DeepCFR
-        from src.engine import FastEnhancedPokerEngine
-        engine = FastEnhancedPokerEngine(
-            num_players=6, add_position_features=True,
-            add_pot_odds_features=True, add_hand_strength_features=True,
-            add_stack_features=True, add_equity_features=True,
-            add_street_features=True, add_game_state_features=True,
-            add_betting_history_features=True)
-        obs_size = engine.get_observation_space_size()
-        action_size = engine.get_action_space_size()
-        deep_cfr = DeepCFR(
-            observation_size=obs_size, action_size=action_size,
-            num_players=6, hidden_layers=[512, 512, 256],
-            learning_rate=0.001, buffer_size=100000, device='cpu')
-        deep_cfr.load_models(path)
-        return deep_cfr, obs_size
+        """Load a CQL/Supervised/DeepCFR checkpoint. Returns (adapter, obs_size)."""
+        from src.models import load_model
+        adapter, obs_size = load_model(path, exclude_fold=exclude_fold)
+        return adapter, obs_size
 
     def _load_reraise(self, path: str) -> None:
         """Load the binary re-raise classifier."""

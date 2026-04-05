@@ -731,6 +731,8 @@ def main():
                         help='Number of hands to play (default: 10000)')
     parser.add_argument('--players', type=int, default=6,
                         help='Number of players (default: 6)')
+    parser.add_argument('--model', type=str, default='',
+                        help='Single Deep CFR checkpoint (used for all spots)')
     parser.add_argument('--model-facing-bet', type=str,
                         default='models/cql_6p_facing_bet_v9.pt')
     parser.add_argument('--model-checked-to', type=str,
@@ -762,15 +764,22 @@ def main():
         allin_filter=not args.no_guards,
         style_tuning=not args.no_guards,
         use_preflop_ranges=not args.no_preflop_ranges,
-        raise_randomize=True,
+        raise_randomize=not args.no_guards,
     )
     engine = DecisionEngine(dc)
-    engine.load_models(
-        facing_bet=args.model_facing_bet,
-        checked_to=args.model_checked_to,
-        facing_bet_3bet=args.model_facing_bet_3bet
-            if Path(args.model_facing_bet_3bet).exists() else '',
-    )
+    if args.model:
+        # Single Deep CFR checkpoint — use for all spots
+        engine.load_models(
+            facing_bet=args.model,
+            checked_to=args.model,
+        )
+    else:
+        engine.load_models(
+            facing_bet=args.model_facing_bet,
+            checked_to=args.model_checked_to,
+            facing_bet_3bet=args.model_facing_bet_3bet
+                if Path(args.model_facing_bet_3bet).exists() else '',
+        )
     engine.load_preflop_ranges()
     print(f'  Engine A: {engine.info()}')
 
