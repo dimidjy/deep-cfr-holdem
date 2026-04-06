@@ -6,6 +6,9 @@ are interchangeable between engines.
 """
 
 import math
+import sys
+from pathlib import Path
+
 import numpy as np
 
 from .fast_poker_engine import (
@@ -53,6 +56,237 @@ _TREYS_RANK_BOUNDS = {
 }
 
 
+# ── GPU Equity Model (optional, replaces Monte Carlo) ─────────────────────────
+_EQUITY_MODEL = None
+_EQUITY_DEVICE = None
+
+def load_equity_model(path: str, device: str = 'cpu'):
+    """Load the trained equity prediction network for fast inference.
+    Auto-detects v1 (simple) vs v2 (residual) architecture from checkpoint."""
+    global _EQUITY_MODEL, _EQUITY_DEVICE
+    import torch
+
+    ckpt = torch.load(path, map_location=device)
+    input_size = ckpt.get('input_size', 24)
+    output_size = ckpt.get('output_size', 9)
+    hidden = ckpt.get('hidden', [128, 128, 64])
+
+    # Try loading via current EquityNetwork class first, then fallback
+    import torch.nn as tnn
+    try:
+        sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'scripts'))
+        from train_equity_model import EquityNetwork
+        model = EquityNetwork(input_size=input_size, output_size=output_size, hidden=hidden)
+        model.load_state_dict(ckpt['model_state_dict'])
+    except (RuntimeError, Exception):
+        # Fallback: build simple Sequential wrapped in 'net' attribute (v1 compat)
+        class _SimpleEquity(tnn.Module):
+            def __init__(self, in_sz, out_sz, hid):
+                super().__init__()
+                layers = []
+                prev = in_sz
+                for h in hid:
+                    layers.extend([tnn.Linear(prev, h), tnn.ReLU(), tnn.Dropout(0.05)])
+                    prev = h
+                layers.append(tnn.Linear(prev, out_sz))
+                self.net = tnn.Sequential(*layers)
+            def forward(self, x):
+                return self.net(x)
+        model = _SimpleEquity(input_size, output_size, hidden)
+        model.load_state_dict(ckpt['model_state_dict'])
+
+    model.eval()
+    model.to(device)
+    _EQUITY_MODEL = model
+    _EQUITY_DEVICE = device
+
+_RANK_MAP_EQ = {r: i for i, r in enumerate('23456789TJQKA')}
+_SUIT_MAP_EQ = {s: i for i, s in enumerate('shdc')}
+
+
+def _encode_card_for_equity(rank_char, suit_char):
+    """Encode one card as 6 features for the equity model."""
+    r = _RANK_MAP_EQ.get(rank_char.upper(), 0)
+    s = _SUIT_MAP_EQ.get(suit_char.lower(), 0)
+    feat = np.zeros(6, dtype=np.float32)
+    feat[0] = r / 12.0
+    feat[1 + s] = 1.0
+    feat[5] = 1.0
+    return feat
+
+
+def _equity_model_predict(hole_ranks, hole_suits, board_ranks, board_suits,
+                           hole_cards_raw, board_cards_raw):
+    """Use GPU equity model to predict 9-dim equity features.
+
+    Returns numpy array of shape (9,) or None if model not loaded.
+    """
+    if _EQUITY_MODEL is None:
+        return None
+
+    import torch
+    from collections import Counter
+
+    # Detect input size from model's first layer
+    first_param = next(_EQUITY_MODEL.parameters())
+    input_size = first_param.shape[1] if first_param.dim() == 2 else 82
+
+    features = np.zeros(input_size, dtype=np.float32)
+
+    if input_size <= 24:
+        # v1 simple encoding: rank_norm + suit_norm per card + basic derived
+        for i, (r, s) in enumerate(zip(hole_ranks[:2], hole_suits[:2])):
+            features[i*2] = r / 12.0
+            features[i*2 + 1] = s / 3.0
+        for i, (r, s) in enumerate(zip(board_ranks[:5], board_suits[:5])):
+            features[4 + i*2] = r / 12.0
+            features[4 + i*2 + 1] = s / 3.0
+        d = 14
+        h_ranks = list(hole_ranks[:2])
+        h_suits = list(hole_suits[:2])
+        features[d+0] = 1.0 if h_ranks[0] == h_ranks[1] else 0.0
+        features[d+1] = 1.0 if h_suits[0] == h_suits[1] else 0.0
+        features[d+2] = max(h_ranks) / 12.0
+        features[d+3] = min(h_ranks) / 12.0
+        features[d+4] = len(board_ranks) / 5.0
+        if board_ranks:
+            features[d+5] = max(board_ranks) / 12.0
+            from collections import Counter as C2
+            brc2 = C2(board_ranks)
+            features[d+6] = 1.0 if max(brc2.values()) >= 2 else 0.0
+            bsc2 = C2(board_suits)
+            features[d+7] = max(bsc2.values()) / 5.0
+            unique2 = sorted(set(board_ranks))
+            mc2 = 1; c2 = 1
+            for ii in range(1, len(unique2)):
+                if unique2[ii] - unique2[ii-1] == 1: c2 += 1; mc2 = max(mc2, c2)
+                else: c2 = 1
+            features[d+8] = mc2 / 4.0
+            features[d+9] = (max(board_ranks) - min(board_ranks)) / 12.0
+
+        with torch.no_grad():
+            inp = torch.from_numpy(features).unsqueeze(0)
+            if _EQUITY_DEVICE and _EQUITY_DEVICE != 'cpu':
+                inp = inp.to(_EQUITY_DEVICE)
+            return _EQUITY_MODEL(inp).cpu().numpy()[0]
+
+    # v2 rich encoding (82 dims)
+    for i, (r, s) in enumerate(zip(hole_ranks[:2], hole_suits[:2])):
+        features[i*6] = r / 12.0
+        features[i*6 + 1 + s] = 1.0
+        features[i*6 + 5] = 1.0
+    for i, (r, s) in enumerate(zip(board_ranks[:5], board_suits[:5])):
+        features[(i+2)*6] = r / 12.0
+        features[(i+2)*6 + 1 + s] = 1.0
+        features[(i+2)*6 + 5] = 1.0
+
+    d = 42
+    h_ranks = list(hole_ranks[:2])
+    h_suits = list(hole_suits[:2])
+
+    features[d+0] = 1.0 if h_ranks[0] == h_ranks[1] else 0.0
+    features[d+1] = 1.0 if h_suits[0] == h_suits[1] else 0.0
+    features[d+2] = max(h_ranks) / 12.0
+    features[d+3] = min(h_ranks) / 12.0
+    features[d+4] = abs(h_ranks[0] - h_ranks[1]) / 12.0
+    features[d+5] = len(board_ranks) / 5.0
+
+    if board_ranks:
+        b_ranks = list(board_ranks)
+        b_suits = list(board_suits)
+        all_ranks = h_ranks + b_ranks
+        all_suits = h_suits + b_suits
+
+        features[d+6] = max(b_ranks) / 12.0
+        features[d+7] = min(b_ranks) / 12.0
+        features[d+8] = (max(b_ranks) - min(b_ranks)) / 12.0
+
+        brc = Counter(b_ranks)
+        features[d+9] = max(brc.values()) / 4.0
+        features[d+10] = sum(1 for v in brc.values() if v >= 2) / 3.0
+
+        bsc = Counter(b_suits)
+        features[d+11] = max(bsc.values()) / 5.0
+        dom_suit = bsc.most_common(1)[0][0]
+        features[d+12] = sum(1 for s in h_suits if s == dom_suit) / 2.0
+
+        asc = Counter(all_suits)
+        features[d+13] = max(asc.values()) / 7.0
+        features[d+14] = 1.0 if max(asc.values()) >= 4 else 0.0
+        features[d+15] = 1.0 if max(asc.values()) >= 5 else 0.0
+
+        def _max_consec(ranks):
+            if not ranks: return 0
+            mc, c = 1, 1
+            for i in range(1, len(ranks)):
+                if ranks[i] - ranks[i-1] == 1: c += 1; mc = max(mc, c)
+                else: c = 1
+            return mc
+
+        unique_all = sorted(set(all_ranks))
+        if 12 in unique_all: unique_all = sorted(set([-1] + unique_all))
+        unique_board = sorted(set(b_ranks))
+        if 12 in unique_board: unique_board = sorted(set([-1] + unique_board))
+
+        features[d+16] = _max_consec(unique_all) / 5.0
+        features[d+17] = _max_consec(unique_board) / 5.0
+
+        board_set = set(b_ranks)
+        if 12 in board_set: board_set.add(-1)
+        hero_set = set(h_ranks)
+        if 12 in hero_set: hero_set.add(-1)
+        hero_str = 0.0
+        for start in range(-1, 10):
+            window = set(range(start, start + 5))
+            combined = len(window & (board_set | hero_set))
+            hero_adds = combined - len(window & board_set)
+            if combined >= 4 and hero_adds > 0:
+                hero_str = 1.0 if combined == 5 else 0.5
+                if combined == 5: break
+        features[d+18] = hero_str
+
+        features[d+19] = 1.0 if max(b_ranks) in h_ranks else 0.0
+        features[d+20] = 1.0 if (h_ranks[0] == h_ranks[1] and h_ranks[0] > max(b_ranks)) else 0.0
+        features[d+21] = sum(1 for r in h_ranks if r in b_ranks) / 2.0
+        features[d+22] = sum(1 for r in h_ranks if r > max(b_ranks)) / 2.0
+        features[d+23] = 1.0 if len(set(b_suits)) == 1 else 0.0
+        features[d+24] = len(board_ranks) / 5.0
+
+        for si in range(4):
+            hero_has = sum(1 for s in h_suits if s == si)
+            board_has = bsc.get(si, 0)
+            features[d+25+si] = (hero_has + board_has) / 7.0
+
+        arc = Counter(all_ranks)
+        features[d+29] = sum(1 for v in arc.values() if v >= 2) / 6.0
+        features[d+30] = sum(1 for v in arc.values() if v >= 3) / 3.0
+        features[d+31] = sum(1 for v in arc.values() if v >= 4) / 2.0
+
+        features[d+32] = sum(1 for r in b_ranks if r <= 4) / max(len(b_ranks), 1)
+        features[d+33] = sum(1 for r in b_ranks if 5 <= r <= 8) / max(len(b_ranks), 1)
+        features[d+34] = sum(1 for r in b_ranks if r >= 9) / max(len(b_ranks), 1)
+
+        hero_on_board = sum(1 for r in h_ranks if r in b_ranks)
+        if hero_on_board == 1:
+            kicker = [r for r in h_ranks if r not in b_ranks]
+            features[d+35] = kicker[0] / 12.0 if kicker else 0.0
+        else:
+            features[d+35] = max(h_ranks) / 12.0
+
+        features[d+36] = 1.0 if len(board_ranks) == 3 else 0.0
+        features[d+37] = 1.0 if len(board_ranks) == 4 else 0.0
+        features[d+38] = 1.0 if len(board_ranks) == 5 else 0.0
+        features[d+39] = 1.0 if len(board_ranks) == 0 else 0.0
+
+    with torch.no_grad():
+        inp = torch.from_numpy(features).unsqueeze(0)
+        if _EQUITY_DEVICE and _EQUITY_DEVICE != 'cpu':
+            inp = inp.to(_EQUITY_DEVICE)
+        pred = _EQUITY_MODEL(inp).cpu().numpy()[0]
+
+    return pred
+
+
 class FastEnhancedPokerEngine(FastPokerEngine):
     """
     Drop-in replacement for EnhancedPokerEngine using the fast pokers backend.
@@ -90,6 +324,7 @@ class FastEnhancedPokerEngine(FastPokerEngine):
         self._opponent_profile = None  # 5-dim array, set via set_opponent_profile()
         self.rake_pct = rake_pct  # e.g. 0.05 = 5%
         self.rake_cap = rake_cap  # max rake in chips (0 = no cap)
+        self.use_equity_model = (_EQUITY_MODEL is not None)  # auto-detect
 
         self.num_players = num_players
         self._bh = None  # behavioral tracking state (must be before super().__init__)
@@ -271,7 +506,18 @@ class FastEnhancedPokerEngine(FastPokerEngine):
             r2 = self._rank_to_value(_pkrs_card_rank(hole[1]))
             hi, lo = max(r1, r2), min(r1, r2)
 
-            # Monte Carlo equity vs random range (eval7)
+            # Try GPU equity model first (fast path)
+            if self.use_equity_model:
+                hole_ranks = [r1, r2]
+                hole_suits = [_SUIT_MAP_EQ.get(_pkrs_card_suit(c).lower(), 0) for c in hole[:2]]
+                board_ranks = [self._rank_to_value(_pkrs_card_rank(c)) for c in board_pkrs]
+                board_suits = [_SUIT_MAP_EQ.get(_pkrs_card_suit(c).lower(), 0) for c in board_pkrs]
+                pred = _equity_model_predict(hole_ranks, hole_suits,
+                                              board_ranks, board_suits, hole, board_pkrs)
+                if pred is not None:
+                    return pred
+
+            # Fallback: Monte Carlo equity vs random range (eval7)
             def _to_card_str(c):
                 return _pkrs_card_rank(c) + _pkrs_card_suit(c).lower()
 
@@ -279,7 +525,7 @@ class FastEnhancedPokerEngine(FastPokerEngine):
                 try:
                     e7_hole = [_eval7.Card(_to_card_str(c)) for c in hole[:2]]
                     e7_board = [_eval7.Card(_to_card_str(c)) for c in board_pkrs] if board_pkrs else []
-                    n_samples = 1000 if not board_pkrs else 300
+                    n_samples = 500 if not board_pkrs else 150
                     hand_strength = _eval7.py_hand_vs_range_monte_carlo(
                         e7_hole, _EVAL7_RANDOM_RANGE, e7_board, n_samples)
                 except Exception:

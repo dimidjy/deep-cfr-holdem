@@ -175,7 +175,11 @@ class ReplayBuffer:
         self._dirty = False
 
     def sample_player_tensors(self, batch_size: int, player_idx: int, device):
-        """Sample batch and return GPU tensors directly (skips Python dicts)."""
+        """Sample batch with importance weights. Returns 6 tensors (+ weights).
+
+        Uses fast uniform sampling instead of slow weighted np.random.choice.
+        Iteration weighting is applied via importance weights in the loss.
+        """
         if self._dirty:
             self.rebuild_indices()
 
@@ -184,20 +188,24 @@ class ReplayBuffer:
         if n == 0:
             return None
 
-        w = self._player_weights[player_idx]
         k = min(batch_size, n)
-        chosen = np.random.choice(n, size=k, replace=False, p=w)
+        chosen = np.random.randint(0, n, size=k)  # fast uniform sampling
         sel = idx[chosen]
+
+        # Importance weights: iteration-proportional (normalize to mean=1)
+        raw_w = self.iterations[sel].copy()
+        raw_w /= max(raw_w.mean(), 1e-8)
 
         states_t = torch.from_numpy(self.states[sel]).to(device, non_blocking=True)
         actions_t = torch.from_numpy(self.actions[sel]).to(device, non_blocking=True)
         regrets_t = torch.from_numpy(self.regrets[sel]).to(device, non_blocking=True)
         strategies_t = torch.from_numpy(self.strategies[sel]).to(device, non_blocking=True)
         legal_masks_t = torch.from_numpy(self.legal_masks[sel]).to(device, non_blocking=True)
-        return states_t, actions_t, regrets_t, strategies_t, legal_masks_t
+        weights_t = torch.from_numpy(raw_w.astype(np.float32)).to(device, non_blocking=True)
+        return states_t, actions_t, regrets_t, strategies_t, legal_masks_t, weights_t
 
     def sample_player_tensors_sqrt(self, batch_size: int, player_idx: int, device):
-        """Sample with sqrt iteration weights (flatter, for strategy network)."""
+        """Sample with sqrt importance weights (flatter, for strategy network)."""
         if self._dirty:
             self.rebuild_indices()
 
@@ -206,17 +214,21 @@ class ReplayBuffer:
         if n == 0:
             return None
 
-        w = self._player_weights_sqrt[player_idx]
         k = min(batch_size, n)
-        chosen = np.random.choice(n, size=k, replace=False, p=w)
+        chosen = np.random.randint(0, n, size=k)  # fast uniform sampling
         sel = idx[chosen]
+
+        # Sqrt importance weights (flatter than linear)
+        raw_w = np.sqrt(self.iterations[sel].copy())
+        raw_w /= max(raw_w.mean(), 1e-8)
 
         states_t = torch.from_numpy(self.states[sel]).to(device, non_blocking=True)
         actions_t = torch.from_numpy(self.actions[sel]).to(device, non_blocking=True)
         regrets_t = torch.from_numpy(self.regrets[sel]).to(device, non_blocking=True)
         strategies_t = torch.from_numpy(self.strategies[sel]).to(device, non_blocking=True)
         legal_masks_t = torch.from_numpy(self.legal_masks[sel]).to(device, non_blocking=True)
-        return states_t, actions_t, regrets_t, strategies_t, legal_masks_t
+        weights_t = torch.from_numpy(raw_w.astype(np.float32)).to(device, non_blocking=True)
+        return states_t, actions_t, regrets_t, strategies_t, legal_masks_t, weights_t
 
     def sample_player(self, batch_size: int, player_idx: int) -> List[Dict]:
         """Legacy dict-based sampling (kept for compatibility)."""
@@ -471,14 +483,15 @@ class DeepCFR:
                 batch_size, player_idx, self.device)
             if batch is None:
                 continue
-            states, actions, regrets, _, _ = batch
+            states, actions, regrets, _, _, weights = batch
 
             self.advantage_optimizers[player_idx].zero_grad()
 
             with torch.cuda.amp.autocast(enabled=self._amp_enabled):
                 predicted = self.advantage_networks[player_idx](states)
                 pred_act = predicted.gather(1, actions.unsqueeze(1)).squeeze(1)
-                loss = nn.MSELoss()(pred_act, regrets)
+                # Weighted MSE loss (importance sampling)
+                loss = (weights * (pred_act - regrets) ** 2).mean()
 
             self._scaler.scale(loss).backward()
             self._scaler.unscale_(self.advantage_optimizers[player_idx])
@@ -508,7 +521,7 @@ class DeepCFR:
                 batch_size, player_idx, self.device)
             if batch is None:
                 continue
-            states, _, _, target_strategies, legal_masks = batch
+            states, _, _, target_strategies, legal_masks, weights = batch
 
             self.strategy_optimizers[player_idx].zero_grad()
 
@@ -530,9 +543,9 @@ class DeepCFR:
                 kl_per_action = masked_targets * (
                     torch.log(masked_targets + 1e-8) - log_probs
                 )
-                # Zero out illegal actions
+                # Zero out illegal actions, apply importance weights
                 kl_per_action = kl_per_action * legal_masks
-                loss = kl_per_action.sum(dim=-1).mean()
+                loss = (weights * kl_per_action.sum(dim=-1)).mean()
 
             self._scaler.scale(loss).backward()
             self._scaler.unscale_(self.strategy_optimizers[player_idx])

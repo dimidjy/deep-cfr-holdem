@@ -6,10 +6,10 @@
     "num_iterations": 3000,
     "batch_size": 65536,
     "learning_rate": 0.0003,
-    "buffer_size": 40000000,
+    "buffer_size": 10000000,
     "traversals_per_iteration": 18000,
     "checkpoint_interval": 50,
-    "train_passes": 20,
+    "train_passes": 10,
     "gradient_clip": 1.0,
     "lr_scheduler_t_max": 2500
   },

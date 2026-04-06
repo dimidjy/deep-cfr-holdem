@@ -234,6 +234,22 @@ class ObservationBuilder:
         r2 = _rank_val(hole_cards[1][0])
         hi, lo = max(r1, r2), min(r1, r2)
 
+        # Try GPU equity model first (fast path)
+        try:
+            from src.engine.fast_enhanced_engine import _EQUITY_MODEL, _equity_model_predict, _SUIT_MAP_EQ
+            if _EQUITY_MODEL is not None:
+                hole_ranks = [r1, r2]
+                hole_suits = [_SUIT_MAP_EQ.get(hole_cards[0][1].lower(), 0),
+                              _SUIT_MAP_EQ.get(hole_cards[1][1].lower(), 0)]
+                board_ranks = [_rank_val(c[0]) for c in community_cards]
+                board_suits = [_SUIT_MAP_EQ.get(c[1].lower(), 0) for c in community_cards]
+                pred = _equity_model_predict(hole_ranks, hole_suits,
+                                              board_ranks, board_suits, None, None)
+                if pred is not None:
+                    return pred
+        except Exception:
+            pass
+
         if _EVAL7_AVAILABLE:
             try:
                 e7_hole = [_eval7.Card(c) for c in hole_cards[:2]]

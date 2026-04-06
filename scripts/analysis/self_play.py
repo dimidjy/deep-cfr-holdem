@@ -346,6 +346,13 @@ def run_self_play(engine: DecisionEngine, num_hands: int,
                 elif action >= RAISE_HALF:
                     stats[seat].postflop_bets += 1
                     stats[seat].actions_by_street[street_key]['raise'] += 1
+                    # Granular raise tracking
+                    if action == RAISE_HALF:
+                        stats[seat].actions_by_street[street_key]['raise_half'] += 1
+                    elif action == RAISE_POT:
+                        stats[seat].actions_by_street[street_key]['raise_pot'] += 1
+                    elif action == ALL_IN:
+                        stats[seat].actions_by_street[street_key]['all_in'] += 1
                 elif action == CALL:
                     # Action 1 = check when not facing bet, call when facing bet
                     if not facing_bet:
@@ -579,6 +586,40 @@ def generate_report(all_stats: Dict[int, PlayerStats], num_players: int,
         w(f'  {st:<8} {_pct(ck, tot):>8} {_pct(ca, tot):>8} '
           f'{_pct(ra, tot):>8} {_pct(fo, tot):>8} '
           f'{tot:>8}  {st_af:>5.2f}')
+    w('')
+
+    # ── Granular action breakdown (Raise½ / RaisePot / AllIn) ──
+    w('─' * 70)
+    w('POSTFLOP RAISE BREAKDOWN BY STREET')
+    w('─' * 70)
+    w(f'  {"Street":<8} {"Fold":>8} {"Check":>8} {"Call":>8} '
+      f'{"Raise½":>8} {"RaisePot":>9} {"AllIn":>8}')
+    w(f'  {"-"*8} {"-"*8} {"-"*8} {"-"*8} {"-"*8} {"-"*9} {"-"*8}')
+    for st in ['flop', 'turn', 'river']:
+        acts = agg.actions_by_street.get(st, {})
+        fo = acts.get('fold', 0)
+        ck = acts.get('check', 0)
+        ca = acts.get('call', 0)
+        rh = acts.get('raise_half', 0)
+        rp = acts.get('raise_pot', 0)
+        ai = acts.get('all_in', 0)
+        tot = fo + ck + ca + rh + rp + ai
+        w(f'  {st:<8} {_pct(fo, tot):>8} {_pct(ck, tot):>8} {_pct(ca, tot):>8} '
+          f'{_pct(rh, tot):>8} {_pct(rp, tot):>9} {_pct(ai, tot):>8}')
+
+    # Overall action totals
+    all_acts = defaultdict(int)
+    for st in ['flop', 'turn', 'river']:
+        for k, v in agg.actions_by_street.get(st, {}).items():
+            all_acts[k] += v
+    tot_all = sum(all_acts.values())
+    if tot_all > 0:
+        w(f'  {"TOTAL":<8} {_pct(all_acts["fold"], tot_all):>8} '
+          f'{_pct(all_acts["check"], tot_all):>8} '
+          f'{_pct(all_acts["call"], tot_all):>8} '
+          f'{_pct(all_acts["raise_half"], tot_all):>8} '
+          f'{_pct(all_acts["raise_pot"], tot_all):>9} '
+          f'{_pct(all_acts["all_in"], tot_all):>8}')
     w('')
 
     # ── Preflop ranges summary ──

@@ -262,7 +262,7 @@ def _traversal_worker(args):
             eng.step(a)
         return eng
 
-    def _branch_exact(history, legal_int, n_samples=5):
+    def _branch_exact(history, legal_int, n_samples=3):
         """Branch all legal actions, average n_samples rollouts to reduce variance.
         All-in (action 4) gets 2x samples because its variance is much higher
         (winning +3 or losing -98 vs fold which is always ~-1)."""
@@ -443,6 +443,8 @@ def main():
                         help='Rake percentage (e.g. 0.05 = 5%%, default: 0 = no rake)')
     parser.add_argument('--rake-cap', type=float, default=6.0,
                         help='Max rake in chips per hand (default: 6 = 3BB)')
+    parser.add_argument('--equity-model', type=str, default=None,
+                        help='Path to GPU equity model (.pt) to replace Monte Carlo')
     args = parser.parse_args()
 
     if args.no_preflop_ranges:
@@ -463,6 +465,13 @@ def main():
     _ARCHETYPE_MODE = args.archetype_mode
     _RAKE_PCT = args.rake
     _RAKE_CAP = args.rake_cap
+
+    # Load GPU equity model if specified
+    if args.equity_model:
+        from src.engine.fast_enhanced_engine import load_equity_model
+        eq_device = 'cpu'  # workers run on CPU; use 'cuda' only if single-process
+        load_equity_model(args.equity_model, device=eq_device)
+        print(f'  equity  : GPU model ({Path(args.equity_model).name}) on {eq_device}')
 
     print('=' * 60)
     print('DEEP CFR  —  GPU + MULTI-CORE')
@@ -743,18 +752,10 @@ def main():
                 try:
                     new_config = load_config(str(config_path))
                     new_tp = new_config['training'].get('train_passes', train_passes)
-                    new_lr = new_config['training'].get('learning_rate', None)
                     changed = []
                     if new_tp != train_passes:
                         train_passes = new_tp
                         changed.append(f'train_passes={train_passes}')
-                    if new_lr is not None:
-                        for opt in deep_cfr.advantage_optimizers + deep_cfr.strategy_optimizers:
-                            for pg in opt.param_groups:
-                                if abs(pg['lr'] - new_lr) > 1e-8:
-                                    pg['lr'] = new_lr
-                                    if 'lr' not in [c.split('=')[0] for c in changed]:
-                                        changed.append(f'lr={new_lr}')
                     new_bs = new_config['training'].get('batch_size', batch_size)
                     if new_bs != batch_size:
                         batch_size = new_bs
@@ -849,8 +850,8 @@ def main():
             writer.add_scalar('perf/total_time', total,   iter_num)
             writer.add_scalar('buffer/size', len(deep_cfr.replay_buffer), iter_num)
 
-            # ── K-Best pool update every 25 iters (more frequent than checkpoints)
-            if iter_num % 25 == 0 and iter_num > 0:
+            # ── K-Best pool update every 100 iters (pool restart is expensive ~30s)
+            if iter_num % 100 == 0 and iter_num > 0:
                 try:
                     pool_nets = []
                     for net in deep_cfr.strategy_networks:
