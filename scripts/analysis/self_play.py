@@ -38,6 +38,7 @@ from src.decision_engine import (
     IDX_POT_ODDS, IDX_MADE_HAND, NUM_ACTIONS, ACTION_NAMES,
 )
 from src.engine import FastEnhancedPokerEngine
+from src.archetypes import get_archetype_skew, ARCHETYPE_NAMES
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Hand notation
@@ -131,6 +132,40 @@ class PlayerStats:
     # By street
     actions_by_street: Dict[str, Dict[str, int]] = field(
         default_factory=lambda: defaultdict(lambda: defaultdict(int)))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Archetype engine wrapper
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ArchetypeEngine:
+    """Wraps a DecisionEngine, applying an archetype skew to its strategy output.
+
+    Used for calibrating archetype multipliers: run self-play with this as
+    engine_b, then check if the resulting stats match the target profile.
+    """
+
+    def __init__(self, base_engine: DecisionEngine, skew_fn):
+        self._base = base_engine
+        self._skew = skew_fn
+
+    def decide(self, ctx):
+        strategy = self._base.get_strategy(ctx)
+        strategy = self._skew(strategy, ctx.legal_actions)
+        strategy_list = [float(strategy[i]) for i in range(NUM_ACTIONS)]
+        # Sample action from skewed strategy
+        legal = ctx.legal_actions
+        probs = np.array([strategy_list[a] for a in legal])
+        s = probs.sum()
+        if s > 0:
+            probs /= s
+        else:
+            probs = np.ones(len(legal)) / len(legal)
+        action = int(np.random.choice(legal, p=probs))
+        return action, strategy_list
+
+    def info(self):
+        return f'{self._base.info()} + archetype_skew'
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -750,9 +785,13 @@ def main():
                         help='Disable guards and style tuning (raw model)')
     parser.add_argument('--no-preflop-ranges', action='store_true',
                         help='Disable GTO preflop ranges (model plays preflop too)')
+    parser.add_argument('--archetype', type=str, default='',
+                        choices=['', 'calling_station', 'nit', 'maniac', 'weak_tight'],
+                        help='Use archetype as opponent (engine B). '
+                             'Wraps the same model with a strategy skew.')
     args = parser.parse_args()
 
-    vs_mode = bool(args.vs_facing_bet)
+    vs_mode = bool(args.vs_facing_bet) or bool(args.archetype)
 
     print('=' * 70)
     print('SELF-PLAY ANALYSIS' + (' — VS MODE' if vs_mode else ''))
@@ -783,9 +822,13 @@ def main():
     engine.load_preflop_ranges()
     print(f'  Engine A: {engine.info()}')
 
-    # Setup DecisionEngine B (vs mode)
+    # Setup DecisionEngine B (vs mode or archetype mode)
     engine_b = None
-    if vs_mode:
+    if args.archetype:
+        skew_fn = get_archetype_skew(args.archetype)
+        engine_b = ArchetypeEngine(engine, skew_fn)
+        print(f'  Engine B: archetype={args.archetype} (skew on engine A)')
+    elif vs_mode:
         engine_b = DecisionEngine(dc)
         engine_b.load_models(
             facing_bet=args.vs_facing_bet,
@@ -807,8 +850,8 @@ def main():
 
     # Generate report
     if vs_mode:
-        label_a = Path(args.model_facing_bet).stem
-        label_b = Path(args.vs_facing_bet).stem
+        label_a = Path(args.model or args.model_facing_bet).stem
+        label_b = args.archetype if args.archetype else Path(args.vs_facing_bet).stem
         report = _generate_vs_report(stats, args.players, args.hands, label_a, label_b)
     else:
         report = generate_report(stats, args.players, args.hands)

@@ -87,8 +87,17 @@ class ObservationBuilder:
         self.behavioral_stats = behavioral_stats
         self.equity_vs_odds = equity_vs_odds
 
-    def build(self, game_state: GameState) -> Optional[np.ndarray]:
-        """Build observation vector from GameState. Returns None if hole cards missing."""
+    def build(self, game_state: GameState,
+              opponent_profile: np.ndarray = None) -> Optional[np.ndarray]:
+        """Build observation vector from GameState.
+
+        Args:
+            game_state: Current game state from parser.
+            opponent_profile: Optional 5-dim cross-hand opponent stats
+                (VPIP, PFR, AF_norm, Fold2CBet, WTSD). If None, skipped.
+
+        Returns None if hole cards missing.
+        """
         players = game_state.active_players
         if not players:
             return None
@@ -123,6 +132,9 @@ class ObservationBuilder:
         if self.behavioral_stats:
             features.append(self._behavioral_stats_features(
                 game_state, players, player_idx))
+
+        if opponent_profile is not None:
+            features.append(opponent_profile.astype(np.float32))
 
         obs = np.concatenate(features).astype(np.float32)
 

@@ -29,6 +29,10 @@ from torch.utils.tensorboard import SummaryWriter
 
 from src.training import DeepCFR
 from src.utils import load_config
+from src.archetypes import (
+    get_archetype_skew, get_archetype_profile, random_archetype,
+    OPPONENT_PROFILE_DIM,
+)
 from validate_spots import run_validation, validation_summary_line
 
 
@@ -37,14 +41,22 @@ _SHARED_ADV_NETS   = None
 _SHARED_STRAT_NETS = None
 _ACT_SIZE          = None   # action space size, needed for uniform fallback strategy
 
+# K-Best Self-Play: pool of historical strategy networks for diverse opponents
+_KBEST_POOL = None  # list of (label, [net_per_player]) or None if disabled
+
 _REWARD_SCALE = 100.0
 _REGRET_CLIP  = 1.0
+_RAKE_PCT     = 0.0
+_RAKE_CAP     = 0.0
 
 # Worker-local engine pool — reuse PettingZoo envs instead of recreating per branch
 _ENGINE_POOL = []
 
 # Preflop range override — loaded once per worker
 _PREFLOP_RANGES = None      # PreflopRanges instance (or None if disabled)
+
+# Archetype opponent training — set per worker via _worker_init
+_ARCHETYPE_MODE = False
 
 
 def _get_engine(num_players):
@@ -60,11 +72,15 @@ def _return_engine(eng):
     _ENGINE_POOL.append(eng)
 
 
-def _worker_init(shared_adv, shared_strat, act_size, use_preflop_ranges=False):
+def _worker_init(shared_adv, shared_strat, act_size, use_preflop_ranges=False,
+                 archetype_mode=False, kbest_pool=None):
     global _SHARED_ADV_NETS, _SHARED_STRAT_NETS, _ACT_SIZE, _PREFLOP_RANGES
+    global _ARCHETYPE_MODE, _KBEST_POOL
     _SHARED_ADV_NETS  = shared_adv
     _SHARED_STRAT_NETS = shared_strat
     _ACT_SIZE          = act_size
+    _ARCHETYPE_MODE    = archetype_mode
+    _KBEST_POOL        = kbest_pool
     if use_preflop_ranges:
         from src.preflop_ranges import PreflopRanges
         _PREFLOP_RANGES = PreflopRanges()
@@ -83,13 +99,38 @@ def _worker_init(shared_adv, shared_strat, act_size, use_preflop_ranges=False):
 
 
 def _regret_match(adv, legal, epsilon=0.05):
-    """Regret-matching with epsilon-uniform exploration."""
+    """Regret-matching with epsilon-uniform exploration and action floor.
+
+    The action floor prevents any legal action from dropping to 0% probability.
+    This is critical for call (action 1) which tends to collapse to 0% in
+    self-play, creating the raise-or-fold degenerate equilibrium.
+    Standard epsilon exploration is uniform across all actions.
+    The action floor specifically ensures call retains minimum probability.
+    """
     strategy = np.zeros(len(adv), dtype=np.float32)
     pos = np.maximum(adv[legal], 0.0)
     s = pos.sum()
     strategy[legal] = pos / s if s > 0 else 1.0 / len(legal)
     if epsilon > 0:
         strategy[legal] = (1.0 - epsilon) * strategy[legal] + epsilon / len(legal)
+    # Action floor: ensure call (action 1) never drops below 3%
+    # This prevents the call-collapse that causes strategy oscillation.
+    # 3% is small enough to not distort Nash convergence but large enough
+    # to keep call regrets from going permanently negative.
+    CALL = 1
+    CALL_FLOOR = 0.03
+    if CALL in legal and strategy[CALL] < CALL_FLOOR:
+        deficit = CALL_FLOOR - strategy[CALL]
+        strategy[CALL] = CALL_FLOOR
+        # Take from the largest non-call action
+        others = [a for a in legal if a != CALL]
+        if others:
+            biggest = max(others, key=lambda a: strategy[a])
+            strategy[biggest] = max(0.0, strategy[biggest] - deficit)
+            # Renormalize
+            s = strategy[legal].sum()
+            if s > 0:
+                strategy[legal] /= s
     return strategy
 
 
@@ -106,6 +147,9 @@ def _make_engine(num_players):
         add_game_state_features=True,
         add_betting_history_features=True,
         behavioral_stats=True,
+        opponent_profile=_ARCHETYPE_MODE,
+        rake_pct=_RAKE_PCT,
+        rake_cap=_RAKE_CAP,
     )
 
 
@@ -141,9 +185,25 @@ def _traversal_worker(args):
     advantage network learns the correct preflop values over time.
     """
     global _SHARED_ADV_NETS, _SHARED_STRAT_NETS, _ACT_SIZE, _PREFLOP_RANGES
+    global _ARCHETYPE_MODE, _KBEST_POOL
     player_idx, num_players, current_iter = args
     # Decay exploration: 5% early → 1% by iter 2000
     epsilon = max(0.01, 0.05 * (1.0 - current_iter / 3000.0))
+
+    # Archetype opponent selection (per-traversal)
+    archetype_skew_fn = None
+    archetype_profile = None
+    if _ARCHETYPE_MODE:
+        arch_name = random_archetype()
+        archetype_skew_fn = get_archetype_skew(arch_name)
+        archetype_profile = get_archetype_profile(arch_name)
+
+    # K-Best Self-Play: pick which opponent nets to use for this traversal.
+    # 50% current strategy nets, 50% random historical version from pool.
+    # This forces the model to beat diverse opponents, preventing strategy collapse.
+    opp_nets = _SHARED_STRAT_NETS
+    if _KBEST_POOL and len(_KBEST_POOL) > 0 and np.random.random() < 0.7:
+        _, opp_nets = _KBEST_POOL[np.random.randint(len(_KBEST_POOL))]
 
     def _pick_opponent_action(ai, obs, legal, eng=None, is_preflop=False):
         # Preflop override for opponents too
@@ -157,12 +217,17 @@ def _traversal_worker(args):
                 lp = lp / s if s > 0 else np.ones(len(legal)) / len(legal)
                 return int(np.random.choice(legal, p=lp))
 
-        nets = _SHARED_STRAT_NETS
+        nets = opp_nets
         if nets is not None:
             with torch.no_grad():
                 obs_t = torch.from_numpy(obs.astype(np.float32)).unsqueeze(0)
                 strat = nets[ai](obs_t).numpy()[0]
-            lp = np.maximum(strat[legal], 0.0)
+            # Apply archetype skew to opponent strategy
+            if archetype_skew_fn is not None:
+                strat = archetype_skew_fn(strat, legal)
+                lp = strat[legal].copy()
+            else:
+                lp = np.maximum(strat[legal], 0.0)
             s = lp.sum()
             lp = lp / s if s > 0 else np.ones(len(legal)) / len(legal)
             return int(np.random.choice(legal, p=lp))
@@ -187,6 +252,8 @@ def _traversal_worker(args):
     def _fresh_engine_at(history):
         """Reuse pooled engine with saved state, replay history, return positioned engine."""
         eng = _get_engine(num_players)
+        if archetype_profile is not None:
+            eng.set_opponent_profile(archetype_profile)
         g   = eng._get_game()
         g.np_random.set_state(pre_reset_game_rng)
         g.dealer_id = pre_reset_dealer_id
@@ -240,6 +307,8 @@ def _traversal_worker(args):
     # immutable State object.  We must save it AFTER reset() so branches
     # replay the same dealt cards.  (Before reset returns the previous game.)
     engine = _get_engine(num_players)
+    if archetype_profile is not None:
+        engine.set_opponent_profile(archetype_profile)
     engine.reset()
     game = engine._get_game()
     pre_reset_game_rng  = game.np_random.get_state()
@@ -362,10 +431,25 @@ def main():
                         help='Lock preflop play to GTO ranges from configs/preflop_ranges.json (default: on)')
     parser.add_argument('--no-preflop-ranges', action='store_true',
                         help='Disable preflop range override, let neural net learn preflop')
+    parser.add_argument('--archetype-mode', action='store_true',
+                        help='Mixed archetype opponent training (extends obs to 55 dims)')
+    parser.add_argument('--fine-tune-from', type=str, default=None,
+                        help='Base checkpoint to fine-tune from (extends obs 50→55, lower LR)')
+    parser.add_argument('--kbest-seed', type=str, nargs='+', default=None,
+                        help='Checkpoint(s) to seed K-Best opponent pool (e.g. --kbest-seed models/best.pt models/iter200.pt)')
+    parser.add_argument('--load-buffer', type=str, default=None,
+                        help='Load replay buffer from .npz file (without resuming model weights)')
+    parser.add_argument('--rake', type=float, default=0.0,
+                        help='Rake percentage (e.g. 0.05 = 5%%, default: 0 = no rake)')
+    parser.add_argument('--rake-cap', type=float, default=6.0,
+                        help='Max rake in chips per hand (default: 6 = 3BB)')
     args = parser.parse_args()
 
     if args.no_preflop_ranges:
         args.preflop_ranges = False
+    # --fine-tune-from implies --archetype-mode
+    if args.fine_tune_from:
+        args.archetype_mode = True
 
     config_path = Path(__file__).parent.parent / 'configs/training_config.json'
     config = load_config(str(config_path))
@@ -373,6 +457,12 @@ def main():
     device      = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
     num_workers = args.workers or max(1, mp.cpu_count() - 1)
     num_players = config['game']['num_players']
+
+    # Set globals so _make_engine() uses them in workers
+    global _ARCHETYPE_MODE, _RAKE_PCT, _RAKE_CAP
+    _ARCHETYPE_MODE = args.archetype_mode
+    _RAKE_PCT = args.rake
+    _RAKE_CAP = args.rake_cap
 
     print('=' * 60)
     print('DEEP CFR  —  GPU + MULTI-CORE')
@@ -382,6 +472,12 @@ def main():
         print(f'  GPU      : {torch.cuda.get_device_name(0)}')
     print(f'  engine   : fast (Rust)')
     print(f'  preflop  : {"GTO ranges (locked)" if args.preflop_ranges else "neural net (learned)"}')
+    if args.rake > 0:
+        print(f'  rake     : {args.rake*100:.1f}% (cap {args.rake_cap:.0f} chips = {args.rake_cap/2:.1f}BB)')
+    if args.archetype_mode:
+        print(f'  archetype: ON (mixed opponent training)')
+    if args.fine_tune_from:
+        print(f'  fine-tune: {Path(args.fine_tune_from).name}')
     if args.warm_start:
         print(f'  warm-start: {Path(args.warm_start).name}')
     print(f'  workers  : {num_workers}')
@@ -395,8 +491,15 @@ def main():
     act_size = engine.get_action_space_size()
     print(f'\n  obs_size={obs_size}  act_size={act_size}\n')
 
+    # For fine-tuning: create DeepCFR with OLD obs size so checkpoint loads,
+    # then extend to new size after loading.
+    init_obs_size = obs_size
+    if args.fine_tune_from:
+        init_obs_size = obs_size - OPPONENT_PROFILE_DIM  # 55 - 5 = 50
+        print(f'  Fine-tune mode: init obs={init_obs_size}, target obs={obs_size}')
+
     deep_cfr = DeepCFR(
-        observation_size=obs_size,
+        observation_size=init_obs_size,
         action_size=act_size,
         num_players=num_players,
         hidden_layers=config['network']['hidden_layers'],
@@ -411,10 +514,49 @@ def main():
     start_iter = 0
     cfg_lr = config['training']['learning_rate']
     cfg_t_max = config['training'].get('lr_scheduler_t_max', 2000)
-    if args.resume:
+
+    if args.fine_tune_from:
+        ft_path = Path(args.fine_tune_from)
+        if not ft_path.exists():
+            print(f'Fine-tune checkpoint not found: {ft_path}')
+            sys.exit(1)
+        deep_cfr.load_models(str(ft_path))
+        start_iter = deep_cfr.iteration
+        print(f'Loaded base checkpoint — iteration {start_iter}')
+
+        # Extend networks from 50 → 55 dims
+        deep_cfr.extend_first_layer(obs_size)
+        print(f'Extended first layer: {init_obs_size} → {obs_size} dims')
+
+        # Lower LR for fine-tuning (5x lower than config)
+        ft_lr = args.lr if args.lr else cfg_lr * 0.2
+        for opt in deep_cfr.advantage_optimizers + deep_cfr.strategy_optimizers:
+            for pg in opt.param_groups:
+                pg['lr'] = ft_lr
+
+        from torch.optim import lr_scheduler
+        deep_cfr.advantage_schedulers = [
+            lr_scheduler.LinearLR(opt, start_factor=1.0, end_factor=0.1, total_iters=cfg_t_max)
+            for opt in deep_cfr.advantage_optimizers
+        ]
+        deep_cfr.strategy_schedulers = [
+            lr_scheduler.LinearLR(opt, start_factor=1.0, end_factor=0.1, total_iters=cfg_t_max)
+            for opt in deep_cfr.strategy_optimizers
+        ]
+        print(f'Fine-tune LR={ft_lr}, schedulers rebuilt (T_max={cfg_t_max})')
+
+    elif args.resume:
         deep_cfr.load_models(args.resume)
         start_iter = deep_cfr.iteration
         print(f'Resumed from checkpoint — iteration {start_iter}')
+
+        # Load replay buffer if available
+        buf_path = args.resume.replace('.pt', '_buffer.npz')
+        if Path(buf_path).exists():
+            deep_cfr.replay_buffer.load(buf_path)
+            print(f'Loaded replay buffer: {len(deep_cfr.replay_buffer):,} entries from {buf_path}')
+        else:
+            print(f'No buffer file found ({buf_path}), starting with empty buffer')
 
         # Override LR: use --lr flag if given, otherwise use config value
         new_lr = args.lr if args.lr else cfg_lr
@@ -450,6 +592,15 @@ def main():
             print(f'  source: {ws_path.name}  epoch={ckpt.get("epoch", "?")}  '
                   f'val_acc={ckpt.get("val_acc", 0):.1%}')
 
+    # Load buffer from file (without resuming model weights)
+    if args.load_buffer:
+        buf_path = Path(args.load_buffer)
+        if buf_path.exists():
+            deep_cfr.replay_buffer.load(str(buf_path))
+            print(f'Loaded replay buffer: {len(deep_cfr.replay_buffer):,} entries from {buf_path}')
+        else:
+            print(f'Warning: buffer file not found: {buf_path}')
+
     # Shared-memory CPU copies so workers can read current network weights.
     shared_adv_nets = []
     for net in deep_cfr.advantage_networks:
@@ -480,9 +631,74 @@ def main():
     print(f'batch_size={batch_size}  train_passes={train_passes}')
     print(f'Spawning {num_workers} workers...')
 
+    # K-Best Self-Play: pool of historical opponent networks
+    KBEST_K = 5  # keep top-K historical versions
+    kbest_pool = []  # list of (label, [shared_net_per_player])
+
+    # Seed the pool with the best known model + resume checkpoints
+    def _load_pool_checkpoint(path, label):
+        """Load a checkpoint into K-Best pool as shared-memory nets."""
+        from src.training.deep_cfr import StrategyNetwork
+        cp_data = torch.load(str(path), map_location='cpu')
+        strat_states = cp_data.get('strategy_networks', [])
+        if not strat_states:
+            return None
+        pool_nets = []
+        for sd in strat_states:
+            net = StrategyNetwork(obs_size, act_size,
+                                   config['network']['hidden_layers'],
+                                   config['network'].get('dropout', 0.1))
+            net.load_state_dict(sd)
+            net.eval()
+            net.share_memory()
+            pool_nets.append(net)
+        return (label, pool_nets)
+
+    # Seed pool from --kbest-seed flag, or auto-detect best model
+    if args.kbest_seed:
+        for seed_path in args.kbest_seed:
+            p = Path(seed_path)
+            if p.exists():
+                try:
+                    entry = _load_pool_checkpoint(p, p.stem)
+                    if entry:
+                        kbest_pool.append(entry)
+                except Exception as e:
+                    print(f'  Warning: failed to load pool seed {p}: {e}')
+            else:
+                print(f'  Warning: pool seed not found: {p}')
+    else:
+        # Auto-seed with best known model if it exists
+        best_model = models_dir.parent / 'deep_cfr_best.pt'
+        if best_model.exists():
+            try:
+                entry = _load_pool_checkpoint(best_model, 'best_iter300')
+                if entry:
+                    kbest_pool.append(entry)
+            except Exception:
+                pass
+
+    if args.resume:
+        ckpt_dir = models_dir
+        existing = sorted(ckpt_dir.glob('checkpoint_iter_*.pt'),
+                          key=lambda p: int(p.stem.split('_')[-1]))
+        if existing:
+            step = max(1, len(existing) // KBEST_K)
+            for cp in existing[::step][:KBEST_K]:
+                try:
+                    entry = _load_pool_checkpoint(cp, cp.stem)
+                    if entry:
+                        kbest_pool.append(entry)
+                except Exception:
+                    pass
+            if kbest_pool:
+                print(f'K-Best pool seeded with {len(kbest_pool)} checkpoints: '
+                      f'{", ".join(l for l, _ in kbest_pool)}')
+
     pool = Pool(processes=num_workers, initializer=_worker_init,
                 initargs=(shared_adv_nets, shared_strat_nets, act_size,
-                          args.preflop_ranges))
+                          args.preflop_ranges, args.archetype_mode,
+                          kbest_pool if kbest_pool else None))
     print('Workers ready.\n')
 
     _adv_hist   = deque(maxlen=10)
@@ -515,9 +731,38 @@ def main():
     try:
         async_result = None   # pending traversal results (pipeline overlap)
 
+        _last_config_reload = 0
+
         for iteration in range(start_iter, num_iterations):
             iter_num = iteration + 1
             t0 = time.time()
+
+            # ── Hot-reload config every 10 iterations ───────────────────────
+            if iter_num - _last_config_reload >= 10:
+                _last_config_reload = iter_num
+                try:
+                    new_config = load_config(str(config_path))
+                    new_tp = new_config['training'].get('train_passes', train_passes)
+                    new_lr = new_config['training'].get('learning_rate', None)
+                    changed = []
+                    if new_tp != train_passes:
+                        train_passes = new_tp
+                        changed.append(f'train_passes={train_passes}')
+                    if new_lr is not None:
+                        for opt in deep_cfr.advantage_optimizers + deep_cfr.strategy_optimizers:
+                            for pg in opt.param_groups:
+                                if abs(pg['lr'] - new_lr) > 1e-8:
+                                    pg['lr'] = new_lr
+                                    if 'lr' not in [c.split('=')[0] for c in changed]:
+                                        changed.append(f'lr={new_lr}')
+                    new_bs = new_config['training'].get('batch_size', batch_size)
+                    if new_bs != batch_size:
+                        batch_size = new_bs
+                        changed.append(f'batch_size={batch_size}')
+                    if changed:
+                        print(f'  [config reload] {", ".join(changed)}')
+                except Exception:
+                    pass  # config file might be mid-write
 
             # ── Collect traversal results ────────────────────────────────────
             if async_result is not None:
@@ -552,18 +797,21 @@ def main():
             # ── Train networks (GPU) — overlaps with next traversals (CPU) ───
             # Buffer warmup: after resume the buffer starts empty. Training on a
             # tiny buffer causes catastrophic overfitting (network sees all data
-            # 15x per iteration). Scale train_passes by buffer fullness so we
-            # only do full training once the buffer has enough diverse samples.
-            # Minimum threshold: 10× batch_size (~320K entries, ~7 iterations).
+            # many times per iteration). Skip training entirely until buffer has
+            # enough diverse samples, then ramp up train_passes gradually.
+            # Minimum threshold: 10× batch_size (~655K entries, ~15 iterations).
             buf_len = len(deep_cfr.replay_buffer)
-            min_buf = batch_size * 10
+            min_buf = batch_size * 40  # ~2.6M entries, several iterations of diverse data
             if buf_len < min_buf:
-                warmup_ratio = buf_len / min_buf
-                effective_passes = max(1, int(train_passes * warmup_ratio))
+                # Skip training — just collect data
+                effective_passes = 0
+                warmup_tag = f'  FILLING BUFFER {buf_len}/{min_buf} ({100*buf_len//min_buf}%)'
             else:
                 effective_passes = train_passes
+                warmup_tag = ''
 
-            print(f'Iter {iter_num:4d}  training...        ', end='\r', flush=True)
+            if effective_passes > 0:
+                print(f'Iter {iter_num:4d}  training...        ', end='\r', flush=True)
             deep_cfr.replay_buffer.rebuild_indices()
             adv_losses, strat_losses = [], []
             for _ in range(effective_passes):
@@ -580,7 +828,8 @@ def main():
             _adv_hist.append(adv)
             _strat_hist.append(strat)
 
-            warmup_tag = f'  warmup={effective_passes}/{train_passes}' if effective_passes < train_passes else ''
+            if not warmup_tag:
+                warmup_tag = ''
             print(
                 f'Iter {iter_num:4d}/{num_iterations}'
                 f'  buf={len(deep_cfr.replay_buffer):>7d}'
@@ -600,9 +849,39 @@ def main():
             writer.add_scalar('perf/total_time', total,   iter_num)
             writer.add_scalar('buffer/size', len(deep_cfr.replay_buffer), iter_num)
 
+            # ── K-Best pool update every 25 iters (more frequent than checkpoints)
+            if iter_num % 25 == 0 and iter_num > 0:
+                try:
+                    pool_nets = []
+                    for net in deep_cfr.strategy_networks:
+                        pnet = copy.deepcopy(net).cpu().eval()
+                        pnet.share_memory()
+                        pool_nets.append(pnet)
+                    label = f'iter_{iter_num}'
+                    kbest_pool.append((label, pool_nets))
+                    if len(kbest_pool) > KBEST_K:
+                        kbest_pool = [kbest_pool[0]] + kbest_pool[-(KBEST_K - 1):]
+                    # Restart workers with updated pool
+                    if async_result is not None:
+                        async_result.get()
+                        async_result = None
+                    pool.terminate()
+                    pool.join()
+                    pool = Pool(processes=num_workers, initializer=_worker_init,
+                                initargs=(shared_adv_nets, shared_strat_nets, act_size,
+                                          args.preflop_ranges, args.archetype_mode,
+                                          kbest_pool))
+                    pool_labels = ', '.join(l for l, _ in kbest_pool)
+                    print(f'  K-Best pool updated: [{pool_labels}]')
+                except Exception as e:
+                    print(f'  K-Best pool update failed: {e}')
+
             if iter_num % ckpt_interval == 0:
                 ckpt = str(models_dir / f'checkpoint_iter_{iter_num}.pt')
                 deep_cfr.save_models(ckpt)
+                # Save replay buffer alongside checkpoint
+                buf_path = ckpt.replace('.pt', '_buffer.npz')
+                deep_cfr.replay_buffer.save(buf_path)
                 meta = {'iteration': iter_num,
                         'buffer_size': len(deep_cfr.replay_buffer),
                         'config': config['training']}

@@ -60,6 +60,7 @@ class FastEnhancedPokerEngine(FastPokerEngine):
     """
 
     BEHAVIORAL_STATS_DIM = 8
+    OPPONENT_PROFILE_DIM = 5
 
     def __init__(self, num_players: int = 6,
                  add_position_features: bool = True,
@@ -71,7 +72,10 @@ class FastEnhancedPokerEngine(FastPokerEngine):
                  add_game_state_features: bool = True,
                  add_betting_history_features: bool = True,
                  legacy_game_state: bool = False,
-                 behavioral_stats: bool = False):
+                 behavioral_stats: bool = False,
+                 opponent_profile: bool = False,
+                 rake_pct: float = 0.0,
+                 rake_cap: float = 0.0):
         self.add_position_features = add_position_features
         self.add_pot_odds_features = add_pot_odds_features
         self.add_hand_strength_features = add_hand_strength_features
@@ -82,6 +86,10 @@ class FastEnhancedPokerEngine(FastPokerEngine):
         self.add_betting_history_features = add_betting_history_features
         self.legacy_game_state = legacy_game_state  # 3 dims instead of 6
         self.add_behavioral_stats = behavioral_stats
+        self.add_opponent_profile = opponent_profile
+        self._opponent_profile = None  # 5-dim array, set via set_opponent_profile()
+        self.rake_pct = rake_pct  # e.g. 0.05 = 5%
+        self.rake_cap = rake_cap  # max rake in chips (0 = no cap)
 
         self.num_players = num_players
         self._bh = None  # behavioral tracking state (must be before super().__init__)
@@ -108,6 +116,8 @@ class FastEnhancedPokerEngine(FastPokerEngine):
             size += 5
         if self.add_behavioral_stats:
             size += self.BEHAVIORAL_STATS_DIM
+        if self.add_opponent_profile:
+            size += self.OPPONENT_PROFILE_DIM
         return size
 
     def get_observation_space_size(self) -> int:
@@ -136,10 +146,24 @@ class FastEnhancedPokerEngine(FastPokerEngine):
             features.append(self._get_betting_history_features())
         if self.add_behavioral_stats:
             features.append(self._get_behavioral_stats_features())
+        if self.add_opponent_profile:
+            features.append(self._get_opponent_profile_features())
 
         if features:
             return np.concatenate(features).astype(np.float32)
         return np.zeros(self.enhanced_obs_size, dtype=np.float32)
+
+    # ── Opponent profile (cross-hand, set externally) ──────────────────────
+
+    def set_opponent_profile(self, profile: np.ndarray):
+        """Set cross-hand opponent profile (5 dims). Persists until changed."""
+        self._opponent_profile = profile
+
+    def _get_opponent_profile_features(self) -> np.ndarray:
+        """Return opponent profile or zeros if not set."""
+        if self._opponent_profile is not None:
+            return self._opponent_profile.astype(np.float32)
+        return np.zeros(self.OPPONENT_PROFILE_DIM, dtype=np.float32)
 
     # ── Helper: quick access to current state ────────────────────────────────
 
@@ -478,6 +502,24 @@ class FastEnhancedPokerEngine(FastPokerEngine):
                 dtype=np.float32)
         except Exception:
             return np.zeros(5, dtype=np.float32)
+
+    # ── Rake: deduct from winner's reward ────────────────────────────────────
+
+    def _finish(self):
+        """Mark hand as done, collect rewards, apply rake to winners."""
+        super()._finish()
+        if self.rake_pct > 0:
+            # Calculate total pot from rewards (winner's gain = pot - their investment)
+            total_pot = sum(max(0, r) for r in self._rewards.values())
+            if total_pot > 0:
+                rake = total_pot * self.rake_pct
+                if self.rake_cap > 0:
+                    rake = min(rake, self.rake_cap)
+                # Deduct rake proportionally from winners
+                for agent in self.agents:
+                    if self._rewards[agent] > 0:
+                        share = self._rewards[agent] / total_pot
+                        self._rewards[agent] -= rake * share
 
     # ── Behavioral stats: within-hand action tracking ───────────────────────
 

@@ -82,11 +82,16 @@ class StrategyNetwork(nn.Module):
 
 
 class ReplayBuffer:
-    """Columnar replay buffer using pre-allocated numpy arrays for fast sampling.
+    """Columnar replay buffer with reservoir sampling.
 
-    Instead of a list of Python dicts, stores data in contiguous numpy arrays.
-    This eliminates per-sample Python overhead during batch sampling (the main
-    training bottleneck: 300 sample calls × 32768 items per iteration).
+    Uses reservoir sampling instead of FIFO: once the buffer is full, each
+    new entry has a (capacity / total_seen) probability of replacing a random
+    existing entry. This preserves a representative sample across ALL
+    iterations, preventing strategy collapse from losing diverse old data.
+
+    Research confirms: "with sliding-window memories, exploitability stops
+    converging once the buffer becomes full. With reservoir sampling,
+    convergence improves." (Deep Predictive Discounted CFR, 2025)
     """
 
     def __init__(self, capacity: int, num_players: int = 6,
@@ -94,7 +99,7 @@ class ReplayBuffer:
         self.capacity = capacity
         self.num_players = num_players
         self._size = 0
-        self._pos = 0
+        self._total_seen = 0  # total entries ever added (for reservoir sampling)
 
         # Pre-allocated columnar storage
         self.states = np.zeros((capacity, obs_size), dtype=np.float32)
@@ -108,12 +113,26 @@ class ReplayBuffer:
         # Per-player index caches
         self._player_indices = [None] * num_players
         self._player_weights = [None] * num_players
+        self._player_weights_sqrt = [None] * num_players
         self._dirty = True
 
     def add(self, state: np.ndarray, action: int, regret: float,
             strategy: np.ndarray, player: int, iteration: int = 1,
             legal_mask: np.ndarray = None):
-        i = self._pos
+        self._total_seen += 1
+
+        if self._size < self.capacity:
+            # Buffer not full yet — append normally
+            i = self._size
+            self._size += 1
+        else:
+            # Reservoir sampling: accept with probability capacity / total_seen
+            # This ensures uniform sampling across all iterations ever seen
+            j = random.randint(0, self._total_seen - 1)
+            if j >= self.capacity:
+                return  # reject this entry (keeps existing data)
+            i = j  # replace random existing entry
+
         self.states[i] = state
         self.actions[i] = action
         self.regrets[i] = regret
@@ -121,18 +140,20 @@ class ReplayBuffer:
         if legal_mask is not None:
             self.legal_masks[i] = legal_mask
         else:
-            # Fallback: infer from strategy (non-zero = legal)
             self.legal_masks[i] = (strategy > 0).astype(np.float32)
         self.players[i] = player
         self.iterations[i] = max(iteration, 1)
-
-        self._pos = (self._pos + 1) % self.capacity
-        if self._size < self.capacity:
-            self._size += 1
         self._dirty = True
 
     def rebuild_indices(self):
-        """Rebuild per-player indices and pre-compute weights."""
+        """Rebuild per-player indices and pre-compute weights.
+
+        Two weight sets:
+        - _player_weights: linear iteration weighting (for advantage network)
+        - _player_weights_sqrt: sqrt iteration weighting (for strategy network)
+          Sqrt weighting gives more influence to older data, preventing the
+          strategy network from collapsing to the current aggressive policy.
+        """
         players_slice = self.players[:self._size]
         iters_slice = self.iterations[:self._size]
         for p in range(self.num_players):
@@ -140,11 +161,17 @@ class ReplayBuffer:
             idx = np.nonzero(mask)[0]
             self._player_indices[p] = idx
             if len(idx) > 0:
-                w = iters_slice[idx].copy()
+                # Linear weights for advantage network (standard Deep CFR)
+                w = iters_slice[idx].astype(np.float64)
                 w /= w.sum()
                 self._player_weights[p] = w
+                # Sqrt weights for strategy network (flatter, more diverse)
+                w_sqrt = np.sqrt(iters_slice[idx].astype(np.float64))
+                w_sqrt /= w_sqrt.sum()
+                self._player_weights_sqrt[p] = w_sqrt
             else:
                 self._player_weights[p] = None
+                self._player_weights_sqrt[p] = None
         self._dirty = False
 
     def sample_player_tensors(self, batch_size: int, player_idx: int, device):
@@ -158,6 +185,28 @@ class ReplayBuffer:
             return None
 
         w = self._player_weights[player_idx]
+        k = min(batch_size, n)
+        chosen = np.random.choice(n, size=k, replace=False, p=w)
+        sel = idx[chosen]
+
+        states_t = torch.from_numpy(self.states[sel]).to(device, non_blocking=True)
+        actions_t = torch.from_numpy(self.actions[sel]).to(device, non_blocking=True)
+        regrets_t = torch.from_numpy(self.regrets[sel]).to(device, non_blocking=True)
+        strategies_t = torch.from_numpy(self.strategies[sel]).to(device, non_blocking=True)
+        legal_masks_t = torch.from_numpy(self.legal_masks[sel]).to(device, non_blocking=True)
+        return states_t, actions_t, regrets_t, strategies_t, legal_masks_t
+
+    def sample_player_tensors_sqrt(self, batch_size: int, player_idx: int, device):
+        """Sample with sqrt iteration weights (flatter, for strategy network)."""
+        if self._dirty:
+            self.rebuild_indices()
+
+        idx = self._player_indices[player_idx]
+        n = len(idx)
+        if n == 0:
+            return None
+
+        w = self._player_weights_sqrt[player_idx]
         k = min(batch_size, n)
         chosen = np.random.choice(n, size=k, replace=False, p=w)
         sel = idx[chosen]
@@ -204,6 +253,41 @@ class ReplayBuffer:
 
     def __len__(self):
         return self._size
+
+    def save(self, filepath: str):
+        """Save buffer contents to disk (numpy compressed)."""
+        n = self._size
+        np.savez_compressed(filepath,
+                            states=self.states[:n],
+                            actions=self.actions[:n],
+                            regrets=self.regrets[:n],
+                            strategies=self.strategies[:n],
+                            legal_masks=self.legal_masks[:n],
+                            players=self.players[:n],
+                            iterations=self.iterations[:n],
+                            size=np.array([n]),
+                            total_seen=np.array([self._total_seen]))
+
+    def load(self, filepath: str):
+        """Load buffer contents from disk."""
+        data = np.load(filepath)
+        n = int(data['size'][0])
+        if n == 0:
+            return
+
+        if n > self.capacity:
+            n = self.capacity
+
+        self.states[:n] = data['states'][:n]
+        self.actions[:n] = data['actions'][:n]
+        self.regrets[:n] = data['regrets'][:n]
+        self.strategies[:n] = data['strategies'][:n]
+        self.legal_masks[:n] = data['legal_masks'][:n]
+        self.players[:n] = data['players'][:n]
+        self.iterations[:n] = data['iterations'][:n]
+        self._size = n
+        self._total_seen = int(data['total_seen'][0]) if 'total_seen' in data else n
+        self._dirty = True
 
 
 class DeepCFR:
@@ -265,6 +349,52 @@ class DeepCFR:
         # AMP scaler for mixed-precision training
         self._amp_enabled = self.device.type == 'cuda'
         self._scaler = torch.cuda.amp.GradScaler(enabled=self._amp_enabled)
+
+    def extend_first_layer(self, new_obs_size: int):
+        """Extend all networks from current obs_size to new_obs_size.
+
+        Used for fine-tuning: copies existing weights, near-zero-inits new
+        input dimensions so the model initially ignores them and gradually
+        learns their meaning. Clears replay buffer (old obs incompatible)
+        and rebuilds optimizers (old momentum buffers wrong shape).
+        """
+        old_obs_size = self.observation_size
+        extra = new_obs_size - old_obs_size
+        if extra <= 0:
+            return
+
+        for net_list in [self.advantage_networks, self.strategy_networks]:
+            for net in net_list:
+                old_layer = net.network[0]  # first nn.Linear
+                new_layer = nn.Linear(new_obs_size, old_layer.out_features)
+                with torch.no_grad():
+                    new_layer.weight[:, :old_obs_size] = old_layer.weight
+                    new_layer.weight[:, old_obs_size:] = (
+                        torch.randn(old_layer.out_features, extra) * 0.01)
+                    new_layer.bias[:] = old_layer.bias
+                net.network[0] = new_layer
+                net.to(self.device)
+
+        self.observation_size = new_obs_size
+
+        # Clear buffer — old states have wrong dimensionality
+        self.replay_buffer = ReplayBuffer(
+            self.replay_buffer.capacity,
+            num_players=self.num_players,
+            obs_size=new_obs_size,
+            act_size=self.action_size,
+        )
+
+        # Rebuild optimizers — old momentum buffers reference old param shapes
+        lr = self.advantage_optimizers[0].param_groups[0]['lr']
+        self.advantage_optimizers = [
+            optim.Adam(net.parameters(), lr=lr)
+            for net in self.advantage_networks
+        ]
+        self.strategy_optimizers = [
+            optim.Adam(net.parameters(), lr=lr)
+            for net in self.strategy_networks
+        ]
 
     def get_strategy(self, observation: np.ndarray, player_idx: int,
                      legal_actions: List[int]) -> np.ndarray:
@@ -372,7 +502,9 @@ class DeepCFR:
         count = 0
 
         for player_idx in range(self.num_players):
-            batch = self.replay_buffer.sample_player_tensors(
+            # Use sqrt-weighted sampling for strategy network — gives more
+            # weight to older iterations, preventing collapse to current policy
+            batch = self.replay_buffer.sample_player_tensors_sqrt(
                 batch_size, player_idx, self.device)
             if batch is None:
                 continue
