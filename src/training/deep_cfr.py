@@ -417,9 +417,13 @@ class DeepCFR:
             logits = self.strategy_networks[player_idx](obs_tensor).cpu().numpy()[0]
 
         # Masked softmax: set illegal actions to -inf, then softmax
-        strategy = np.full(self.action_size, -1e9, dtype=np.float32)
+        # Use max(action_size, model output) to handle action space mismatch
+        n_logits = len(logits)
+        out_size = max(self.action_size, n_logits)
+        strategy = np.full(out_size, -1e9, dtype=np.float32)
         for a in legal_actions:
-            strategy[a] = logits[a]
+            if a < n_logits:
+                strategy[a] = logits[a]
 
         # Numerically stable softmax over legal actions
         strategy -= strategy.max()
@@ -427,8 +431,10 @@ class DeepCFR:
         strategy = exp_s / exp_s.sum()
 
         # Zero out any residual mass on illegal actions (from exp(-1e9) ≈ 0)
-        legal_mask = np.zeros(self.action_size, dtype=np.float32)
-        legal_mask[legal_actions] = 1.0
+        legal_mask = np.zeros(out_size, dtype=np.float32)
+        for a in legal_actions:
+            if a < out_size:
+                legal_mask[a] = 1.0
         strategy = strategy * legal_mask
         s = strategy.sum()
         if s > 0:
@@ -465,8 +471,11 @@ class DeepCFR:
         with torch.no_grad():
             advantages = self.advantage_networks[player_idx](obs_tensor).cpu().numpy()[0]
 
-        legal_mask = np.zeros(self.action_size)
-        legal_mask[legal_actions] = 1
+        n_adv = len(advantages)
+        legal_mask = np.zeros(n_adv)
+        for a in legal_actions:
+            if a < n_adv:
+                legal_mask[a] = 1
         advantages = advantages * legal_mask
 
         return advantages
@@ -490,8 +499,10 @@ class DeepCFR:
             with torch.cuda.amp.autocast(enabled=self._amp_enabled):
                 predicted = self.advantage_networks[player_idx](states)
                 pred_act = predicted.gather(1, actions.unsqueeze(1)).squeeze(1)
-                # Weighted MSE loss (importance sampling)
-                loss = (weights * (pred_act - regrets) ** 2).mean()
+                # Weighted Huber loss — robust to outlier regrets (all-in ±100)
+                # MSE would square these to 10,000 and destabilize the network
+                huber = nn.functional.smooth_l1_loss(pred_act, regrets, reduction='none')
+                loss = (weights * huber).mean()
 
             self._scaler.scale(loss).backward()
             self._scaler.unscale_(self.advantage_optimizers[player_idx])

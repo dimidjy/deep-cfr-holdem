@@ -3,15 +3,15 @@
     "num_players": 6
   },
   "training": {
-    "num_iterations": 3000,
+    "num_iterations": 10000,
     "batch_size": 65536,
     "learning_rate": 0.0003,
     "buffer_size": 10000000,
-    "traversals_per_iteration": 18000,
-    "checkpoint_interval": 50,
+    "traversals_per_iteration": 6000,
+    "checkpoint_interval": 100,
     "train_passes": 10,
     "gradient_clip": 1.0,
-    "lr_scheduler_t_max": 2500
+    "lr_scheduler_t_max": 8000
   },
   "network": {
     "hidden_layers": [256, 256, 128],

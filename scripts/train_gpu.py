@@ -187,8 +187,28 @@ def _traversal_worker(args):
     global _SHARED_ADV_NETS, _SHARED_STRAT_NETS, _ACT_SIZE, _PREFLOP_RANGES
     global _ARCHETYPE_MODE, _KBEST_POOL
     player_idx, num_players, current_iter = args
-    # Decay exploration: 5% early → 1% by iter 2000
-    epsilon = max(0.01, 0.05 * (1.0 - current_iter / 3000.0))
+
+    # ── Three-phase training ─────────────────────────────────────────────
+    # Phase 1 (iter 1-1000):   vs random opponents — learn basic hand values
+    # Phase 2 (iter 1001-3000): self-play — refine strategy against itself
+    # Phase 3 (iter 3001+):    mixed training — 70% K-Best pool, 30% current
+    PHASE1_END = 1000
+    PHASE2_END = 3000
+
+    if current_iter <= PHASE1_END:
+        # Phase 1: random opponents, high exploration
+        epsilon = 0.10
+        opp_nets = None  # random actions
+    elif current_iter <= PHASE2_END:
+        # Phase 2: self-play, moderate exploration
+        epsilon = max(0.02, 0.05 * (1.0 - (current_iter - PHASE1_END) / (PHASE2_END - PHASE1_END)))
+        opp_nets = _SHARED_STRAT_NETS
+    else:
+        # Phase 3: mixed training against diverse pool, low exploration
+        epsilon = 0.01
+        opp_nets = _SHARED_STRAT_NETS
+        if _KBEST_POOL and len(_KBEST_POOL) > 0 and np.random.random() < 0.7:
+            _, opp_nets = _KBEST_POOL[np.random.randint(len(_KBEST_POOL))]
 
     # Archetype opponent selection (per-traversal)
     archetype_skew_fn = None
@@ -197,13 +217,6 @@ def _traversal_worker(args):
         arch_name = random_archetype()
         archetype_skew_fn = get_archetype_skew(arch_name)
         archetype_profile = get_archetype_profile(arch_name)
-
-    # K-Best Self-Play: pick which opponent nets to use for this traversal.
-    # 50% current strategy nets, 50% random historical version from pool.
-    # This forces the model to beat diverse opponents, preventing strategy collapse.
-    opp_nets = _SHARED_STRAT_NETS
-    if _KBEST_POOL and len(_KBEST_POOL) > 0 and np.random.random() < 0.7:
-        _, opp_nets = _KBEST_POOL[np.random.randint(len(_KBEST_POOL))]
 
     def _pick_opponent_action(ai, obs, legal, eng=None, is_preflop=False):
         # Preflop override for opponents too
@@ -263,12 +276,10 @@ def _traversal_worker(args):
         return eng
 
     def _branch_exact(history, legal_int, n_samples=3):
-        """Branch all legal actions, average n_samples rollouts to reduce variance.
-        All-in (action 4) gets 2x samples because its variance is much higher
-        (winning +3 or losing -98 vs fold which is always ~-1)."""
+        """Branch all legal actions, average n_samples rollouts to reduce variance."""
         results = {}
         for ba in legal_int:
-            n = n_samples * 2 if ba == 4 else n_samples  # all-in needs more samples
+            n = n_samples
             results[ba] = float(np.mean([
                 _run_to_terminal(_fresh_engine_at(history + [ba]))
                 for _ in range(n)
@@ -287,17 +298,35 @@ def _traversal_worker(args):
         return strat
 
     def _make_steps(obs, legal_int, branch_rewards, strategy):
-        """Turn branch rewards + strategy into buffer-ready step dicts."""
+        """Turn branch rewards + strategy into buffer-ready step dicts.
+
+        Regret normalization: divide by max absolute regret so values are
+        in [-1, 1] range. This prevents outlier all-in regrets (±1.0 after
+        _REWARD_SCALE) from dominating the advantage network's loss.
+        Combined with Huber loss, this makes training robust to variance.
+        """
         ev = sum(strategy[a] * branch_rewards[a] / _REWARD_SCALE for a in legal_int)
         legal_mask = np.zeros(_ACT_SIZE, dtype=np.float32)
         legal_mask[legal_int] = 1.0
+
+        # Compute raw regrets
+        raw_regrets = {a: float(np.clip(branch_rewards[a] / _REWARD_SCALE - ev,
+                                         -_REGRET_CLIP, _REGRET_CLIP))
+                       for a in legal_int}
+
+        # Normalize: divide by max absolute regret (keeps direction, scales to [-1,1])
+        max_abs = max(abs(r) for r in raw_regrets.values())
+        if max_abs > 1e-6:
+            norm_regrets = {a: r / max_abs for a, r in raw_regrets.items()}
+        else:
+            norm_regrets = raw_regrets  # all near zero, don't divide
+
         return [{
             'player':   player_idx,
             'obs':      obs,
             'action':   a,
             'legal':    legal_int,
-            'regret':   float(np.clip(branch_rewards[a] / _REWARD_SCALE - ev,
-                                      -_REGRET_CLIP, _REGRET_CLIP)),
+            'regret':   float(norm_regrets[a]),
             'strategy': strategy,
             'legal_mask': legal_mask,
         } for a in legal_int]
@@ -492,6 +521,7 @@ def main():
     print(f'  workers  : {num_workers}')
     print(f'  players  : {num_players}')
     print(f'  iters    : {config["training"]["num_iterations"]}')
+    print(f'  phases   : 1-1000 random, 1001-3000 self-play, 3001+ mixed (K-Best)')
     print(f'  trav/iter: {config["training"]["traversals_per_iteration"]}')
     print('=' * 60)
 
@@ -636,6 +666,31 @@ def main():
     writer = SummaryWriter(log_dir=str(logs_dir))
     print(f'TensorBoard logs → {logs_dir}  (run: tensorboard --logdir {logs_dir})\n')
 
+    # ── Set Phase 1 LR schedule: 0.0003 → 0.0001 over 1000 iters ──────
+    # Override the constructor's default scheduler (which uses config t_max)
+    if start_iter < 1000:
+        from torch.optim import lr_scheduler as _lr_sched
+        p1_lr, p1_end, p1_dur = 0.0003, 0.0001, 1000
+        for opt in deep_cfr.advantage_optimizers + deep_cfr.strategy_optimizers:
+            for pg in opt.param_groups:
+                pg['lr'] = p1_lr
+        deep_cfr.advantage_schedulers = [
+            _lr_sched.LinearLR(opt, start_factor=1.0,
+                               end_factor=p1_end / p1_lr,
+                               total_iters=p1_dur)
+            for opt in deep_cfr.advantage_optimizers
+        ]
+        deep_cfr.strategy_schedulers = [
+            _lr_sched.LinearLR(opt, start_factor=1.0,
+                               end_factor=p1_end / p1_lr,
+                               total_iters=p1_dur)
+            for opt in deep_cfr.strategy_optimizers
+        ]
+        # Step scheduler to match current iteration (for resume mid-Phase 1)
+        for _ in range(start_iter):
+            deep_cfr.step_schedulers()
+        print(f'  Phase 1 LR: {p1_lr} → {p1_end} over {p1_dur} iters')
+
     print(f'Training iterations {start_iter + 1} → {num_iterations}')
     print(f'batch_size={batch_size}  train_passes={train_passes}')
     print(f'Spawning {num_workers} workers...')
@@ -713,6 +768,15 @@ def main():
     _adv_hist   = deque(maxlen=10)
     _strat_hist = deque(maxlen=10)
 
+    # ── Batched logging ──────────────────────────────────────────────────
+    LOG_INTERVAL = 20       # print avg loss every N iterations
+    EVAL_INTERVAL = 200     # self-play + validation every N iterations
+    EVAL_HANDS = 2000       # hands per self-play eval (~6s)
+    _batch_adv = []
+    _batch_strat = []
+    _batch_trav = []
+    _batch_train = []
+
     def _trend(val, hist):
         if len(hist) < 3:
             return ' '
@@ -724,6 +788,75 @@ def main():
         if r > 1.05: return '↑ '
         if r < 0.95: return '↓ '
         return '→ '
+
+    def _run_eval(deep_cfr_ref, eval_engine, iter_num_snap):
+        """Run self-play + validation inline. Wrapped in try/except — never crashes training."""
+        try:
+            import io
+            from src.decision_engine import DecisionEngine, DecisionConfig
+            from scripts.analysis.self_play import run_self_play, generate_json
+
+            dc = DecisionConfig(
+                strong_hand_guard=False, allin_filter=False,
+                style_tuning=False, use_preflop_ranges=True,
+                raise_randomize=False,
+            )
+            sp_engine = DecisionEngine(dc)
+            tmp_ckpt = str(models_dir / '_eval_tmp.pt')
+            deep_cfr_ref.save_models(tmp_ckpt)
+            sp_engine.load_models(facing_bet=tmp_ckpt, checked_to=tmp_ckpt)
+            sp_engine.load_preflop_ranges()
+
+            old_stdout = sys.stdout
+            sys.stdout = io.StringIO()
+            try:
+                raw_stats = run_self_play(sp_engine, EVAL_HANDS, num_players)
+            finally:
+                sys.stdout = old_stdout
+            sp = generate_json(raw_stats, num_players, EVAL_HANDS)
+
+            act = sp.get('postflop_actions', {})
+            print(
+                f"  [self-play {EVAL_HANDS}h] "
+                f"VPIP={sp['vpip']:.1f}% PFR={sp['pfr']:.1f}% "
+                f"CBet={sp['cbet']:.1f}% AF={sp['af']:.1f} "
+                f"WTSD={sp['wtsd']:.1f}% W$SD={sp['wsd']:.1f}% "
+                f"| Fold={act.get('fold_pct',0):.0f}% "
+                f"Chk={act.get('check_pct',0):.0f}% "
+                f"Call={act.get('call_pct',0):.0f}% "
+                f"Bet={act.get('bet_raise_pct',0):.0f}%"
+            )
+
+            # TensorBoard
+            for k in ('vpip', 'pfr', 'cbet', 'af', 'wtsd', 'wsd'):
+                writer.add_scalar(f'selfplay/{k}', sp[k], iter_num_snap)
+
+            try:
+                os.remove(tmp_ckpt)
+            except OSError:
+                pass
+        except Exception as e:
+            print(f'  [self-play ERROR: {e}]')
+
+        try:
+            val_results = run_validation(deep_cfr_ref, eval_engine,
+                                          num_games=500, verbose=False)
+            print(f'  {validation_summary_line(val_results)}')
+
+            for spot_key, spot_data in val_results.items():
+                if spot_key == '_summary' or not isinstance(spot_data, dict):
+                    continue
+                if spot_data.get('n', 0) == 0:
+                    continue
+                writer.add_scalar(f'val/{spot_key}/fold', spot_data['fold_pct'], iter_num_snap)
+                writer.add_scalar(f'val/{spot_key}/call', spot_data['call_pct'], iter_num_snap)
+                writer.add_scalar(f'val/{spot_key}/aggr', spot_data['aggr_pct'], iter_num_snap)
+            summary = val_results.get('_summary', {})
+            if summary.get('total', 0) > 0:
+                writer.add_scalar('val/pass_rate',
+                                  summary['passed'] / summary['total'], iter_num_snap)
+        except Exception as e:
+            print(f'  [validation ERROR: {e}]')
 
     def _push_weights():
         """Copy GPU-trained weights into shared-memory CPU nets for workers."""
@@ -742,9 +875,58 @@ def main():
 
         _last_config_reload = 0
 
+        _phase_transitions_done = set()
+
         for iteration in range(start_iter, num_iterations):
             iter_num = iteration + 1
             t0 = time.time()
+
+            # ── Phase transitions: clear buffer + reset LR ──────────────────
+            #
+            # Per-phase LR schedule (start → end, linear decay):
+            #   Phase 1 (1-1000):    0.0003 → 0.0001
+            #   Phase 2 (1001-3000): 0.0003 → 0.0001
+            #   Phase 3 (3001-5000): 0.0002 → 0.0001
+            #   Phase 3 (3001+):     0.0002 → 0.0001
+            PHASE_LR = {
+                1001: (0.0003, 0.0001, 2000),   # (start_lr, end_lr, duration)
+                3001: (0.0002, 0.0001, 2000),
+            }
+            phase_transitions = {1001: 'P2:self-play', 3001: 'P3:mixed'}
+            for phase_start, phase_name in phase_transitions.items():
+                if iter_num == phase_start and phase_start not in _phase_transitions_done:
+                    _phase_transitions_done.add(phase_start)
+                    old_size = len(deep_cfr.replay_buffer)
+                    deep_cfr.replay_buffer._size = 0
+                    deep_cfr.replay_buffer._total_seen = 0
+                    deep_cfr.replay_buffer._dirty = True
+                    print(f'  *** Buffer cleared for {phase_name} '
+                          f'(was {old_size:,} entries) ***')
+                    if phase_start == 3001:
+                        kbest_pool.clear()
+                        print(f'  *** K-Best pool cleared for Phase 3 ***')
+
+                    # Reset LR + rebuild scheduler for this phase
+                    if phase_start in PHASE_LR:
+                        from torch.optim import lr_scheduler
+                        p_lr, p_end, p_dur = PHASE_LR[phase_start]
+                        end_factor = p_end / p_lr
+                        for opt in deep_cfr.advantage_optimizers + deep_cfr.strategy_optimizers:
+                            for pg in opt.param_groups:
+                                pg['lr'] = p_lr
+                        deep_cfr.advantage_schedulers = [
+                            lr_scheduler.LinearLR(opt, start_factor=1.0,
+                                                  end_factor=end_factor,
+                                                  total_iters=p_dur)
+                            for opt in deep_cfr.advantage_optimizers
+                        ]
+                        deep_cfr.strategy_schedulers = [
+                            lr_scheduler.LinearLR(opt, start_factor=1.0,
+                                                  end_factor=end_factor,
+                                                  total_iters=p_dur)
+                            for opt in deep_cfr.strategy_optimizers
+                        ]
+                        print(f'  *** LR reset: {p_lr} → {p_end} over {p_dur} iters ***')
 
             # ── Hot-reload config every 10 iterations ───────────────────────
             if iter_num - _last_config_reload >= 10:
@@ -828,21 +1010,22 @@ def main():
 
             _adv_hist.append(adv)
             _strat_hist.append(strat)
+            _batch_adv.append(adv)
+            _batch_strat.append(strat)
+            _batch_trav.append(t_trav)
+            _batch_train.append(t_train)
 
             if not warmup_tag:
                 warmup_tag = ''
-            print(
-                f'Iter {iter_num:4d}/{num_iterations}'
-                f'  buf={len(deep_cfr.replay_buffer):>7d}'
-                f'  adv={adv:.4f}{_trend(adv, _adv_hist)}'
-                f'  strat={strat:.4f}{_trend(strat, _strat_hist)}'
-                f'  trav={t_trav:.1f}s'
-                f'  train={t_train:.1f}s'
-                f'  total={total:.1f}s'
-                f'{warmup_tag}'
-            )
+            # Phase indicator
+            if iter_num <= 1000:
+                phase_tag = ' P1:random'
+            elif iter_num <= 3000:
+                phase_tag = ' P2:self-play'
+            else:
+                phase_tag = ' P3:mixed'
 
-            # ── TensorBoard: per-iteration metrics ──────────────────────────
+            # ── TensorBoard: per-iteration (always) ─────────────────────────
             writer.add_scalar('loss/advantage',  adv,   iter_num)
             writer.add_scalar('loss/strategy',   strat, iter_num)
             writer.add_scalar('perf/trav_time',  t_trav,  iter_num)
@@ -850,8 +1033,30 @@ def main():
             writer.add_scalar('perf/total_time', total,   iter_num)
             writer.add_scalar('buffer/size', len(deep_cfr.replay_buffer), iter_num)
 
-            # ── K-Best pool update every 100 iters (pool restart is expensive ~30s)
-            if iter_num % 100 == 0 and iter_num > 0:
+            # ── Print avg loss every LOG_INTERVAL iters ─────────────────────
+            if iter_num % LOG_INTERVAL == 0 or warmup_tag:
+                avg_a = np.mean(_batch_adv) if _batch_adv else 0.0
+                avg_s = np.mean(_batch_strat) if _batch_strat else 0.0
+                avg_tv = np.mean(_batch_trav) if _batch_trav else 0.0
+                avg_tr = np.mean(_batch_train) if _batch_train else 0.0
+                cur_lr = deep_cfr.advantage_optimizers[0].param_groups[0]['lr']
+                print(
+                    f'Iter {iter_num:4d}/{num_iterations}'
+                    f'  buf={len(deep_cfr.replay_buffer):>7d}'
+                    f'  adv={avg_a:.4f}{_trend(avg_a, _adv_hist)}'
+                    f'  strat={avg_s:.4f}{_trend(avg_s, _strat_hist)}'
+                    f'  lr={cur_lr:.5f}'
+                    f'  trav={avg_tv:.1f}s'
+                    f'  train={avg_tr:.1f}s'
+                    f'{warmup_tag}{phase_tag}'
+                )
+                _batch_adv.clear()
+                _batch_strat.clear()
+                _batch_trav.clear()
+                _batch_train.clear()
+
+            # ── K-Best pool update every 100 iters, only in Phase 2+ ────────
+            if iter_num % 100 == 0 and iter_num > 1000:
                 try:
                     pool_nets = []
                     for net in deep_cfr.strategy_networks:
@@ -877,10 +1082,10 @@ def main():
                 except Exception as e:
                     print(f'  K-Best pool update failed: {e}')
 
+            # ── Checkpoint save ─────────────────────────────────────────────
             if iter_num % ckpt_interval == 0:
                 ckpt = str(models_dir / f'checkpoint_iter_{iter_num}.pt')
                 deep_cfr.save_models(ckpt)
-                # Save replay buffer alongside checkpoint
                 buf_path = ckpt.replace('.pt', '_buffer.npz')
                 deep_cfr.replay_buffer.save(buf_path)
                 meta = {'iteration': iter_num,
@@ -889,22 +1094,9 @@ def main():
                 with open(ckpt.replace('.pt', '_metadata.json'), 'w') as f:
                     json.dump(meta, f, indent=2)
 
-                val_results = run_validation(deep_cfr, engine, num_games=500, verbose=False)
-                print(f'  {validation_summary_line(val_results)}')
-
-                # ── TensorBoard: validation metrics ─────────────────────────
-                for spot_key, spot_data in val_results.items():
-                    if spot_key == '_summary' or not isinstance(spot_data, dict):
-                        continue
-                    if spot_data.get('n', 0) == 0:
-                        continue
-                    writer.add_scalar(f'val/{spot_key}/fold', spot_data['fold_pct'], iter_num)
-                    writer.add_scalar(f'val/{spot_key}/call', spot_data['call_pct'], iter_num)
-                    writer.add_scalar(f'val/{spot_key}/aggr', spot_data['aggr_pct'], iter_num)
-                summary = val_results.get('_summary', {})
-                if summary.get('total', 0) > 0:
-                    writer.add_scalar('val/pass_rate',
-                                      summary['passed'] / summary['total'], iter_num)
+            # ── Self-play + validation every EVAL_INTERVAL iters ────────────
+            if iter_num % EVAL_INTERVAL == 0:
+                _run_eval(deep_cfr, engine, iter_num)
     finally:
         if async_result is not None:
             async_result.wait()

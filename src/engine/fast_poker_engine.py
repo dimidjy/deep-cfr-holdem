@@ -329,7 +329,7 @@ class FastPokerEngine:
         pass  # nothing to clean up
 
     def get_action_space_size(self):
-        return 5
+        return 4  # fold, call, raise_half, raise_pot (no all-in)
 
     def get_observation_space_size(self):
         return 54  # overridden by enhanced engine
@@ -473,9 +473,11 @@ class FastPokerEngine:
         if pot_raise_clamped <= max_raise:
             legal.append(3)
 
-        # 4: All-in (always legal if can raise at all)
-        if max_raise >= min_raise:
-            legal.append(4)
+        # 4: All-in — DISABLED for faster convergence (4-action space)
+        # With only fold/call/raise½/raisePot, the model converges faster
+        # because there's no extreme action to exploit in self-play.
+        # if max_raise >= min_raise:
+        #     legal.append(4)
 
         return legal
 

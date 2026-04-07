@@ -241,6 +241,9 @@ def _load_model(model_path: Path, config: dict, num_players: int,
         device='cpu',
     )
     deep_cfr.load_models(str(model_path))
+    # HH parser uses 5 actions (0-4 incl ALL_IN) but fast engine may only
+    # have 4.  Expand action_size so strategy arrays can hold all HH actions.
+    deep_cfr.action_size = max(5, deep_cfr.action_size)
     return deep_cfr
 
 
@@ -397,8 +400,9 @@ def analyze_decision_points(deep_cfr, decision_points: list,
 
             # Model position stats
             model_pos[pos]['hands'] += 1
-            fold_p = float(model_strategy[FOLD]) if FOLD in legal_set else 0.0
-            raise_p = sum(float(model_strategy[a]) for a in AGGRESSIVE if a in legal_set)
+            n_act = len(model_strategy)
+            fold_p = float(model_strategy[FOLD]) if FOLD in legal_set and FOLD < n_act else 0.0
+            raise_p = sum(float(model_strategy[a]) for a in AGGRESSIVE if a in legal_set and a < n_act)
 
             is_bb_free = (pos == 'BB' and FOLD not in legal_set)
             if not is_bb_free:

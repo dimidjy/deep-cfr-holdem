@@ -133,36 +133,42 @@ def _equity_model_predict(hole_ranks, hole_suits, board_ranks, board_suits,
 
     features = np.zeros(input_size, dtype=np.float32)
 
+    # Convert from _rank_to_value (2-14) to training scale (0-12)
+    def _to_train_rank_v1(r):
+        return r - 2
+
     if input_size <= 24:
         # v1 simple encoding: rank_norm + suit_norm per card + basic derived
-        for i, (r, s) in enumerate(zip(hole_ranks[:2], hole_suits[:2])):
+        hr_t = [_to_train_rank_v1(r) for r in hole_ranks[:2]]
+        br_t = [_to_train_rank_v1(r) for r in board_ranks[:5]]
+        for i, (r, s) in enumerate(zip(hr_t, hole_suits[:2])):
             features[i*2] = r / 12.0
             features[i*2 + 1] = s / 3.0
-        for i, (r, s) in enumerate(zip(board_ranks[:5], board_suits[:5])):
+        for i, (r, s) in enumerate(zip(br_t, board_suits[:5])):
             features[4 + i*2] = r / 12.0
             features[4 + i*2 + 1] = s / 3.0
         d = 14
-        h_ranks = list(hole_ranks[:2])
+        h_ranks = list(hr_t)
         h_suits = list(hole_suits[:2])
         features[d+0] = 1.0 if h_ranks[0] == h_ranks[1] else 0.0
         features[d+1] = 1.0 if h_suits[0] == h_suits[1] else 0.0
         features[d+2] = max(h_ranks) / 12.0
         features[d+3] = min(h_ranks) / 12.0
-        features[d+4] = len(board_ranks) / 5.0
-        if board_ranks:
-            features[d+5] = max(board_ranks) / 12.0
+        features[d+4] = len(br_t) / 5.0
+        if br_t:
+            features[d+5] = max(br_t) / 12.0
             from collections import Counter as C2
-            brc2 = C2(board_ranks)
+            brc2 = C2(br_t)
             features[d+6] = 1.0 if max(brc2.values()) >= 2 else 0.0
             bsc2 = C2(board_suits)
             features[d+7] = max(bsc2.values()) / 5.0
-            unique2 = sorted(set(board_ranks))
+            unique2 = sorted(set(br_t))
             mc2 = 1; c2 = 1
             for ii in range(1, len(unique2)):
                 if unique2[ii] - unique2[ii-1] == 1: c2 += 1; mc2 = max(mc2, c2)
                 else: c2 = 1
             features[d+8] = mc2 / 4.0
-            features[d+9] = (max(board_ranks) - min(board_ranks)) / 12.0
+            features[d+9] = (max(br_t) - min(br_t)) / 12.0
 
         with torch.no_grad():
             inp = torch.from_numpy(features).unsqueeze(0)
@@ -171,17 +177,26 @@ def _equity_model_predict(hole_ranks, hole_suits, board_ranks, board_suits,
             return _EQUITY_MODEL(inp).cpu().numpy()[0]
 
     # v2 rich encoding (82 dims)
-    for i, (r, s) in enumerate(zip(hole_ranks[:2], hole_suits[:2])):
+    # Convert from _rank_to_value (2-14) to training scale (0-12)
+    # Training used RANK_MAP: 2→0, 3→1, ..., A→12
+    # _rank_to_value returns:  2→2, 3→3, ..., A→14
+    def _to_train_rank(r):
+        return r - 2  # 2→0, 3→1, ..., A→12
+
+    hole_ranks_t = [_to_train_rank(r) for r in hole_ranks[:2]]
+    board_ranks_t = [_to_train_rank(r) for r in board_ranks[:5]]
+
+    for i, (r, s) in enumerate(zip(hole_ranks_t, hole_suits[:2])):
         features[i*6] = r / 12.0
         features[i*6 + 1 + s] = 1.0
         features[i*6 + 5] = 1.0
-    for i, (r, s) in enumerate(zip(board_ranks[:5], board_suits[:5])):
+    for i, (r, s) in enumerate(zip(board_ranks_t, board_suits[:5])):
         features[(i+2)*6] = r / 12.0
         features[(i+2)*6 + 1 + s] = 1.0
         features[(i+2)*6 + 5] = 1.0
 
     d = 42
-    h_ranks = list(hole_ranks[:2])
+    h_ranks = list(hole_ranks_t)
     h_suits = list(hole_suits[:2])
 
     features[d+0] = 1.0 if h_ranks[0] == h_ranks[1] else 0.0
@@ -189,10 +204,10 @@ def _equity_model_predict(hole_ranks, hole_suits, board_ranks, board_suits,
     features[d+2] = max(h_ranks) / 12.0
     features[d+3] = min(h_ranks) / 12.0
     features[d+4] = abs(h_ranks[0] - h_ranks[1]) / 12.0
-    features[d+5] = len(board_ranks) / 5.0
+    features[d+5] = len(board_ranks_t) / 5.0
 
-    if board_ranks:
-        b_ranks = list(board_ranks)
+    if board_ranks_t:
+        b_ranks = list(board_ranks_t)
         b_suits = list(board_suits)
         all_ranks = h_ranks + b_ranks
         all_suits = h_suits + b_suits
@@ -250,7 +265,7 @@ def _equity_model_predict(hole_ranks, hole_suits, board_ranks, board_suits,
         features[d+21] = sum(1 for r in h_ranks if r in b_ranks) / 2.0
         features[d+22] = sum(1 for r in h_ranks if r > max(b_ranks)) / 2.0
         features[d+23] = 1.0 if len(set(b_suits)) == 1 else 0.0
-        features[d+24] = len(board_ranks) / 5.0
+        features[d+24] = len(board_ranks_t) / 5.0
 
         for si in range(4):
             hero_has = sum(1 for s in h_suits if s == si)

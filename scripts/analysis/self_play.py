@@ -668,6 +668,7 @@ def generate_json(all_stats: Dict[int, PlayerStats], num_players: int,
         agg.postflop_bets += s.postflop_bets
         agg.postflop_calls += s.postflop_calls
         agg.postflop_folds += s.postflop_folds
+        agg.postflop_checks += s.postflop_checks
         agg.saw_flop += s.saw_flop
         agg.went_to_showdown += s.went_to_showdown
         agg.won_at_showdown += s.won_at_showdown
@@ -681,6 +682,8 @@ def generate_json(all_stats: Dict[int, PlayerStats], num_players: int,
             agg.won_by_pos[pos] += val
 
     af = agg.postflop_bets / agg.postflop_calls if agg.postflop_calls > 0 else 0
+    total_postflop_actions = (agg.postflop_folds + agg.postflop_checks +
+                              agg.postflop_calls + agg.postflop_bets)
     return {
         'num_hands': num_hands,
         'num_players': num_players,
@@ -692,6 +695,13 @@ def generate_json(all_stats: Dict[int, PlayerStats], num_players: int,
         'cbet': _pct_f(agg.cbet, agg.cbet_opps),
         'fold_to_cbet': _pct_f(agg.fold_to_cbet, agg.fold_to_cbet_opps),
         'af': round(af, 2),
+        'postflop_actions': {
+            'fold_pct': _pct_f(agg.postflop_folds, total_postflop_actions),
+            'check_pct': _pct_f(agg.postflop_checks, total_postflop_actions),
+            'call_pct': _pct_f(agg.postflop_calls, total_postflop_actions),
+            'bet_raise_pct': _pct_f(agg.postflop_bets, total_postflop_actions),
+            'total': total_postflop_actions,
+        },
         'saw_flop': _pct_f(agg.saw_flop, agg.hands),
         'wtsd': _pct_f(agg.went_to_showdown, agg.saw_flop),
         'wsd': _pct_f(agg.won_at_showdown, agg.went_to_showdown),
