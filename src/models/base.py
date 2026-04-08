@@ -39,8 +39,17 @@ class ModelAdapter(ABC):
     @staticmethod
     def _normalize(probs: np.ndarray, legal_actions: List[int]) -> np.ndarray:
         """Zero out illegal actions and normalize to sum to 1."""
-        masked = np.zeros_like(probs)
-        masked[legal_actions] = np.maximum(probs[legal_actions], 0.0)
+        n = len(probs)
+        # Expand output if legal_actions reference indices beyond model output
+        max_action = max(legal_actions) if legal_actions else 0
+        if max_action >= n:
+            masked = np.zeros(max_action + 1, dtype=probs.dtype)
+            masked[:n] = 0.0  # will be filled below
+        else:
+            masked = np.zeros_like(probs)
+        valid = [a for a in legal_actions if a < n]
+        if valid:
+            masked[valid] = np.maximum(probs[valid], 0.0)
         s = masked.sum()
         if s > 0:
             masked /= s

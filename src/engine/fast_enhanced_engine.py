@@ -99,9 +99,43 @@ def load_equity_model(path: str, device: str = 'cpu'):
     model.to(device)
     _EQUITY_MODEL = model
     _EQUITY_DEVICE = device
+    _EQUITY_CACHE.clear()
+    global _EQUITY_INPUT_SIZE
+    _EQUITY_INPUT_SIZE = None
 
 _RANK_MAP_EQ = {r: i for i, r in enumerate('23456789TJQKA')}
 _SUIT_MAP_EQ = {s: i for i, s in enumerate('shdc')}
+
+# ── Equity model: cache + batched inference (per-process) ────────────────
+# Cache: same (hole, board) combo returns instantly from dict.
+# Batch queue: uncached combos accumulate; flushed in one forward() call.
+# Together: ~50 unique combos per traversal → 1 batched model call + cache.
+_EQUITY_CACHE = {}
+_EQUITY_CACHE_MAX = 50000
+_EQUITY_INPUT_SIZE = None
+_EQUITY_BATCH_KEYS = []     # list of cache_key for pending predictions
+_EQUITY_BATCH_FEATS = []    # list of feature arrays for pending predictions
+_EQUITY_TORCH = None        # lazy torch import
+
+
+def _equity_batch_flush():
+    """Run all pending equity predictions in one batched forward() call."""
+    global _EQUITY_BATCH_KEYS, _EQUITY_BATCH_FEATS, _EQUITY_TORCH
+    if not _EQUITY_BATCH_FEATS or _EQUITY_MODEL is None:
+        return
+    if _EQUITY_TORCH is None:
+        import torch
+        _EQUITY_TORCH = torch
+    batch = np.stack(_EQUITY_BATCH_FEATS)
+    with _EQUITY_TORCH.no_grad():
+        inp = _EQUITY_TORCH.from_numpy(batch)
+        if _EQUITY_DEVICE and _EQUITY_DEVICE != 'cpu':
+            inp = inp.to(_EQUITY_DEVICE)
+        preds = _EQUITY_MODEL(inp).cpu().numpy()
+    for i, key in enumerate(_EQUITY_BATCH_KEYS):
+        _EQUITY_CACHE[key] = preds[i].copy()
+    _EQUITY_BATCH_KEYS.clear()
+    _EQUITY_BATCH_FEATS.clear()
 
 
 def _encode_card_for_equity(rank_char, suit_char):
@@ -115,22 +149,31 @@ def _encode_card_for_equity(rank_char, suit_char):
     return feat
 
 
-def _equity_model_predict(hole_ranks, hole_suits, board_ranks, board_suits,
-                           hole_cards_raw, board_cards_raw):
-    """Use GPU equity model to predict 9-dim equity features.
-
-    Returns numpy array of shape (9,) or None if model not loaded.
-    """
+def _equity_model_encode(hole_ranks, hole_suits, board_ranks, board_suits):
+    """Encode cards into feature array WITHOUT running the model.
+    Returns (cache_key, features) or (cache_key, None) if cached."""
+    global _EQUITY_INPUT_SIZE
     if _EQUITY_MODEL is None:
-        return None
+        return None, None
 
-    import torch
+    cache_key = (tuple(hole_ranks[:2]), tuple(hole_suits[:2]),
+                 tuple(board_ranks[:5]), tuple(board_suits[:5]))
+    if cache_key in _EQUITY_CACHE:
+        return cache_key, None  # already cached
+
+    if _EQUITY_INPUT_SIZE is None:
+        first_param = next(_EQUITY_MODEL.parameters())
+        _EQUITY_INPUT_SIZE = first_param.shape[1] if first_param.dim() == 2 else 82
+    input_size = _EQUITY_INPUT_SIZE
+    features = _equity_build_features(hole_ranks, hole_suits,
+                                       board_ranks, board_suits, input_size)
+    return cache_key, features
+
+
+def _equity_build_features(hole_ranks, hole_suits, board_ranks, board_suits,
+                            input_size):
+    """Build the 82-dim (or 24-dim) feature vector for the equity model."""
     from collections import Counter
-
-    # Detect input size from model's first layer
-    first_param = next(_EQUITY_MODEL.parameters())
-    input_size = first_param.shape[1] if first_param.dim() == 2 else 82
-
     features = np.zeros(input_size, dtype=np.float32)
 
     # Convert from _rank_to_value (2-14) to training scale (0-12)
@@ -170,11 +213,7 @@ def _equity_model_predict(hole_ranks, hole_suits, board_ranks, board_suits,
             features[d+8] = mc2 / 4.0
             features[d+9] = (max(br_t) - min(br_t)) / 12.0
 
-        with torch.no_grad():
-            inp = torch.from_numpy(features).unsqueeze(0)
-            if _EQUITY_DEVICE and _EQUITY_DEVICE != 'cpu':
-                inp = inp.to(_EQUITY_DEVICE)
-            return _EQUITY_MODEL(inp).cpu().numpy()[0]
+        return features
 
     # v2 rich encoding (82 dims)
     # Convert from _rank_to_value (2-14) to training scale (0-12)
@@ -293,13 +332,97 @@ def _equity_model_predict(hole_ranks, hole_suits, board_ranks, board_suits,
         features[d+38] = 1.0 if len(board_ranks) == 5 else 0.0
         features[d+39] = 1.0 if len(board_ranks) == 0 else 0.0
 
-    with torch.no_grad():
-        inp = torch.from_numpy(features).unsqueeze(0)
-        if _EQUITY_DEVICE and _EQUITY_DEVICE != 'cpu':
-            inp = inp.to(_EQUITY_DEVICE)
-        pred = _EQUITY_MODEL(inp).cpu().numpy()[0]
+    return features
 
-    return pred
+
+def _equity_model_predict(hole_ranks, hole_suits, board_ranks, board_suits,
+                           hole_cards_raw, board_cards_raw):
+    """Predict 9-dim equity features using cached + batched inference.
+
+    Flow: cache hit → return instantly.  Cache miss → encode features, add
+    to batch queue, flush batch (single forward() call), return from cache.
+    """
+    if _EQUITY_MODEL is None:
+        return None
+
+    cache_key = (tuple(hole_ranks[:2]), tuple(hole_suits[:2]),
+                 tuple(board_ranks[:5]), tuple(board_suits[:5]))
+    cached = _EQUITY_CACHE.get(cache_key)
+    if cached is not None:
+        return cached.copy()
+
+    # Cache miss — encode and queue for batched inference
+    global _EQUITY_INPUT_SIZE
+    if _EQUITY_INPUT_SIZE is None:
+        first_param = next(_EQUITY_MODEL.parameters())
+        _EQUITY_INPUT_SIZE = first_param.shape[1] if first_param.dim() == 2 else 82
+
+    features = _equity_build_features(hole_ranks, hole_suits,
+                                       board_ranks, board_suits,
+                                       _EQUITY_INPUT_SIZE)
+    _EQUITY_BATCH_KEYS.append(cache_key)
+    _EQUITY_BATCH_FEATS.append(features)
+
+    # Flush immediately — the caller needs the result now.
+    # Batching still helps because multiple calls between cache clears
+    # accumulate; and the cache prevents re-computation on repeats.
+    # For true deferred batching, call _equity_batch_flush() explicitly.
+    _equity_batch_flush()
+
+    cached = _EQUITY_CACHE.get(cache_key)
+    if cached is not None:
+        return cached.copy()
+    return None
+
+
+def _equity_model_predict_batch(requests):
+    """Predict equity for multiple (hole_ranks, hole_suits, board_ranks, board_suits)
+    in a single batched forward() call.  Returns list of 9-dim arrays.
+
+    Usage from traversal worker:
+        results = _equity_model_predict_batch([
+            ([14,13], [1,1], [10,7,3], [0,1,2]),
+            ([7,2],   [0,1], [14,13,12], [2,3,1]),
+        ])
+    """
+    global _EQUITY_INPUT_SIZE, _EQUITY_TORCH
+    if _EQUITY_MODEL is None:
+        return [None] * len(requests)
+
+    if _EQUITY_INPUT_SIZE is None:
+        first_param = next(_EQUITY_MODEL.parameters())
+        _EQUITY_INPUT_SIZE = first_param.shape[1] if first_param.dim() == 2 else 82
+    if _EQUITY_TORCH is None:
+        import torch
+        _EQUITY_TORCH = torch
+
+    results = [None] * len(requests)
+    to_compute = []  # (index, cache_key, features)
+
+    for i, (hr, hs, br, bs) in enumerate(requests):
+        key = (tuple(hr[:2]), tuple(hs[:2]), tuple(br[:5]), tuple(bs[:5]))
+        cached = _EQUITY_CACHE.get(key)
+        if cached is not None:
+            results[i] = cached.copy()
+        else:
+            feats = _equity_build_features(hr, hs, br, bs, _EQUITY_INPUT_SIZE)
+            to_compute.append((i, key, feats))
+
+    if to_compute:
+        batch = np.stack([f for _, _, f in to_compute])
+        with _EQUITY_TORCH.no_grad():
+            inp = _EQUITY_TORCH.from_numpy(batch)
+            if _EQUITY_DEVICE and _EQUITY_DEVICE != 'cpu':
+                inp = inp.to(_EQUITY_DEVICE)
+            preds = _EQUITY_MODEL(inp).cpu().numpy()
+        for j, (i, key, _) in enumerate(to_compute):
+            pred = preds[j].copy()
+            if len(_EQUITY_CACHE) >= _EQUITY_CACHE_MAX:
+                _EQUITY_CACHE.clear()
+            _EQUITY_CACHE[key] = pred
+            results[i] = pred
+
+    return results
 
 
 class FastEnhancedPokerEngine(FastPokerEngine):

@@ -73,7 +73,7 @@ def _return_engine(eng):
 
 
 def _worker_init(shared_adv, shared_strat, act_size, use_preflop_ranges=False,
-                 archetype_mode=False, kbest_pool=None):
+                 archetype_mode=False, kbest_pool=None, equity_model_path=None):
     global _SHARED_ADV_NETS, _SHARED_STRAT_NETS, _ACT_SIZE, _PREFLOP_RANGES
     global _ARCHETYPE_MODE, _KBEST_POOL
     _SHARED_ADV_NETS  = shared_adv
@@ -86,6 +86,14 @@ def _worker_init(shared_adv, shared_strat, act_size, use_preflop_ranges=False,
         _PREFLOP_RANGES = PreflopRanges()
     else:
         _PREFLOP_RANGES = None
+    if equity_model_path:
+        import torch as _torch
+        # Each worker must use only 1 thread for PyTorch ops.
+        # Without this, 127 workers × N default threads = thousands of
+        # threads fighting for CPU cores → deadlock-level contention.
+        _torch.set_num_threads(1)
+        from src.engine.fast_enhanced_engine import load_equity_model
+        load_equity_model(equity_model_path, device='cpu')
     warnings.filterwarnings('ignore')
     logging.disable(logging.WARNING)
     os.environ['GYMNASIUM_DISABLE_LOGGING'] = '1'
@@ -113,12 +121,12 @@ def _regret_match(adv, legal, epsilon=0.05):
     strategy[legal] = pos / s if s > 0 else 1.0 / len(legal)
     if epsilon > 0:
         strategy[legal] = (1.0 - epsilon) * strategy[legal] + epsilon / len(legal)
-    # Action floor: ensure call (action 1) never drops below 3%
-    # This prevents the call-collapse that causes strategy oscillation.
-    # 3% is small enough to not distort Nash convergence but large enough
-    # to keep call regrets from going permanently negative.
+    # Action floor: ensure call (action 1) never drops below 8%
+    # This prevents the call-collapse that causes raise-or-fold degenerate
+    # equilibrium. Combined with DCFR-style negative regret attenuation,
+    # this keeps call alive so the network can learn when calling is correct.
     CALL = 1
-    CALL_FLOOR = 0.03
+    CALL_FLOOR = 0.08
     if CALL in legal and strategy[CALL] < CALL_FLOOR:
         deficit = CALL_FLOOR - strategy[CALL]
         strategy[CALL] = CALL_FLOOR
@@ -189,23 +197,23 @@ def _traversal_worker(args):
     player_idx, num_players, current_iter = args
 
     # ── Three-phase training ─────────────────────────────────────────────
-    # Phase 1 (iter 1-1000):   vs random opponents — learn basic hand values
-    # Phase 2 (iter 1001-3000): self-play — refine strategy against itself
+    # Phase 1 (iter 1-600):    vs random opponents — learn basic hand values
+    # Phase 2 (iter 601-1600): self-play — refine strategy against itself
     # Phase 3 (iter 3001+):    mixed training — 70% K-Best pool, 30% current
-    PHASE1_END = 1000
-    PHASE2_END = 3000
+    PHASE1_END = 600
+    PHASE2_END = 1600
 
     if current_iter <= PHASE1_END:
         # Phase 1: random opponents, high exploration
         epsilon = 0.10
         opp_nets = None  # random actions
     elif current_iter <= PHASE2_END:
-        # Phase 2: self-play, moderate exploration
-        epsilon = max(0.02, 0.05 * (1.0 - (current_iter - PHASE1_END) / (PHASE2_END - PHASE1_END)))
+        # Phase 2: self-play, higher exploration to prevent call-collapse
+        epsilon = max(0.06, 0.10 * (1.0 - (current_iter - PHASE1_END) / (PHASE2_END - PHASE1_END)))
         opp_nets = _SHARED_STRAT_NETS
     else:
-        # Phase 3: mixed training against diverse pool, low exploration
-        epsilon = 0.01
+        # Phase 3: mixed training against diverse pool
+        epsilon = 0.05
         opp_nets = _SHARED_STRAT_NETS
         if _KBEST_POOL and len(_KBEST_POOL) > 0 and np.random.random() < 0.7:
             _, opp_nets = _KBEST_POOL[np.random.randint(len(_KBEST_POOL))]
@@ -313,6 +321,15 @@ def _traversal_worker(args):
         raw_regrets = {a: float(np.clip(branch_rewards[a] / _REWARD_SCALE - ev,
                                          -_REGRET_CLIP, _REGRET_CLIP))
                        for a in legal_int}
+
+        # DCFR-inspired: attenuate negative call regrets only.
+        # Call is the action that collapses in self-play. Attenuating ALL
+        # negative regrets (tried 0.3x) killed aggression — model became
+        # ultra-passive. Only dampen call's negative regret so it stays
+        # alive without suppressing raise/fold learning signals.
+        CALL_ACTION = 1
+        if CALL_ACTION in raw_regrets and raw_regrets[CALL_ACTION] < 0:
+            raw_regrets[CALL_ACTION] *= 0.3
 
         # Normalize: divide by max absolute regret (keeps direction, scales to [-1,1])
         max_abs = max(abs(r) for r in raw_regrets.values())
@@ -521,7 +538,7 @@ def main():
     print(f'  workers  : {num_workers}')
     print(f'  players  : {num_players}')
     print(f'  iters    : {config["training"]["num_iterations"]}')
-    print(f'  phases   : 1-1000 random, 1001-3000 self-play, 3001+ mixed (K-Best)')
+    print(f'  phases   : 1-600 random, 601-1600 self-play, 1601+ mixed (K-Best)')
     print(f'  trav/iter: {config["training"]["traversals_per_iteration"]}')
     print('=' * 60)
 
@@ -666,11 +683,11 @@ def main():
     writer = SummaryWriter(log_dir=str(logs_dir))
     print(f'TensorBoard logs → {logs_dir}  (run: tensorboard --logdir {logs_dir})\n')
 
-    # ── Set Phase 1 LR schedule: 0.0003 → 0.0001 over 1000 iters ──────
+    # ── Set Phase 1 LR schedule: 0.0003 → 0.0001 over 600 iters ───────
     # Override the constructor's default scheduler (which uses config t_max)
-    if start_iter < 1000:
+    if start_iter < 600:
         from torch.optim import lr_scheduler as _lr_sched
-        p1_lr, p1_end, p1_dur = 0.0003, 0.0001, 1000
+        p1_lr, p1_end, p1_dur = 0.0003, 0.0001, 600
         for opt in deep_cfr.advantage_optimizers + deep_cfr.strategy_optimizers:
             for pg in opt.param_groups:
                 pg['lr'] = p1_lr
@@ -759,10 +776,12 @@ def main():
                 print(f'K-Best pool seeded with {len(kbest_pool)} checkpoints: '
                       f'{", ".join(l for l, _ in kbest_pool)}')
 
+    _eq_path = args.equity_model if args.equity_model else None
     pool = Pool(processes=num_workers, initializer=_worker_init,
                 initargs=(shared_adv_nets, shared_strat_nets, act_size,
                           args.preflop_ranges, args.archetype_mode,
-                          kbest_pool if kbest_pool else None))
+                          kbest_pool if kbest_pool else None,
+                          _eq_path))
     print('Workers ready.\n')
 
     _adv_hist   = deque(maxlen=10)
@@ -884,15 +903,14 @@ def main():
             # ── Phase transitions: clear buffer + reset LR ──────────────────
             #
             # Per-phase LR schedule (start → end, linear decay):
-            #   Phase 1 (1-1000):    0.0003 → 0.0001
-            #   Phase 2 (1001-3000): 0.0003 → 0.0001
-            #   Phase 3 (3001-5000): 0.0002 → 0.0001
-            #   Phase 3 (3001+):     0.0002 → 0.0001
+            #   Phase 1 (1-600):     0.0003 → 0.0001
+            #   Phase 2 (601-1600):  0.0003 → 0.0001
+            #   Phase 3 (1601-5200): 0.0002 → 0.0001
             PHASE_LR = {
-                1001: (0.0003, 0.0001, 2000),   # (start_lr, end_lr, duration)
-                3001: (0.0002, 0.0001, 2000),
+                601:  (0.0003, 0.0001, 1000),   # (start_lr, end_lr, duration)
+                1601: (0.0002, 0.0001, 3600),
             }
-            phase_transitions = {1001: 'P2:self-play', 3001: 'P3:mixed'}
+            phase_transitions = {601: 'P2:self-play', 1601: 'P3:mixed'}
             for phase_start, phase_name in phase_transitions.items():
                 if iter_num == phase_start and phase_start not in _phase_transitions_done:
                     _phase_transitions_done.add(phase_start)
@@ -902,7 +920,7 @@ def main():
                     deep_cfr.replay_buffer._dirty = True
                     print(f'  *** Buffer cleared for {phase_name} '
                           f'(was {old_size:,} entries) ***')
-                    if phase_start == 3001:
+                    if phase_start == 1601:
                         kbest_pool.clear()
                         print(f'  *** K-Best pool cleared for Phase 3 ***')
 
@@ -1018,9 +1036,9 @@ def main():
             if not warmup_tag:
                 warmup_tag = ''
             # Phase indicator
-            if iter_num <= 1000:
+            if iter_num <= 600:
                 phase_tag = ' P1:random'
-            elif iter_num <= 3000:
+            elif iter_num <= 1600:
                 phase_tag = ' P2:self-play'
             else:
                 phase_tag = ' P3:mixed'
@@ -1056,7 +1074,7 @@ def main():
                 _batch_train.clear()
 
             # ── K-Best pool update every 100 iters, only in Phase 2+ ────────
-            if iter_num % 100 == 0 and iter_num > 1000:
+            if iter_num % 100 == 0 and iter_num > 1600:
                 try:
                     pool_nets = []
                     for net in deep_cfr.strategy_networks:
@@ -1076,7 +1094,7 @@ def main():
                     pool = Pool(processes=num_workers, initializer=_worker_init,
                                 initargs=(shared_adv_nets, shared_strat_nets, act_size,
                                           args.preflop_ranges, args.archetype_mode,
-                                          kbest_pool))
+                                          kbest_pool, _eq_path))
                     pool_labels = ', '.join(l for l, _ in kbest_pool)
                     print(f'  K-Best pool updated: [{pool_labels}]')
                 except Exception as e:
@@ -1086,8 +1104,10 @@ def main():
             if iter_num % ckpt_interval == 0:
                 ckpt = str(models_dir / f'checkpoint_iter_{iter_num}.pt')
                 deep_cfr.save_models(ckpt)
-                buf_path = ckpt.replace('.pt', '_buffer.npz')
-                deep_cfr.replay_buffer.save(buf_path)
+                # # Save buffer (disabled — large file, slow I/O)
+                # if iter_num % 200 == 0:
+                #     buf_path = ckpt.replace('.pt', '_buffer.npz')
+                #     deep_cfr.replay_buffer.save(buf_path)
                 meta = {'iteration': iter_num,
                         'buffer_size': len(deep_cfr.replay_buffer),
                         'config': config['training']}
