@@ -670,6 +670,49 @@ def main():
         cpu_net.share_memory()
         shared_strat_nets.append(cpu_net)
 
+    # ── EMA (Exponential Moving Average) of strategy network weights ────
+    # The average strategy converges to Nash in CFR theory. EMA approximates
+    # this by slowly blending current weights into a running average.
+    # EMA model is saved separately and should be used for evaluation/play.
+    EMA_DECAY = 0.995  # higher = slower update, more stable
+    ema_strat_nets = []
+    for net in deep_cfr.strategy_networks:
+        ema_net = copy.deepcopy(net).cpu().eval()
+        ema_strat_nets.append(ema_net)
+    ema_adv_nets = []
+    for net in deep_cfr.advantage_networks:
+        ema_net = copy.deepcopy(net).cpu().eval()
+        ema_adv_nets.append(ema_net)
+
+    def _update_ema():
+        """Blend current network weights into EMA: ema = decay*ema + (1-decay)*current."""
+        for ema_net, gpu_net in zip(ema_strat_nets, deep_cfr.strategy_networks):
+            for ema_p, cur_p in zip(ema_net.parameters(), gpu_net.parameters()):
+                ema_p.data.mul_(EMA_DECAY).add_(cur_p.data.cpu(), alpha=1.0 - EMA_DECAY)
+        for ema_net, gpu_net in zip(ema_adv_nets, deep_cfr.advantage_networks):
+            for ema_p, cur_p in zip(ema_net.parameters(), gpu_net.parameters()):
+                ema_p.data.mul_(EMA_DECAY).add_(cur_p.data.cpu(), alpha=1.0 - EMA_DECAY)
+
+    def _save_ema(path):
+        """Save EMA model as a standard Deep CFR checkpoint."""
+        ema_checkpoint = {
+            'iteration': deep_cfr.iteration,
+            'advantage_networks': [n.state_dict() for n in ema_adv_nets],
+            'strategy_networks': [n.state_dict() for n in ema_strat_nets],
+            'advantage_optimizers': [o.state_dict() for o in deep_cfr.advantage_optimizers],
+            'strategy_optimizers': [o.state_dict() for o in deep_cfr.strategy_optimizers],
+        }
+        torch.save(ema_checkpoint, path)
+
+    # ── Cyclical reset: best checkpoint tracking ─────────────────────────
+    _best_ckpt_path = None
+    _best_ckpt_agreement = 0.0
+    # Thresholds for drift detection
+    RESET_AF_MAX = 3.5     # reset if AF exceeds this
+    RESET_WTSD_MIN = 15.0  # reset if WTSD drops below this
+
+    print(f'  EMA decay: {EMA_DECAY} (saved alongside checkpoints)')
+
     num_iterations = config['training']['num_iterations']
     traversals    = config['training']['traversals_per_iteration']
     batch_size    = config['training'].get('batch_size', 256)
@@ -920,9 +963,7 @@ def main():
                     deep_cfr.replay_buffer._dirty = True
                     print(f'  *** Buffer cleared for {phase_name} '
                           f'(was {old_size:,} entries) ***')
-                    if phase_start == 1601:
-                        kbest_pool.clear()
-                        print(f'  *** K-Best pool cleared for Phase 3 ***')
+                    # Pool is NOT cleared — keep diverse models from earlier phases
 
                     # Reset LR + rebuild scheduler for this phase
                     if phase_start in PHASE_LR:
@@ -1020,6 +1061,8 @@ def main():
                 strat_losses.append(deep_cfr.train_strategy_network(batch_size))
             deep_cfr.step_schedulers()
             deep_cfr.iteration = iter_num
+            if effective_passes > 0:
+                _update_ema()
             t_train = time.time() - t0 - t_trav
 
             adv   = np.mean(adv_losses)   if adv_losses   else 0.0
@@ -1104,10 +1147,9 @@ def main():
             if iter_num % ckpt_interval == 0:
                 ckpt = str(models_dir / f'checkpoint_iter_{iter_num}.pt')
                 deep_cfr.save_models(ckpt)
-                # # Save buffer (disabled — large file, slow I/O)
-                # if iter_num % 200 == 0:
-                #     buf_path = ckpt.replace('.pt', '_buffer.npz')
-                #     deep_cfr.replay_buffer.save(buf_path)
+                # Save EMA model alongside
+                ema_path = str(models_dir / f'ema_iter_{iter_num}.pt')
+                _save_ema(ema_path)
                 meta = {'iteration': iter_num,
                         'buffer_size': len(deep_cfr.replay_buffer),
                         'config': config['training']}
@@ -1117,6 +1159,76 @@ def main():
             # ── Self-play + validation every EVAL_INTERVAL iters ────────────
             if iter_num % EVAL_INTERVAL == 0:
                 _run_eval(deep_cfr, engine, iter_num)
+
+                # ── Cyclical reset: detect drift and reset to best ──────────
+                # Run a quick self-play check on the EMA model to detect drift
+                try:
+                    import io
+                    from src.decision_engine import DecisionEngine, DecisionConfig
+                    from scripts.analysis.self_play import run_self_play, generate_json
+
+                    # Save temp EMA for evaluation
+                    _tmp_ema = str(models_dir / '_ema_eval_tmp.pt')
+                    _save_ema(_tmp_ema)
+
+                    dc = DecisionConfig(
+                        strong_hand_guard=False, allin_filter=False,
+                        style_tuning=False, use_preflop_ranges=True,
+                        raise_randomize=False,
+                    )
+                    sp_eng = DecisionEngine(dc)
+                    sp_eng.load_models(facing_bet=_tmp_ema, checked_to=_tmp_ema)
+                    sp_eng.load_preflop_ranges()
+
+                    old_stdout = sys.stdout
+                    sys.stdout = io.StringIO()
+                    try:
+                        raw = run_self_play(sp_eng, 1000, num_players)
+                    finally:
+                        sys.stdout = old_stdout
+                    sp = generate_json(raw, num_players, 1000)
+
+                    ema_af = sp['af']
+                    ema_wtsd = sp['wtsd']
+                    ema_cbet = sp['cbet']
+                    act = sp.get('postflop_actions', {})
+                    print(f'  [EMA] CBet={ema_cbet:.1f}% AF={ema_af:.1f} '
+                          f'WTSD={ema_wtsd:.1f}% Call={act.get("call_pct",0):.0f}%')
+
+                    # Track best EMA checkpoint
+                    # Use a simple score: in-range metrics get points
+                    _score = 0
+                    if 55 <= ema_cbet <= 70: _score += 1
+                    if 2.0 <= ema_af <= 3.5: _score += 1
+                    if 25 <= ema_wtsd <= 35: _score += 1
+                    if _score > _best_ckpt_agreement:
+                        _best_ckpt_agreement = _score
+                        _best_ckpt_path = _tmp_ema.replace('_ema_eval_tmp', f'ema_iter_{iter_num}')
+                        print(f'  [EMA] New best (score={_score}/3): {_best_ckpt_path}')
+
+                    # Cyclical reset if drift detected
+                    if ema_af > RESET_AF_MAX or ema_wtsd < RESET_WTSD_MIN:
+                        if _best_ckpt_path and Path(_best_ckpt_path).exists():
+                            print(f'  *** DRIFT DETECTED (AF={ema_af:.1f}, WTSD={ema_wtsd:.1f}%) ***')
+                            print(f'  *** Resetting to best EMA: {_best_ckpt_path} ***')
+                            deep_cfr.load_models(_best_ckpt_path)
+                            # Re-init EMA from reset weights
+                            for ema_net, gpu_net in zip(ema_strat_nets, deep_cfr.strategy_networks):
+                                ema_net.load_state_dict({k: v.cpu() for k, v in gpu_net.state_dict().items()})
+                            for ema_net, gpu_net in zip(ema_adv_nets, deep_cfr.advantage_networks):
+                                ema_net.load_state_dict({k: v.cpu() for k, v in gpu_net.state_dict().items()})
+                            # Clear buffer — old data is from drifted model
+                            deep_cfr.replay_buffer._size = 0
+                            deep_cfr.replay_buffer._total_seen = 0
+                            deep_cfr.replay_buffer._dirty = True
+                            print(f'  *** Buffer cleared, continuing from best ***')
+
+                    try:
+                        os.remove(_tmp_ema)
+                    except OSError:
+                        pass
+                except Exception as e:
+                    print(f'  [EMA eval error: {e}]')
     finally:
         if async_result is not None:
             async_result.wait()

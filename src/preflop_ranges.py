@@ -168,8 +168,8 @@ class PreflopRanges:
         return strategy
 
     def _best_raise(self, legal_actions: List[int]) -> int:
-        """Pick best available raise action (never all-in unless in allin range)."""
-        for a in [RAISE_POT, RAISE_HALF]:
+        """Pick best available raise action."""
+        for a in [RAISE_POT, RAISE_HALF, RAISE_MIN, ALL_IN]:
             if a in legal_actions:
                 return a
         if CALL in legal_actions:
@@ -192,6 +192,13 @@ class PreflopRanges:
             range_3b = self.ranges.get('3b', {}).get(key_3b, {})
             is_premium = _is_in_range(combo, range_3b)
 
+            # SB non-premium: 40% just complete (out of position, avoid bloating pot)
+            if pos_key == 'SB' and not is_premium:
+                sb_def = self.ranges.get('SB_DEF', {}).get('SB_DEF_call', {})
+                if _is_in_range(combo, sb_def) and np.random.random() < 0.4:
+                    if CALL in legal_actions:
+                        return CALL
+
             rng = np.random.random()
             if is_premium:
                 # 80% pot, 20% min raise
@@ -202,7 +209,10 @@ class PreflopRanges:
 
             # Fall back if chosen raise not in legal actions
             if action not in legal_actions:
-                for fallback in [RAISE_MIN, RAISE_HALF, RAISE_POT, CALL]:
+                # Premium hands can go all-in if no other raise available
+                fallbacks = [RAISE_MIN, RAISE_HALF, RAISE_POT, ALL_IN, CALL] if is_premium \
+                       else [RAISE_MIN, RAISE_HALF, RAISE_POT, CALL]
+                for fallback in fallbacks:
                     if fallback != action and fallback in legal_actions:
                         return fallback
             return action
