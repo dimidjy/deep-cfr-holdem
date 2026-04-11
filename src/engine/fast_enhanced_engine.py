@@ -171,8 +171,8 @@ def _equity_model_encode(hole_ranks, hole_suits, board_ranks, board_suits):
 
 
 def _equity_build_features(hole_ranks, hole_suits, board_ranks, board_suits,
-                            input_size):
-    """Build the 82-dim (or 24-dim) feature vector for the equity model."""
+                            input_size, n_opponents=1):
+    """Build the 82/83-dim (or 24-dim) feature vector for the equity model."""
     from collections import Counter
     features = np.zeros(input_size, dtype=np.float32)
 
@@ -332,11 +332,15 @@ def _equity_build_features(hole_ranks, hole_suits, board_ranks, board_suits,
         features[d+38] = 1.0 if len(board_ranks) == 5 else 0.0
         features[d+39] = 1.0 if len(board_ranks) == 0 else 0.0
 
+    # n_opponents (index 82 for 83-dim model, ignored for 82-dim v2)
+    if input_size >= 83:
+        features[82] = n_opponents / 5.0
+
     return features
 
 
 def _equity_model_predict(hole_ranks, hole_suits, board_ranks, board_suits,
-                           hole_cards_raw, board_cards_raw):
+                           hole_cards_raw, board_cards_raw, n_opponents=1):
     """Predict 9-dim equity features using cached + batched inference.
 
     Flow: cache hit → return instantly.  Cache miss → encode features, add
@@ -346,7 +350,7 @@ def _equity_model_predict(hole_ranks, hole_suits, board_ranks, board_suits,
         return None
 
     cache_key = (tuple(hole_ranks[:2]), tuple(hole_suits[:2]),
-                 tuple(board_ranks[:5]), tuple(board_suits[:5]))
+                 tuple(board_ranks[:5]), tuple(board_suits[:5]), n_opponents)
     cached = _EQUITY_CACHE.get(cache_key)
     if cached is not None:
         return cached.copy()
@@ -359,7 +363,7 @@ def _equity_model_predict(hole_ranks, hole_suits, board_ranks, board_suits,
 
     features = _equity_build_features(hole_ranks, hole_suits,
                                        board_ranks, board_suits,
-                                       _EQUITY_INPUT_SIZE)
+                                       _EQUITY_INPUT_SIZE, n_opponents)
     _EQUITY_BATCH_KEYS.append(cache_key)
     _EQUITY_BATCH_FEATS.append(features)
 
@@ -650,8 +654,15 @@ class FastEnhancedPokerEngine(FastPokerEngine):
                 hole_suits = [_SUIT_MAP_EQ.get(_pkrs_card_suit(c).lower(), 0) for c in hole[:2]]
                 board_ranks = [self._rank_to_value(_pkrs_card_rank(c)) for c in board_pkrs]
                 board_suits = [_SUIT_MAP_EQ.get(_pkrs_card_suit(c).lower(), 0) for c in board_pkrs]
+                # Count active opponents for multiway equity
+                try:
+                    n_opp = max(sum(1 for a in self.agents if not self._state.player_states[
+                        self.agents.index(a)].has_folded) - 1, 1)
+                except Exception:
+                    n_opp = 1
                 pred = _equity_model_predict(hole_ranks, hole_suits,
-                                              board_ranks, board_suits, hole, board_pkrs)
+                                              board_ranks, board_suits, hole, board_pkrs,
+                                              n_opponents=n_opp)
                 if pred is not None:
                     return pred
 

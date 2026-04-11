@@ -36,6 +36,10 @@ ARCHETYPE_PROFILES: Dict[str, np.ndarray] = {
     'maniac':          np.array([0.60, 0.45, 0.82, 0.15, 0.38], dtype=np.float32),
     'weak_tight':      np.array([0.18, 0.14, 0.60, 0.65, 0.28], dtype=np.float32),
     'gto':             np.array([0.22, 0.18, 0.71, 0.45, 0.30], dtype=np.float32),
+    # NL5 population average from 1.8M hands of real NL5 play:
+    # VPIP=28.5%, PFR=15.7%, AF=1.83 (avg flop/turn/river), Fold2CBet~35%, WTSD~35%
+    # AF_norm = 1.83/(1.83+1) = 0.647
+    'nl5_population':  np.array([0.285, 0.157, 0.647, 0.35, 0.35], dtype=np.float32),
 }
 
 ARCHETYPE_NAMES = list(ARCHETYPE_PROFILES.keys())
@@ -52,20 +56,26 @@ def _apply_skew(strategy: np.ndarray, legal: List[int],
                 fold_mult: float, call_mult: float, raise_mult: float) -> np.ndarray:
     """Apply multiplicative skew to strategy, renormalize over legal actions."""
     s = strategy.copy()
-    s[FOLD] *= fold_mult
-    s[CALL] *= call_mult
-    s[RAISE_HALF] *= raise_mult
-    s[RAISE_POT] *= raise_mult
-    s[ALL_IN] *= raise_mult
-    # Zero out illegal actions
+    n = len(s)
+    if FOLD < n:      s[FOLD] *= fold_mult
+    if CALL < n:      s[CALL] *= call_mult
+    if RAISE_HALF < n: s[RAISE_HALF] *= raise_mult
+    if RAISE_POT < n:  s[RAISE_POT] *= raise_mult
+    if ALL_IN < n:     s[ALL_IN] *= raise_mult
+    # Zero out illegal actions, clamp negatives
+    s = np.maximum(s, 0.0)
     mask = np.zeros(len(s), dtype=np.float32)
-    mask[legal] = 1.0
+    for a in legal:
+        if a < len(mask):
+            mask[a] = 1.0
     s *= mask
     total = s.sum()
     if total > 0:
         s /= total
     else:
-        s[legal] = 1.0 / len(legal)
+        for a in legal:
+            if a < len(s):
+                s[a] = 1.0 / len(legal)
     return s
 
 
@@ -98,12 +108,26 @@ def gto_skew(strategy: np.ndarray, legal: List[int]) -> np.ndarray:
     return strategy
 
 
+def nl5_population_skew(strategy: np.ndarray, legal: List[int]) -> np.ndarray:
+    """NL5 average player: loose-passive, calls too much, folds too little,
+    rarely raises. Based on 1.8M hands of real NL5 data:
+      Flop: fold=16%, check=43%, call=15%, bet=23%, raise=3% → AF=1.78
+    Compared to GTO balanced model, NL5 players:
+      - Fold 20% less than they should
+      - Call 50% more than they should
+      - Raise 30% less than they should
+    """
+    return _apply_skew(strategy, legal,
+                       fold_mult=0.85, call_mult=1.3, raise_mult=0.75)
+
+
 _SKEW_FUNCTIONS: Dict[str, Callable] = {
     'calling_station': calling_station_skew,
     'nit':             nit_skew,
     'maniac':          maniac_skew,
     'weak_tight':      weak_tight_skew,
     'gto':             gto_skew,
+    'nl5_population':  nl5_population_skew,
 }
 
 

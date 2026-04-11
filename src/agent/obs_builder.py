@@ -244,7 +244,8 @@ class ObservationBuilder:
                 board_ranks = [_rank_val(c[0]) for c in community_cards]
                 board_suits = [_SUIT_MAP_EQ.get(c[1].lower(), 0) for c in community_cards]
                 pred = _equity_model_predict(hole_ranks, hole_suits,
-                                              board_ranks, board_suits, None, None)
+                                              board_ranks, board_suits, None, None,
+                                              n_opponents=n_opponents)
                 if pred is not None:
                     return pred
         except Exception:

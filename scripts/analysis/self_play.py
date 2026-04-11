@@ -837,12 +837,15 @@ def main():
     parser.add_argument('--no-preflop-ranges', action='store_true',
                         help='Disable GTO preflop ranges (model plays preflop too)')
     parser.add_argument('--archetype', type=str, default='',
-                        choices=['', 'calling_station', 'nit', 'maniac', 'weak_tight'],
+                        choices=['', 'calling_station', 'nit', 'maniac', 'weak_tight', 'nl5_population'],
                         help='Use archetype as opponent (engine B). '
-                             'Wraps the same model with a strategy skew.')
+                             'Wraps opponent model with a strategy skew.')
+    parser.add_argument('--opponent-model', type=str, default='',
+                        help='Separate model for opponent (engine B). '
+                             'Use with --archetype to skew a different model.')
     args = parser.parse_args()
 
-    vs_mode = bool(args.vs_facing_bet) or bool(args.archetype)
+    vs_mode = bool(args.vs_facing_bet) or bool(args.archetype) or bool(args.opponent_model)
 
     print('=' * 70)
     print('SELF-PLAY ANALYSIS' + (' — VS MODE' if vs_mode else ''))
@@ -875,10 +878,27 @@ def main():
 
     # Setup DecisionEngine B (vs mode or archetype mode)
     engine_b = None
-    if args.archetype:
-        skew_fn = get_archetype_skew(args.archetype)
-        engine_b = ArchetypeEngine(engine, skew_fn)
-        print(f'  Engine B: archetype={args.archetype} (skew on engine A)')
+    if args.archetype or args.opponent_model:
+        # Load separate opponent model if specified, otherwise use engine A
+        if args.opponent_model:
+            opp_engine = DecisionEngine(dc)
+            opp_engine.load_models(
+                facing_bet=args.opponent_model,
+                checked_to=args.opponent_model,
+            )
+            opp_engine.load_preflop_ranges()
+            opp_label = Path(args.opponent_model).stem
+        else:
+            opp_engine = engine
+            opp_label = 'engine A'
+
+        if args.archetype:
+            skew_fn = get_archetype_skew(args.archetype)
+            engine_b = ArchetypeEngine(opp_engine, skew_fn)
+            print(f'  Engine B: archetype={args.archetype} (skew on {opp_label})')
+        else:
+            engine_b = opp_engine
+            print(f'  Engine B: {opp_label}')
     elif vs_mode:
         engine_b = DecisionEngine(dc)
         engine_b.load_models(

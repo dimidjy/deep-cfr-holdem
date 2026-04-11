@@ -37,8 +37,8 @@ SUITS = 'shdc'
 RANK_MAP = {r: i for i, r in enumerate(RANKS)}
 SUIT_MAP = {s: i for i, s in enumerate(SUITS)}
 
-# Total input dims: 7 cards × 6 features + 40 derived = 82
-INPUT_SIZE = 82
+# Total input dims: 7 cards × 6 features + 40 derived + 1 n_opponents = 83
+INPUT_SIZE = 83
 
 
 def encode_card_rich(card_str: str) -> np.ndarray:
@@ -52,12 +52,13 @@ def encode_card_rich(card_str: str) -> np.ndarray:
     return feat
 
 
-def encode_hand_board(hole: list, board: list) -> np.ndarray:
-    """Encode hole cards + board into 82-dim feature vector.
+def encode_hand_board(hole: list, board: list, n_opponents: int = 1) -> np.ndarray:
+    """Encode hole cards + board + n_opponents into 83-dim feature vector.
 
     Layout:
       7 cards × 6 features each = 42 (hole[0], hole[1], board[0-4])
       + 40 derived features
+      + 1 n_opponents (normalized by /5)
     """
     features = np.zeros(INPUT_SIZE, dtype=np.float32)
 
@@ -200,6 +201,9 @@ def encode_hand_board(hole: list, board: list) -> np.ndarray:
         features[d+38] = 1.0 if len(board) == 5 else 0.0           # is_river
         features[d+39] = 1.0 if len(board) == 0 else 0.0           # is_preflop
 
+    # n_opponents feature (index 82)
+    features[82] = n_opponents / 5.0
+
     return features
 
 
@@ -229,10 +233,41 @@ _TREYS_RANK_BOUNDS = {
 }
 
 
-def compute_targets(hole, board, n_equity_samples=300):
+def _multiway_equity_mc(hole, board, n_opponents, n_samples=300):
+    """Monte Carlo multiway equity: win rate vs N random opponents."""
+    import random as _rng
+    deck = [eval7.Card(r + s) for r in RANKS for s in SUITS]
+    used = set(str(c) for c in list(hole) + list(board))
+    available = [c for c in deck if str(c) not in used]
+    cards_needed = n_opponents * 2 + (5 - len(board))
+    if len(available) < cards_needed:
+        return 0.5
+    wins = 0
+    for _ in range(n_samples):
+        _rng.shuffle(available)
+        idx = 0
+        full_board = list(board) + available[idx:idx + (5 - len(board))]
+        idx += 5 - len(board)
+        my_score = eval7.evaluate(list(hole) + full_board)
+        beat_all = True
+        for _ in range(n_opponents):
+            opp = [available[idx], available[idx + 1]]
+            idx += 2
+            if eval7.evaluate(opp + full_board) > my_score:
+                beat_all = False
+                break
+        if beat_all:
+            wins += 1
+    return wins / max(n_samples, 1)
+
+
+def compute_targets(hole, board, n_equity_samples=300, n_opponents=1):
     """Compute the 9-dim equity feature targets using eval7 + treys."""
-    equity = eval7.py_hand_vs_range_monte_carlo(
-        hole, _RANDOM_RANGE, board, n_equity_samples)
+    if n_opponents <= 1:
+        equity = eval7.py_hand_vs_range_monte_carlo(
+            hole, _RANDOM_RANGE, board, n_equity_samples)
+    else:
+        equity = _multiway_equity_mc(hole, board, n_opponents, n_equity_samples)
 
     if not board or not _TREYS_OK:
         return np.array([equity, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
@@ -344,20 +379,20 @@ class EquityNetwork(nn.Module):
 
 # ── Data generation ───────────────────────────────────────────────────────────
 
-def generate_data(n_samples, output_path, n_equity_samples=300):
-    """Generate training data using eval7 ground truth."""
+def _generate_chunk(args):
+    """Generate a chunk of training samples (for multiprocessing)."""
+    chunk_size, n_equity_samples, seed = args
+    np.random.seed(seed)
+
     deck_cards = [eval7.Card(r+s) for r in RANKS for s in SUITS]
+    chunk_inputs = np.zeros((chunk_size, INPUT_SIZE), dtype=np.float32)
+    chunk_targets = np.zeros((chunk_size, 9), dtype=np.float32)
 
-    inputs = np.zeros((n_samples, INPUT_SIZE), dtype=np.float32)
-    targets = np.zeros((n_samples, 9), dtype=np.float32)
-
-    t0 = time.time()
-    for i in range(n_samples):
+    for i in range(chunk_size):
         deck = list(deck_cards)
         np.random.shuffle(deck)
         hole = deck[:2]
 
-        # Weighted street distribution: more postflop (where equity matters most)
         r = np.random.random()
         if r < 0.15:
             board = []
@@ -368,14 +403,63 @@ def generate_data(n_samples, output_path, n_equity_samples=300):
         else:
             board = deck[2:7]
 
-        inputs[i] = encode_hand_board(hole, board)
-        targets[i] = compute_targets(hole, board, n_equity_samples)
+        opp_r = np.random.random()
+        if opp_r < 0.35:
+            n_opp = 1
+        elif opp_r < 0.65:
+            n_opp = 2
+        elif opp_r < 0.80:
+            n_opp = 3
+        elif opp_r < 0.92:
+            n_opp = 4
+        else:
+            n_opp = 5
 
-        if (i + 1) % 100000 == 0:
-            elapsed = time.time() - t0
-            rate = (i + 1) / elapsed
-            eta = (n_samples - i - 1) / rate
-            print(f'  [{i+1:,}/{n_samples:,}] {rate:.0f}/s, ETA {eta/60:.1f}min')
+        chunk_inputs[i] = encode_hand_board(hole, board, n_opp)
+        chunk_targets[i] = compute_targets(hole, board, n_equity_samples, n_opp)
+
+    return chunk_inputs, chunk_targets
+
+
+def generate_data(n_samples, output_path, n_equity_samples=300, n_workers=None):
+    """Generate training data using eval7 ground truth (multiprocessing)."""
+    import multiprocessing as mp
+
+    if n_workers is None:
+        n_workers = max(1, mp.cpu_count() - 1)
+
+    # Split into chunks
+    chunk_size = max(1000, n_samples // (n_workers * 4))
+    n_chunks = (n_samples + chunk_size - 1) // chunk_size
+    chunks = []
+    remaining = n_samples
+    for i in range(n_chunks):
+        sz = min(chunk_size, remaining)
+        chunks.append((sz, n_equity_samples, i * 1000 + 42))
+        remaining -= sz
+
+    print(f'  Using {n_workers} workers, {n_chunks} chunks of ~{chunk_size:,}')
+
+    inputs = np.zeros((n_samples, INPUT_SIZE), dtype=np.float32)
+    targets = np.zeros((n_samples, 9), dtype=np.float32)
+
+    t0 = time.time()
+    done = 0
+
+    with mp.Pool(n_workers) as pool:
+        for chunk_in, chunk_tgt in pool.imap_unordered(_generate_chunk, chunks):
+            n = len(chunk_in)
+            if done + n > n_samples:
+                n = n_samples - done
+            inputs[done:done+n] = chunk_in[:n]
+            targets[done:done+n] = chunk_tgt[:n]
+            done += n
+
+            if done % 500000 < chunk_size:
+                elapsed = time.time() - t0
+                rate = done / elapsed
+                eta = (n_samples - done) / rate if rate > 0 else 0
+                print(f'  [{done:,}/{n_samples:,}] {rate:.0f}/s, ETA {eta/60:.1f}min')
 
     np.savez_compressed(output_path, inputs=inputs, targets=targets)
     elapsed = time.time() - t0
@@ -471,16 +555,17 @@ def main():
     parser.add_argument('--samples', type=int, default=10000000)
     parser.add_argument('--epochs', type=int, default=80)
     parser.add_argument('--train-only', action='store_true')
-    parser.add_argument('--data-path', type=str, default='data/equity_training_data_v2.npz')
-    parser.add_argument('--output', type=str, default='models/equity_model_v2.pt')
+    parser.add_argument('--data-path', type=str, default='data/equity_training_data_v3.npz')
+    parser.add_argument('--output', type=str, default='models/equity_model_v3.pt')
+    parser.add_argument('--workers', type=int, default=None, help='CPU workers for data generation')
     args = parser.parse_args()
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     Path(args.data_path).parent.mkdir(parents=True, exist_ok=True)
 
     if not args.train_only:
-        print(f'Generating {args.samples:,} equity samples (v2 encoding)...')
-        generate_data(args.samples, args.data_path)
+        print(f'Generating {args.samples:,} equity samples (v3 encoding, multiway)...')
+        generate_data(args.samples, args.data_path, n_workers=args.workers)
 
     print(f'\nTraining equity model v2...')
     train(args.data_path, args.output, epochs=args.epochs)
@@ -506,27 +591,34 @@ def main():
         print(f'  vs Monte Carlo: ~300 μs/sample')
         print(f'  Speedup: ~{300/per_sample:.0f}x')
 
-    # Accuracy test on known hands
+    # Accuracy test on known hands (single + multiway)
     print(f'\nAccuracy test:')
     test_hands = [
-        ('AA on K72',     ['As','Ah'], ['Kd','7c','2s']),
-        ('72o on KQJ',    ['7d','2c'], ['Ks','Qh','Jd']),
-        ('AKs flush drw', ['Ah','Kh'], ['Qh','7h','2d']),
-        ('88 on 555',     ['8d','8c'], ['5s','5c','5h']),
-        ('AA preflop',    ['As','Ah'], []),
-        ('72o preflop',   ['7d','2c'], []),
+        # (name, hole, board, n_opponents)
+        ('AA on K72 (1v1)',     ['As','Ah'], ['Kd','7c','2s'], 1),
+        ('AA on K72 (1v2)',     ['As','Ah'], ['Kd','7c','2s'], 2),
+        ('72o on KQJ (1v1)',   ['7d','2c'], ['Ks','Qh','Jd'], 1),
+        ('AKs flush (1v1)',    ['Ah','Kh'], ['Qh','7h','2d'], 1),
+        ('AKs flush (1v3)',    ['Ah','Kh'], ['Qh','7h','2d'], 3),
+        ('55 on 478 (1v1)',    ['5c','5s'], ['4c','7c','8s'], 1),
+        ('55 on 478 (1v2)',    ['5c','5s'], ['4c','7c','8s'], 2),
+        ('55 on 478 (1v4)',    ['5c','5s'], ['4c','7c','8s'], 4),
+        ('AA preflop (1v1)',   ['As','Ah'], [], 1),
     ]
-    for name, h, b in test_hands:
+    for name, h, b, n_opp in test_hands:
         hole = [eval7.Card(c) for c in h]
         board = [eval7.Card(c) for c in b] if b else []
-        feat = encode_hand_board(hole, board)
+        feat = encode_hand_board(hole, board, n_opp)
         with torch.no_grad():
             inp = torch.from_numpy(feat).unsqueeze(0)
             if torch.cuda.is_available(): inp = inp.cuda()
             pred = model(inp).cpu().numpy()[0]
-        real = eval7.py_hand_vs_range_monte_carlo(hole, _RANDOM_RANGE, board, 5000)
+        if n_opp <= 1:
+            real = eval7.py_hand_vs_range_monte_carlo(hole, _RANDOM_RANGE, board, 5000)
+        else:
+            real = _multiway_equity_mc(hole, board, n_opp, 5000)
         err = abs(pred[0] - real)
-        print(f'  {name:18s}  pred={pred[0]:.3f}  real={real:.3f}  err={err:.3f}')
+        print(f'  {name:22s}  pred={pred[0]:.3f}  real={real:.3f}  err={err:.3f}')
 
 
 if __name__ == '__main__':

@@ -54,9 +54,11 @@ _ENGINE_POOL = []
 
 # Preflop range override — loaded once per worker
 _PREFLOP_RANGES = None      # PreflopRanges instance (or None if disabled)
+_OPP_PREFLOP_RANGES = None  # Separate NL5 ranges for opponents (if --nl5-opponents)
 
 # Archetype opponent training — set per worker via _worker_init
 _ARCHETYPE_MODE = False
+_NL5_OPP_MODE = False       # Force nl5_population skew on all opponents
 
 
 def _get_engine(num_players):
@@ -73,19 +75,29 @@ def _return_engine(eng):
 
 
 def _worker_init(shared_adv, shared_strat, act_size, use_preflop_ranges=False,
-                 archetype_mode=False, kbest_pool=None, equity_model_path=None):
+                 archetype_mode=False, kbest_pool=None, equity_model_path=None,
+                 nl5_opp_mode=False):
     global _SHARED_ADV_NETS, _SHARED_STRAT_NETS, _ACT_SIZE, _PREFLOP_RANGES
-    global _ARCHETYPE_MODE, _KBEST_POOL
+    global _ARCHETYPE_MODE, _KBEST_POOL, _OPP_PREFLOP_RANGES, _NL5_OPP_MODE
     _SHARED_ADV_NETS  = shared_adv
     _SHARED_STRAT_NETS = shared_strat
     _ACT_SIZE          = act_size
     _ARCHETYPE_MODE    = archetype_mode
     _KBEST_POOL        = kbest_pool
+    _NL5_OPP_MODE      = nl5_opp_mode
     if use_preflop_ranges:
         from src.preflop_ranges import PreflopRanges
         _PREFLOP_RANGES = PreflopRanges()
+        # Load wider NL5 preflop ranges for opponents
+        if nl5_opp_mode:
+            from pathlib import Path
+            nl5_path = str(Path(__file__).parent.parent / 'configs' / 'preflop_ranges_nl5.json')
+            _OPP_PREFLOP_RANGES = PreflopRanges(ranges_path=nl5_path)
+        else:
+            _OPP_PREFLOP_RANGES = _PREFLOP_RANGES
     else:
         _PREFLOP_RANGES = None
+        _OPP_PREFLOP_RANGES = None
     if equity_model_path:
         import torch as _torch
         # Each worker must use only 1 thread for PyTorch ops.
@@ -207,6 +219,16 @@ def _traversal_worker(args):
         # Phase 1: random opponents, high exploration
         epsilon = 0.10
         opp_nets = None  # random actions
+    elif _NL5_OPP_MODE:
+        # NL5 opponent mode: use FIXED opponent from pool + NL5 skew postflop.
+        # Pool should contain the base model (e.g. 2700) via --kbest-seed.
+        # Fixed opponent prevents feedback loop where hero and opponent
+        # co-adapt into check-check-showdown equilibrium.
+        epsilon = max(0.05, 0.08 * (1.0 - (current_iter - PHASE1_END) / 3000))
+        if _KBEST_POOL and len(_KBEST_POOL) > 0:
+            _, opp_nets = _KBEST_POOL[np.random.randint(len(_KBEST_POOL))]
+        else:
+            opp_nets = _SHARED_STRAT_NETS  # fallback if no pool
     elif current_iter <= PHASE2_END:
         # Phase 2: self-play, higher exploration to prevent call-collapse
         epsilon = max(0.06, 0.10 * (1.0 - (current_iter - PHASE1_END) / (PHASE2_END - PHASE1_END)))
@@ -227,11 +249,12 @@ def _traversal_worker(args):
         archetype_profile = get_archetype_profile(arch_name)
 
     def _pick_opponent_action(ai, obs, legal, eng=None, is_preflop=False):
-        # Preflop override for opponents too
+        # Preflop override for opponents — use NL5 ranges if in nl5 mode
         if is_preflop and _PREFLOP_RANGES is not None and eng is not None:
+            opp_ranges = _OPP_PREFLOP_RANGES if _OPP_PREFLOP_RANGES else _PREFLOP_RANGES
             cards, rel_pos, pot_bb = _get_preflop_info(eng, ai, num_players)
             if cards and len(cards) >= 2:
-                strat = _PREFLOP_RANGES.get_strategy(
+                strat = opp_ranges.get_strategy(
                     cards, rel_pos, pot_bb, legal, _ACT_SIZE)
                 lp = strat[legal].copy()
                 s = lp.sum()
@@ -243,8 +266,12 @@ def _traversal_worker(args):
             with torch.no_grad():
                 obs_t = torch.from_numpy(obs.astype(np.float32)).unsqueeze(0)
                 strat = nets[ai](obs_t).numpy()[0]
-            # Apply archetype skew to opponent strategy
-            if archetype_skew_fn is not None:
+            # Apply NL5 population skew if in nl5 mode (postflop)
+            if _NL5_OPP_MODE and archetype_skew_fn is None:
+                from src.archetypes import nl5_population_skew
+                strat = nl5_population_skew(strat, legal)
+                lp = strat[legal].copy()
+            elif archetype_skew_fn is not None:
                 strat = archetype_skew_fn(strat, legal)
                 lp = strat[legal].copy()
             else:
@@ -491,6 +518,9 @@ def main():
                         help='Max rake in chips per hand (default: 6 = 3BB)')
     parser.add_argument('--equity-model', type=str, default=None,
                         help='Path to GPU equity model (.pt) to replace Monte Carlo')
+    parser.add_argument('--nl5-opponents', action='store_true',
+                        help='Opponents use NL5 population behavior: wider preflop ranges + '
+                             'passive postflop skew (less folding, more calling, less raising)')
     args = parser.parse_args()
 
     if args.no_preflop_ranges:
@@ -531,6 +561,8 @@ def main():
         print(f'  rake     : {args.rake*100:.1f}% (cap {args.rake_cap:.0f} chips = {args.rake_cap/2:.1f}BB)')
     if args.archetype_mode:
         print(f'  archetype: ON (mixed opponent training)')
+    if args.nl5_opponents:
+        print(f'  nl5-opp  : ON (NL5 preflop ranges + passive postflop skew)')
     if args.fine_tune_from:
         print(f'  fine-tune: {Path(args.fine_tune_from).name}')
     if args.warm_start:
@@ -820,11 +852,12 @@ def main():
                       f'{", ".join(l for l, _ in kbest_pool)}')
 
     _eq_path = args.equity_model if args.equity_model else None
+    _nl5_opp = getattr(args, 'nl5_opponents', False)
     pool = Pool(processes=num_workers, initializer=_worker_init,
                 initargs=(shared_adv_nets, shared_strat_nets, act_size,
                           args.preflop_ranges, args.archetype_mode,
                           kbest_pool if kbest_pool else None,
-                          _eq_path))
+                          _eq_path, _nl5_opp))
     print('Workers ready.\n')
 
     _adv_hist   = deque(maxlen=10)
@@ -857,6 +890,15 @@ def main():
             import io
             from src.decision_engine import DecisionEngine, DecisionConfig
             from scripts.analysis.self_play import run_self_play, generate_json
+
+            # Ensure equity model is loaded in main process for self-play obs
+            if _eq_path:
+                import torch as _t
+                _t.set_num_threads(1)
+                from src.engine.fast_enhanced_engine import load_equity_model, _EQUITY_MODEL
+                load_equity_model(_eq_path, device='cpu')
+                from src.engine.fast_enhanced_engine import _EQUITY_MODEL as _em_check
+                print(f'  [eval] equity model loaded: {_em_check is not None}')
 
             dc = DecisionConfig(
                 strong_hand_guard=False, allin_filter=False,
@@ -1061,7 +1103,7 @@ def main():
                 strat_losses.append(deep_cfr.train_strategy_network(batch_size))
             deep_cfr.step_schedulers()
             deep_cfr.iteration = iter_num
-            if effective_passes > 0:
+            if effective_passes > 0 and not _nl5_opp:
                 _update_ema()
             t_train = time.time() - t0 - t_trav
 
@@ -1116,8 +1158,8 @@ def main():
                 _batch_trav.clear()
                 _batch_train.clear()
 
-            # ── K-Best pool update every 100 iters, only in Phase 2+ ────────
-            if iter_num % 100 == 0 and iter_num > 1600:
+            # ── K-Best pool update (skip in NL5 mode — no pool used) ─────
+            if iter_num % 100 == 0 and iter_num > 1600 and not _nl5_opp:
                 try:
                     pool_nets = []
                     for net in deep_cfr.strategy_networks:
@@ -1137,7 +1179,7 @@ def main():
                     pool = Pool(processes=num_workers, initializer=_worker_init,
                                 initargs=(shared_adv_nets, shared_strat_nets, act_size,
                                           args.preflop_ranges, args.archetype_mode,
-                                          kbest_pool, _eq_path))
+                                          kbest_pool, _eq_path, _nl5_opp))
                     pool_labels = ', '.join(l for l, _ in kbest_pool)
                     print(f'  K-Best pool updated: [{pool_labels}]')
                 except Exception as e:
@@ -1147,9 +1189,10 @@ def main():
             if iter_num % ckpt_interval == 0:
                 ckpt = str(models_dir / f'checkpoint_iter_{iter_num}.pt')
                 deep_cfr.save_models(ckpt)
-                # Save EMA model alongside
-                ema_path = str(models_dir / f'ema_iter_{iter_num}.pt')
-                _save_ema(ema_path)
+                # Save EMA model alongside (skip in NL5 mode — EMA slows adaptation)
+                if not _nl5_opp:
+                    ema_path = str(models_dir / f'ema_iter_{iter_num}.pt')
+                    _save_ema(ema_path)
                 meta = {'iteration': iter_num,
                         'buffer_size': len(deep_cfr.replay_buffer),
                         'config': config['training']}
@@ -1160,75 +1203,69 @@ def main():
             if iter_num % EVAL_INTERVAL == 0:
                 _run_eval(deep_cfr, engine, iter_num)
 
-                # ── Cyclical reset: detect drift and reset to best ──────────
-                # Run a quick self-play check on the EMA model to detect drift
-                try:
-                    import io
-                    from src.decision_engine import DecisionEngine, DecisionConfig
-                    from scripts.analysis.self_play import run_self_play, generate_json
-
-                    # Save temp EMA for evaluation
-                    _tmp_ema = str(models_dir / '_ema_eval_tmp.pt')
-                    _save_ema(_tmp_ema)
-
-                    dc = DecisionConfig(
-                        strong_hand_guard=False, allin_filter=False,
-                        style_tuning=False, use_preflop_ranges=True,
-                        raise_randomize=False,
-                    )
-                    sp_eng = DecisionEngine(dc)
-                    sp_eng.load_models(facing_bet=_tmp_ema, checked_to=_tmp_ema)
-                    sp_eng.load_preflop_ranges()
-
-                    old_stdout = sys.stdout
-                    sys.stdout = io.StringIO()
+                # ── EMA eval + cyclical reset (skip in NL5 mode) ────────────
+                if not _nl5_opp:
                     try:
-                        raw = run_self_play(sp_eng, 1000, num_players)
-                    finally:
-                        sys.stdout = old_stdout
-                    sp = generate_json(raw, num_players, 1000)
+                        import io
+                        from src.decision_engine import DecisionEngine, DecisionConfig
+                        from scripts.analysis.self_play import run_self_play, generate_json
 
-                    ema_af = sp['af']
-                    ema_wtsd = sp['wtsd']
-                    ema_cbet = sp['cbet']
-                    act = sp.get('postflop_actions', {})
-                    print(f'  [EMA] CBet={ema_cbet:.1f}% AF={ema_af:.1f} '
-                          f'WTSD={ema_wtsd:.1f}% Call={act.get("call_pct",0):.0f}%')
+                        _tmp_ema = str(models_dir / '_ema_eval_tmp.pt')
+                        _save_ema(_tmp_ema)
 
-                    # Track best EMA checkpoint
-                    # Use a simple score: in-range metrics get points
-                    _score = 0
-                    if 55 <= ema_cbet <= 70: _score += 1
-                    if 2.0 <= ema_af <= 3.5: _score += 1
-                    if 25 <= ema_wtsd <= 35: _score += 1
-                    if _score > _best_ckpt_agreement:
-                        _best_ckpt_agreement = _score
-                        _best_ckpt_path = _tmp_ema.replace('_ema_eval_tmp', f'ema_iter_{iter_num}')
-                        print(f'  [EMA] New best (score={_score}/3): {_best_ckpt_path}')
+                        dc = DecisionConfig(
+                            strong_hand_guard=False, allin_filter=False,
+                            style_tuning=False, use_preflop_ranges=True,
+                            raise_randomize=False,
+                        )
+                        sp_eng = DecisionEngine(dc)
+                        sp_eng.load_models(facing_bet=_tmp_ema, checked_to=_tmp_ema)
+                        sp_eng.load_preflop_ranges()
 
-                    # Cyclical reset if drift detected
-                    if ema_af > RESET_AF_MAX or ema_wtsd < RESET_WTSD_MIN:
-                        if _best_ckpt_path and Path(_best_ckpt_path).exists():
-                            print(f'  *** DRIFT DETECTED (AF={ema_af:.1f}, WTSD={ema_wtsd:.1f}%) ***')
-                            print(f'  *** Resetting to best EMA: {_best_ckpt_path} ***')
-                            deep_cfr.load_models(_best_ckpt_path)
-                            # Re-init EMA from reset weights
-                            for ema_net, gpu_net in zip(ema_strat_nets, deep_cfr.strategy_networks):
-                                ema_net.load_state_dict({k: v.cpu() for k, v in gpu_net.state_dict().items()})
-                            for ema_net, gpu_net in zip(ema_adv_nets, deep_cfr.advantage_networks):
-                                ema_net.load_state_dict({k: v.cpu() for k, v in gpu_net.state_dict().items()})
-                            # Clear buffer — old data is from drifted model
-                            deep_cfr.replay_buffer._size = 0
-                            deep_cfr.replay_buffer._total_seen = 0
-                            deep_cfr.replay_buffer._dirty = True
-                            print(f'  *** Buffer cleared, continuing from best ***')
+                        old_stdout = sys.stdout
+                        sys.stdout = io.StringIO()
+                        try:
+                            raw = run_self_play(sp_eng, 1000, num_players)
+                        finally:
+                            sys.stdout = old_stdout
+                        sp = generate_json(raw, num_players, 1000)
 
-                    try:
-                        os.remove(_tmp_ema)
-                    except OSError:
-                        pass
-                except Exception as e:
-                    print(f'  [EMA eval error: {e}]')
+                        ema_af = sp['af']
+                        ema_wtsd = sp['wtsd']
+                        ema_cbet = sp['cbet']
+                        act = sp.get('postflop_actions', {})
+                        print(f'  [EMA] CBet={ema_cbet:.1f}% AF={ema_af:.1f} '
+                              f'WTSD={ema_wtsd:.1f}% Call={act.get("call_pct",0):.0f}%')
+
+                        _score = 0
+                        if 55 <= ema_cbet <= 70: _score += 1
+                        if 2.0 <= ema_af <= 3.5: _score += 1
+                        if 25 <= ema_wtsd <= 35: _score += 1
+                        if _score > _best_ckpt_agreement:
+                            _best_ckpt_agreement = _score
+                            _best_ckpt_path = _tmp_ema.replace('_ema_eval_tmp', f'ema_iter_{iter_num}')
+                            print(f'  [EMA] New best (score={_score}/3): {_best_ckpt_path}')
+
+                        if ema_af > RESET_AF_MAX or ema_wtsd < RESET_WTSD_MIN:
+                            if _best_ckpt_path and Path(_best_ckpt_path).exists():
+                                print(f'  *** DRIFT DETECTED (AF={ema_af:.1f}, WTSD={ema_wtsd:.1f}%) ***')
+                                print(f'  *** Resetting to best EMA: {_best_ckpt_path} ***')
+                                deep_cfr.load_models(_best_ckpt_path)
+                                for ema_net, gpu_net in zip(ema_strat_nets, deep_cfr.strategy_networks):
+                                    ema_net.load_state_dict({k: v.cpu() for k, v in gpu_net.state_dict().items()})
+                                for ema_net, gpu_net in zip(ema_adv_nets, deep_cfr.advantage_networks):
+                                    ema_net.load_state_dict({k: v.cpu() for k, v in gpu_net.state_dict().items()})
+                                deep_cfr.replay_buffer._size = 0
+                                deep_cfr.replay_buffer._total_seen = 0
+                                deep_cfr.replay_buffer._dirty = True
+                                print(f'  *** Buffer cleared, continuing from best ***')
+
+                        try:
+                            os.remove(_tmp_ema)
+                        except OSError:
+                            pass
+                    except Exception as e:
+                        print(f'  [EMA eval error: {e}]')
     finally:
         if async_result is not None:
             async_result.wait()

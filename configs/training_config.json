@@ -3,23 +3,23 @@
     "num_players": 6
   },
   "training": {
-    "num_iterations": 10000,
+    "num_iterations": 5000,
     "batch_size": 65536,
     "learning_rate": 0.0003,
     "buffer_size": 10000000,
     "traversals_per_iteration": 8000,
     "checkpoint_interval": 100,
-    "train_passes": 15,
+    "train_passes": 20,
     "gradient_clip": 1.0,
     "lr_scheduler_t_max": 8000
   },
   "network": {
-    "hidden_layers": [256, 256, 128],
+    "hidden_layers": [384, 384, 192],
     "activation": "leaky_relu",
     "dropout": 0.1
   },
   "paths": {
-    "models": "models/deep_cfr_v6/",
+    "models": "models/deep_cfr_v10/",
     "data": "data/",
     "logs": "data/logs/"
   }
