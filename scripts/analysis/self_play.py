@@ -180,17 +180,8 @@ def run_self_play(engine: DecisionEngine, num_hands: int,
     If engine_b is provided: seats 0,2,4 use engine (A), seats 1,3,5 use engine_b (B).
     Returns dict of seat_index → PlayerStats.
     """
-    eng = FastEnhancedPokerEngine(
-        num_players=num_players,
-        add_position_features=True,
-        add_pot_odds_features=True,
-        add_hand_strength_features=True,
-        add_stack_features=True,
-        add_equity_features=True,
-        add_street_features=True,
-        add_game_state_features=True,
-        add_betting_history_features=True,
-    )
+    from src.engine.factory import make_engine
+    eng = make_engine(num_players=num_players)
 
     stats = {i: PlayerStats() for i in range(num_players)}
     t0 = time.time()
@@ -684,17 +675,58 @@ def generate_json(all_stats: Dict[int, PlayerStats], num_players: int,
     af = agg.postflop_bets / agg.postflop_calls if agg.postflop_calls > 0 else 0
     total_postflop_actions = (agg.postflop_folds + agg.postflop_checks +
                               agg.postflop_calls + agg.postflop_bets)
+    # AFq = (bets+raises) / (bets+raises+calls+folds) — excludes checks, more stable than AF
+    afq_denom = agg.postflop_bets + agg.postflop_calls + agg.postflop_folds
+    afq = (agg.postflop_bets / afq_denom * 100) if afq_denom > 0 else 0
+
+    # Per-street stats from aggregated action counts
+    street_stats = {}
+    for st in ['flop', 'turn', 'river']:
+        sa = defaultdict(int)
+        for s in all_stats.values():
+            for k, v in s.actions_by_street[st].items():
+                sa[k] += v
+        st_total = sum(sa.values())
+        st_bets = sa['raise'] + sa['raise_half'] + sa['raise_pot'] + sa['all_in']
+        st_calls = sa['call']
+        st_af = st_bets / st_calls if st_calls > 0 else 0
+        street_stats[st] = {
+            'fold_pct': _pct_f(sa['fold'], st_total),
+            'check_pct': _pct_f(sa['check'], st_total),
+            'call_pct': _pct_f(sa['call'], st_total),
+            'bet_raise_pct': _pct_f(st_bets, st_total),
+            'af': round(st_af, 2),
+            'total_actions': st_total,
+        }
+
+    # GTO range check
+    vpip_val = _pct_f(agg.vpip, agg.hands)
+    pfr_val = _pct_f(agg.pfr, agg.hands)
+    cbet_val = _pct_f(agg.cbet, agg.cbet_opps)
+    wtsd_val = _pct_f(agg.went_to_showdown, agg.saw_flop)
+
+    gto_flags = []
+    if vpip_val < 20 or vpip_val > 25: gto_flags.append('VPIP')
+    if pfr_val < 16 or pfr_val > 21: gto_flags.append('PFR')
+    if cbet_val < 55 or cbet_val > 70: gto_flags.append('CBET')
+    if af < 2.0 or af > 3.5: gto_flags.append('AF')
+    if wtsd_val < 25 or wtsd_val > 35: gto_flags.append('WTSD')
+
     return {
         'num_hands': num_hands,
         'num_players': num_players,
-        'vpip': _pct_f(agg.vpip, agg.hands),
-        'pfr': _pct_f(agg.pfr, agg.hands),
+        'vpip': vpip_val,
+        'pfr': pfr_val,
         'three_bet': _pct_f(agg.three_bet, agg.three_bet_opps),
         'rfi': _pct_f(agg.open_raise, agg.open_raise_opps),
         'limp_pct': _pct_f(agg.limp, agg.hands),
-        'cbet': _pct_f(agg.cbet, agg.cbet_opps),
+        'cbet': cbet_val,
         'fold_to_cbet': _pct_f(agg.fold_to_cbet, agg.fold_to_cbet_opps),
         'af': round(af, 2),
+        'afq': round(afq, 1),
+        'saw_flop': _pct_f(agg.saw_flop, agg.hands),
+        'wtsd': wtsd_val,
+        'wsd': _pct_f(agg.won_at_showdown, agg.went_to_showdown),
         'postflop_actions': {
             'fold_pct': _pct_f(agg.postflop_folds, total_postflop_actions),
             'check_pct': _pct_f(agg.postflop_checks, total_postflop_actions),
@@ -702,9 +734,7 @@ def generate_json(all_stats: Dict[int, PlayerStats], num_players: int,
             'bet_raise_pct': _pct_f(agg.postflop_bets, total_postflop_actions),
             'total': total_postflop_actions,
         },
-        'saw_flop': _pct_f(agg.saw_flop, agg.hands),
-        'wtsd': _pct_f(agg.went_to_showdown, agg.saw_flop),
-        'wsd': _pct_f(agg.won_at_showdown, agg.went_to_showdown),
+        'by_street': street_stats,
         'by_position': {
             pos: {
                 'hands': agg.hands_by_pos.get(pos, 0),
@@ -717,6 +747,18 @@ def generate_json(all_stats: Dict[int, PlayerStats], num_players: int,
                      max(agg.hands_by_pos.get(pos, 1), 1)) * 100, 1),
             }
             for pos in ['UTG', 'MP', 'CO', 'BTN', 'SB', 'BB']
+        },
+        'gto_flags': gto_flags if gto_flags else ['OK'],
+        'raw_counts': {
+            'postflop_bets': agg.postflop_bets,
+            'postflop_calls': agg.postflop_calls,
+            'postflop_checks': agg.postflop_checks,
+            'postflop_folds': agg.postflop_folds,
+            'saw_flop': agg.saw_flop,
+            'went_to_showdown': agg.went_to_showdown,
+            'won_at_showdown': agg.won_at_showdown,
+            'cbet_opps': agg.cbet_opps,
+            'cbet_made': agg.cbet,
         },
     }
 

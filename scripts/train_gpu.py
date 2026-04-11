@@ -119,13 +119,12 @@ def _worker_init(shared_adv, shared_strat, act_size, use_preflop_ranges=False,
 
 
 def _regret_match(adv, legal, epsilon=0.05):
-    """Regret-matching with epsilon-uniform exploration and action floor.
+    """Standard regret matching with epsilon-uniform exploration.
 
-    The action floor prevents any legal action from dropping to 0% probability.
-    This is critical for call (action 1) which tends to collapse to 0% in
-    self-play, creating the raise-or-fold degenerate equilibrium.
-    Standard epsilon exploration is uniform across all actions.
-    The action floor specifically ensures call retains minimum probability.
+    σ(I,a) = max(0, R(I,a)) / Σ max(0, R(I,a'))
+    Plus epsilon-greedy exploration to ensure all actions are sampled.
+    No call floor — with correct opponent play (advantage network),
+    call receives proper regrets naturally.
     """
     strategy = np.zeros(len(adv), dtype=np.float32)
     pos = np.maximum(adv[legal], 0.0)
@@ -133,40 +132,13 @@ def _regret_match(adv, legal, epsilon=0.05):
     strategy[legal] = pos / s if s > 0 else 1.0 / len(legal)
     if epsilon > 0:
         strategy[legal] = (1.0 - epsilon) * strategy[legal] + epsilon / len(legal)
-    # Action floor: ensure call (action 1) never drops below 8%
-    # This prevents the call-collapse that causes raise-or-fold degenerate
-    # equilibrium. Combined with DCFR-style negative regret attenuation,
-    # this keeps call alive so the network can learn when calling is correct.
-    CALL = 1
-    CALL_FLOOR = 0.08
-    if CALL in legal and strategy[CALL] < CALL_FLOOR:
-        deficit = CALL_FLOOR - strategy[CALL]
-        strategy[CALL] = CALL_FLOOR
-        # Take from the largest non-call action
-        others = [a for a in legal if a != CALL]
-        if others:
-            biggest = max(others, key=lambda a: strategy[a])
-            strategy[biggest] = max(0.0, strategy[biggest] - deficit)
-            # Renormalize
-            s = strategy[legal].sum()
-            if s > 0:
-                strategy[legal] /= s
     return strategy
 
 
 def _make_engine(num_players):
-    from src.engine import EnhancedPokerEngine
-    return EnhancedPokerEngine(
+    from src.engine.factory import make_engine
+    return make_engine(
         num_players=num_players,
-        add_position_features=True,
-        add_pot_odds_features=True,
-        add_hand_strength_features=True,
-        add_stack_features=True,
-        add_equity_features=True,
-        add_street_features=True,
-        add_game_state_features=True,
-        add_betting_history_features=True,
-        behavioral_stats=True,
         opponent_profile=_ARCHETYPE_MODE,
         rake_pct=_RAKE_PCT,
         rake_cap=_RAKE_CAP,
@@ -230,13 +202,14 @@ def _traversal_worker(args):
         else:
             opp_nets = _SHARED_STRAT_NETS  # fallback if no pool
     elif current_iter <= PHASE2_END:
-        # Phase 2: self-play, higher exploration to prevent call-collapse
+        # Phase 2: self-play — opponents use ADVANTAGE network with regret matching
+        # (Deep CFR paper: opponents play current iteration's strategy, not average)
         epsilon = max(0.06, 0.10 * (1.0 - (current_iter - PHASE1_END) / (PHASE2_END - PHASE1_END)))
-        opp_nets = _SHARED_STRAT_NETS
+        opp_nets = _SHARED_ADV_NETS  # advantage network, not strategy
     else:
-        # Phase 3: mixed training against diverse pool
+        # Phase 3: mixed pool — pool uses stored strategy nets, self-play uses advantage
         epsilon = 0.05
-        opp_nets = _SHARED_STRAT_NETS
+        opp_nets = _SHARED_ADV_NETS  # advantage network for self-play portion
         if _KBEST_POOL and len(_KBEST_POOL) > 0 and np.random.random() < 0.7:
             _, opp_nets = _KBEST_POOL[np.random.randint(len(_KBEST_POOL))]
 
@@ -265,17 +238,18 @@ def _traversal_worker(args):
         if nets is not None:
             with torch.no_grad():
                 obs_t = torch.from_numpy(obs.astype(np.float32)).unsqueeze(0)
-                strat = nets[ai](obs_t).numpy()[0]
-            # Apply NL5 population skew if in nl5 mode (postflop)
+                adv = nets[ai](obs_t).numpy()[0]
+            # Apply regret matching on advantage output (same as traverser)
+            # This is what Deep CFR paper specifies for opponent play:
+            # σ(I,a) = max(0, R(I,a)) / Σ max(0, R(I,a'))
+            strat = _regret_match(adv, legal, epsilon=epsilon)
+            # Apply archetype skew if configured
             if _NL5_OPP_MODE and archetype_skew_fn is None:
                 from src.archetypes import nl5_population_skew
                 strat = nl5_population_skew(strat, legal)
-                lp = strat[legal].copy()
             elif archetype_skew_fn is not None:
                 strat = archetype_skew_fn(strat, legal)
-                lp = strat[legal].copy()
-            else:
-                lp = np.maximum(strat[legal], 0.0)
+            lp = strat[legal].copy()
             s = lp.sum()
             lp = lp / s if s > 0 else np.ones(len(legal)) / len(legal)
             return int(np.random.choice(legal, p=lp))
@@ -349,21 +323,13 @@ def _traversal_worker(args):
                                          -_REGRET_CLIP, _REGRET_CLIP))
                        for a in legal_int}
 
-        # DCFR-inspired: attenuate negative call regrets only.
-        # Call is the action that collapses in self-play. Attenuating ALL
-        # negative regrets (tried 0.3x) killed aggression — model became
-        # ultra-passive. Only dampen call's negative regret so it stays
-        # alive without suppressing raise/fold learning signals.
-        CALL_ACTION = 1
-        if CALL_ACTION in raw_regrets and raw_regrets[CALL_ACTION] < 0:
-            raw_regrets[CALL_ACTION] *= 0.3
-
-        # Normalize: divide by max absolute regret (keeps direction, scales to [-1,1])
-        max_abs = max(abs(r) for r in raw_regrets.values())
-        if max_abs > 1e-6:
-            norm_regrets = {a: r / max_abs for a, r in raw_regrets.items()}
-        else:
-            norm_regrets = raw_regrets  # all near zero, don't divide
+        # Store raw regrets — no normalization, no call attenuation.
+        # With correct opponent play (advantage network with regret matching),
+        # call receives proper regrets naturally.
+        # Previous code divided by max absolute regret, which destroyed
+        # magnitude information — marginal spots looked identical to clear
+        # spots. The Huber loss + gradient clipping handle outliers instead.
+        norm_regrets = raw_regrets
 
         return [{
             'player':   player_idx,
@@ -485,6 +451,7 @@ def _traversal_worker(args):
         eng.step(action)
 
     _return_engine(eng)
+
     return all_steps
 
 
@@ -702,49 +669,6 @@ def main():
         cpu_net.share_memory()
         shared_strat_nets.append(cpu_net)
 
-    # ── EMA (Exponential Moving Average) of strategy network weights ────
-    # The average strategy converges to Nash in CFR theory. EMA approximates
-    # this by slowly blending current weights into a running average.
-    # EMA model is saved separately and should be used for evaluation/play.
-    EMA_DECAY = 0.995  # higher = slower update, more stable
-    ema_strat_nets = []
-    for net in deep_cfr.strategy_networks:
-        ema_net = copy.deepcopy(net).cpu().eval()
-        ema_strat_nets.append(ema_net)
-    ema_adv_nets = []
-    for net in deep_cfr.advantage_networks:
-        ema_net = copy.deepcopy(net).cpu().eval()
-        ema_adv_nets.append(ema_net)
-
-    def _update_ema():
-        """Blend current network weights into EMA: ema = decay*ema + (1-decay)*current."""
-        for ema_net, gpu_net in zip(ema_strat_nets, deep_cfr.strategy_networks):
-            for ema_p, cur_p in zip(ema_net.parameters(), gpu_net.parameters()):
-                ema_p.data.mul_(EMA_DECAY).add_(cur_p.data.cpu(), alpha=1.0 - EMA_DECAY)
-        for ema_net, gpu_net in zip(ema_adv_nets, deep_cfr.advantage_networks):
-            for ema_p, cur_p in zip(ema_net.parameters(), gpu_net.parameters()):
-                ema_p.data.mul_(EMA_DECAY).add_(cur_p.data.cpu(), alpha=1.0 - EMA_DECAY)
-
-    def _save_ema(path):
-        """Save EMA model as a standard Deep CFR checkpoint."""
-        ema_checkpoint = {
-            'iteration': deep_cfr.iteration,
-            'advantage_networks': [n.state_dict() for n in ema_adv_nets],
-            'strategy_networks': [n.state_dict() for n in ema_strat_nets],
-            'advantage_optimizers': [o.state_dict() for o in deep_cfr.advantage_optimizers],
-            'strategy_optimizers': [o.state_dict() for o in deep_cfr.strategy_optimizers],
-        }
-        torch.save(ema_checkpoint, path)
-
-    # ── Cyclical reset: best checkpoint tracking ─────────────────────────
-    _best_ckpt_path = None
-    _best_ckpt_agreement = 0.0
-    # Thresholds for drift detection
-    RESET_AF_MAX = 3.5     # reset if AF exceeds this
-    RESET_WTSD_MIN = 15.0  # reset if WTSD drops below this
-
-    print(f'  EMA decay: {EMA_DECAY} (saved alongside checkpoints)')
-
     num_iterations = config['training']['num_iterations']
     traversals    = config['training']['traversals_per_iteration']
     batch_size    = config['training'].get('batch_size', 256)
@@ -866,7 +790,7 @@ def main():
     # ── Batched logging ──────────────────────────────────────────────────
     LOG_INTERVAL = 20       # print avg loss every N iterations
     EVAL_INTERVAL = 200     # self-play + validation every N iterations
-    EVAL_HANDS = 2000       # hands per self-play eval (~6s)
+    EVAL_HANDS = 2000       # hands per self-play eval
     _batch_adv = []
     _batch_strat = []
     _batch_trav = []
@@ -891,33 +815,111 @@ def main():
             from src.decision_engine import DecisionEngine, DecisionConfig
             from scripts.analysis.self_play import run_self_play, generate_json
 
-            # Ensure equity model is loaded in main process for self-play obs
+            # Self-play eval using direct deep_cfr.get_strategy() —
+            # same path as validation, avoids DecisionEngine obs mismatch.
+            from src.engine.factory import make_engine as _mk_eng
+            from src.preflop_ranges import PreflopRanges
+
             if _eq_path:
-                import torch as _t
-                _t.set_num_threads(1)
-                from src.engine.fast_enhanced_engine import load_equity_model, _EQUITY_MODEL
+                from src.engine.fast_enhanced_engine import load_equity_model
                 load_equity_model(_eq_path, device='cpu')
-                from src.engine.fast_enhanced_engine import _EQUITY_MODEL as _em_check
-                print(f'  [eval] equity model loaded: {_em_check is not None}')
 
-            dc = DecisionConfig(
-                strong_hand_guard=False, allin_filter=False,
-                style_tuning=False, use_preflop_ranges=True,
-                raise_randomize=False,
+            _sp_eng = _mk_eng(num_players=num_players)
+            _sp_ranges = PreflopRanges()
+            _sp_stats = {i: {'hands': 0} for i in range(num_players)}
+            _sp_postflop = {'bets': 0, 'calls': 0, 'checks': 0, 'folds': 0}
+            _sp_cbet_opp = 0
+            _sp_cbet = 0
+
+            for _hand in range(EVAL_HANDS):
+                _sp_eng.reset()
+                _preflop_raiser = -1
+                _saw_flop = set()
+                _street = 'Preflop'
+
+                while not _sp_eng.is_done():
+                    _ca = _sp_eng.current_agent
+                    _ai = _sp_eng.agents.index(_ca)
+                    _obs = _sp_eng.get_observation()
+                    _legal = _sp_eng.get_legal_actions()
+                    if not _legal:
+                        break
+                    _legal_int = [int(a) for a in _legal]
+                    _stage = _sp_eng.get_stage()
+
+                    if _stage != _street:
+                        if _stage == 'Flop':
+                            _saw_flop = set(range(num_players))  # simplified
+                        _street = _stage
+
+                    # Preflop: use ranges
+                    if _stage == 'Preflop':
+                        _cards = _sp_eng.get_player_cards(_ca)
+                        if _cards and len(_cards) >= 2:
+                            _rel = (_ai - _sp_eng._button) % num_players
+                            _pot = _sp_eng.get_pot_size() / 2.0
+                            _strat = _sp_ranges.get_strategy(
+                                _cards, _rel, _pot, _legal_int, 6)
+                        else:
+                            _strat = np.zeros(6, dtype=np.float32)
+                            _strat[_legal_int] = 1.0 / len(_legal_int)
+                    else:
+                        # Postflop: direct deep_cfr.get_strategy()
+                        _strat_raw = deep_cfr_ref.get_strategy(_obs, _ai % num_players, _legal_int)
+                        _strat = np.zeros(6, dtype=np.float32)
+                        for _a in _legal_int:
+                            if _a < len(_strat_raw):
+                                _strat[_a] = max(0.0, float(_strat_raw[_a]))
+                        _s = _strat.sum()
+                        if _s > 0:
+                            _strat /= _s
+                        else:
+                            _strat[_legal_int] = 1.0 / len(_legal_int)
+
+                    # Sample action
+                    _probs = np.array([_strat[a] for a in _legal_int], dtype=np.float64)
+                    _probs = np.maximum(_probs, 0.0)
+                    _ps = _probs.sum()
+                    _probs = _probs / _ps if _ps > 0 else np.ones(len(_legal_int)) / len(_legal_int)
+                    _action = int(np.random.choice(_legal_int, p=_probs))
+
+                    # Track postflop stats
+                    if _stage != 'Preflop':
+                        if _action == 0: _sp_postflop['folds'] += 1
+                        elif _action == 1:
+                            if _sp_eng.get_pot_size() > 0:
+                                _sp_postflop['checks' if True else 'calls'] += 1
+                            else:
+                                _sp_postflop['checks'] += 1
+                        else:
+                            _sp_postflop['bets'] += 1
+
+                    if _stage == 'Preflop' and _action >= 2:
+                        _preflop_raiser = _ai
+
+                    _sp_eng.step(_action)
+
+                # Track VPIP/PFR simplified
+                for _i in range(num_players):
+                    _sp_stats[_i]['hands'] += 1
+
+            # Compute stats
+            _total_pf = sum(s.hands for s in _sp_stats.values())
+            _t_acts = _sp_postflop['bets'] + _sp_postflop['calls'] + _sp_postflop['checks'] + _sp_postflop['folds']
+            _af = _sp_postflop['bets'] / max(_sp_postflop['calls'], 1)
+            _fold_pct = 100 * _sp_postflop['folds'] / max(_t_acts, 1)
+            _chk_pct = 100 * _sp_postflop['checks'] / max(_t_acts, 1)
+            _call_pct = 100 * _sp_postflop['calls'] / max(_t_acts, 1)
+            _bet_pct = 100 * _sp_postflop['bets'] / max(_t_acts, 1)
+
+            print(
+                f"  [self-play {EVAL_HANDS}h] "
+                f"AF={_af:.1f} "
+                f"| Fold={_fold_pct:.0f}% "
+                f"Chk={_chk_pct:.0f}% "
+                f"Call={_call_pct:.0f}% "
+                f"Bet={_bet_pct:.0f}%"
             )
-            sp_engine = DecisionEngine(dc)
-            tmp_ckpt = str(models_dir / '_eval_tmp.pt')
-            deep_cfr_ref.save_models(tmp_ckpt)
-            sp_engine.load_models(facing_bet=tmp_ckpt, checked_to=tmp_ckpt)
-            sp_engine.load_preflop_ranges()
-
-            old_stdout = sys.stdout
-            sys.stdout = io.StringIO()
-            try:
-                raw_stats = run_self_play(sp_engine, EVAL_HANDS, num_players)
-            finally:
-                sys.stdout = old_stdout
-            sp = generate_json(raw_stats, num_players, EVAL_HANDS)
 
             act = sp.get('postflop_actions', {})
             print(
@@ -1103,8 +1105,6 @@ def main():
                 strat_losses.append(deep_cfr.train_strategy_network(batch_size))
             deep_cfr.step_schedulers()
             deep_cfr.iteration = iter_num
-            if effective_passes > 0 and not _nl5_opp:
-                _update_ema()
             t_train = time.time() - t0 - t_trav
 
             adv   = np.mean(adv_losses)   if adv_losses   else 0.0
@@ -1189,10 +1189,6 @@ def main():
             if iter_num % ckpt_interval == 0:
                 ckpt = str(models_dir / f'checkpoint_iter_{iter_num}.pt')
                 deep_cfr.save_models(ckpt)
-                # Save EMA model alongside (skip in NL5 mode — EMA slows adaptation)
-                if not _nl5_opp:
-                    ema_path = str(models_dir / f'ema_iter_{iter_num}.pt')
-                    _save_ema(ema_path)
                 meta = {'iteration': iter_num,
                         'buffer_size': len(deep_cfr.replay_buffer),
                         'config': config['training']}
@@ -1203,69 +1199,6 @@ def main():
             if iter_num % EVAL_INTERVAL == 0:
                 _run_eval(deep_cfr, engine, iter_num)
 
-                # ── EMA eval + cyclical reset (skip in NL5 mode) ────────────
-                if not _nl5_opp:
-                    try:
-                        import io
-                        from src.decision_engine import DecisionEngine, DecisionConfig
-                        from scripts.analysis.self_play import run_self_play, generate_json
-
-                        _tmp_ema = str(models_dir / '_ema_eval_tmp.pt')
-                        _save_ema(_tmp_ema)
-
-                        dc = DecisionConfig(
-                            strong_hand_guard=False, allin_filter=False,
-                            style_tuning=False, use_preflop_ranges=True,
-                            raise_randomize=False,
-                        )
-                        sp_eng = DecisionEngine(dc)
-                        sp_eng.load_models(facing_bet=_tmp_ema, checked_to=_tmp_ema)
-                        sp_eng.load_preflop_ranges()
-
-                        old_stdout = sys.stdout
-                        sys.stdout = io.StringIO()
-                        try:
-                            raw = run_self_play(sp_eng, 1000, num_players)
-                        finally:
-                            sys.stdout = old_stdout
-                        sp = generate_json(raw, num_players, 1000)
-
-                        ema_af = sp['af']
-                        ema_wtsd = sp['wtsd']
-                        ema_cbet = sp['cbet']
-                        act = sp.get('postflop_actions', {})
-                        print(f'  [EMA] CBet={ema_cbet:.1f}% AF={ema_af:.1f} '
-                              f'WTSD={ema_wtsd:.1f}% Call={act.get("call_pct",0):.0f}%')
-
-                        _score = 0
-                        if 55 <= ema_cbet <= 70: _score += 1
-                        if 2.0 <= ema_af <= 3.5: _score += 1
-                        if 25 <= ema_wtsd <= 35: _score += 1
-                        if _score > _best_ckpt_agreement:
-                            _best_ckpt_agreement = _score
-                            _best_ckpt_path = _tmp_ema.replace('_ema_eval_tmp', f'ema_iter_{iter_num}')
-                            print(f'  [EMA] New best (score={_score}/3): {_best_ckpt_path}')
-
-                        if ema_af > RESET_AF_MAX or ema_wtsd < RESET_WTSD_MIN:
-                            if _best_ckpt_path and Path(_best_ckpt_path).exists():
-                                print(f'  *** DRIFT DETECTED (AF={ema_af:.1f}, WTSD={ema_wtsd:.1f}%) ***')
-                                print(f'  *** Resetting to best EMA: {_best_ckpt_path} ***')
-                                deep_cfr.load_models(_best_ckpt_path)
-                                for ema_net, gpu_net in zip(ema_strat_nets, deep_cfr.strategy_networks):
-                                    ema_net.load_state_dict({k: v.cpu() for k, v in gpu_net.state_dict().items()})
-                                for ema_net, gpu_net in zip(ema_adv_nets, deep_cfr.advantage_networks):
-                                    ema_net.load_state_dict({k: v.cpu() for k, v in gpu_net.state_dict().items()})
-                                deep_cfr.replay_buffer._size = 0
-                                deep_cfr.replay_buffer._total_seen = 0
-                                deep_cfr.replay_buffer._dirty = True
-                                print(f'  *** Buffer cleared, continuing from best ***')
-
-                        try:
-                            os.remove(_tmp_ema)
-                        except OSError:
-                            pass
-                    except Exception as e:
-                        print(f'  [EMA eval error: {e}]')
     finally:
         if async_result is not None:
             async_result.wait()
