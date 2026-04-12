@@ -362,6 +362,33 @@ class DeepCFR:
         self._amp_enabled = self.device.type == 'cuda'
         self._scaler = torch.cuda.amp.GradScaler(enabled=self._amp_enabled)
 
+        # Store init params for reinitialization
+        self._hidden_layers = hidden_layers
+        self._dropout = dropout
+        self._learning_rate = learning_rate
+
+    def reinitialize_advantage_networks(self):
+        """Reset advantage networks to random weights with fresh optimizers.
+
+        Per Deep CFR paper (Algorithm 1): advantage networks should be
+        "trained from scratch" each iteration on the accumulated buffer.
+        This prevents the network from accumulating bias (e.g. "call is bad")
+        across iterations.
+        """
+        for i in range(self.num_players):
+            # Reset network weights
+            new_net = AdvantageNetwork(
+                self.observation_size, self.action_size,
+                self._hidden_layers, self._dropout
+            ).to(self.device)
+            self.advantage_networks[i].load_state_dict(new_net.state_dict())
+
+            # Reset optimizer (fresh momentum/Adam state)
+            self.advantage_optimizers[i] = optim.Adam(
+                self.advantage_networks[i].parameters(),
+                lr=self._learning_rate
+            )
+
     def extend_first_layer(self, new_obs_size: int):
         """Extend all networks from current obs_size to new_obs_size.
 

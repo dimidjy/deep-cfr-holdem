@@ -36,29 +36,49 @@ from src.archetypes import (
 from validate_spots import run_validation, validation_summary_line
 
 
-# Shared-memory CPU networks — set once per worker, updated by main process each iteration.
-_SHARED_ADV_NETS   = None
-_SHARED_STRAT_NETS = None
-_ACT_SIZE          = None   # action space size, needed for uniform fallback strategy
+# =============================================================================
+# Training phase boundaries
+# =============================================================================
+PHASE1_END = 600    # iters 1..600 — random opponents (learn basic hand values)
+PHASE2_END = 1600   # iters 601..1600 — pure self-play
+                    # iters 1601+     — mixed (K-Best pool + self-play)
 
-# K-Best Self-Play: pool of historical strategy networks for diverse opponents
-_KBEST_POOL = None  # list of (label, [net_per_player]) or None if disabled
+# Per-phase LR schedule: (start_lr, end_lr, duration_iters)
+PHASE_LR = {
+    601:  (0.0003, 0.0001, 1000),
+    1601: (0.0002, 0.0001, 3600),
+}
 
-_REWARD_SCALE = 100.0
-_REGRET_CLIP  = 1.0
+# =============================================================================
+# Reward/regret constants
+# =============================================================================
+_REWARD_SCALE = 100.0   # divides chip rewards → regrets in roughly [-1, 1]
+_REGRET_CLIP  = 1.0     # clip bound on regret after scaling
 _RAKE_PCT     = 0.0
 _RAKE_CAP     = 0.0
 
-# Worker-local engine pool — reuse PettingZoo envs instead of recreating per branch
+# =============================================================================
+# Worker-process globals — set via _worker_init, read by _traversal_worker
+# =============================================================================
+# Neural networks (shared memory, updated each iteration by main)
+_SHARED_ADV_NETS   = None   # advantage nets, one per player
+_SHARED_STRAT_NETS = None   # strategy nets, one per player
+_ACT_SIZE          = None   # action space size
+
+# Opponent pool + preflop ranges
+_KBEST_POOL         = None  # [(label, [net_per_player])] — historical opponents
+_PREFLOP_RANGES     = None  # hero preflop range charts
+_OPP_PREFLOP_RANGES = None  # wider NL5 ranges for opponents (if --nl5-opponents)
+
+# Training modes (flags)
+_ARCHETYPE_MODE = False     # mixed archetype opponents (extends obs 50→55)
+_NL5_OPP_MODE   = False     # force NL5 population skew on all opponents
+_DECK_RESHUFFLE = False     # reshuffle undealt cards per branch rollout
+_BLUFF_PENALTY  = 0.0       # penalize raises with equity<0.5 (value-only nudge)
+_CALL_BONUS     = 0.0       # reward +EV calls (equity > pot_odds_required)
+
+# Engine pool — per-worker reuse to avoid env teardown on every branch
 _ENGINE_POOL = []
-
-# Preflop range override — loaded once per worker
-_PREFLOP_RANGES = None      # PreflopRanges instance (or None if disabled)
-_OPP_PREFLOP_RANGES = None  # Separate NL5 ranges for opponents (if --nl5-opponents)
-
-# Archetype opponent training — set per worker via _worker_init
-_ARCHETYPE_MODE = False
-_NL5_OPP_MODE = False       # Force nl5_population skew on all opponents
 
 
 def _get_engine(num_players):
@@ -76,15 +96,20 @@ def _return_engine(eng):
 
 def _worker_init(shared_adv, shared_strat, act_size, use_preflop_ranges=False,
                  archetype_mode=False, kbest_pool=None, equity_model_path=None,
-                 nl5_opp_mode=False):
+                 nl5_opp_mode=False, deck_reshuffle=False, bluff_penalty=0.0,
+                 call_bonus=0.0):
     global _SHARED_ADV_NETS, _SHARED_STRAT_NETS, _ACT_SIZE, _PREFLOP_RANGES
     global _ARCHETYPE_MODE, _KBEST_POOL, _OPP_PREFLOP_RANGES, _NL5_OPP_MODE
+    global _DECK_RESHUFFLE, _BLUFF_PENALTY, _CALL_BONUS
     _SHARED_ADV_NETS  = shared_adv
     _SHARED_STRAT_NETS = shared_strat
     _ACT_SIZE          = act_size
     _ARCHETYPE_MODE    = archetype_mode
     _KBEST_POOL        = kbest_pool
     _NL5_OPP_MODE      = nl5_opp_mode
+    _DECK_RESHUFFLE    = deck_reshuffle
+    _BLUFF_PENALTY     = bluff_penalty
+    _CALL_BONUS        = call_bonus
     if use_preflop_ranges:
         from src.preflop_ranges import PreflopRanges
         _PREFLOP_RANGES = PreflopRanges()
@@ -160,6 +185,96 @@ def _get_preflop_info(eng, player_idx, num_players):
     return cards, rel_pos, pot_bb
 
 
+def _reshuffled_init_state(init_state, num_players, n_visible_public):
+    """Build a new initial pkrs.State with reshuffled future board cards.
+
+    Preserves hole cards (so action history stays consistent) and the first
+    n_visible_public board cards (which are part of the info state at the
+    decision point). Cards drawn AFTER the decision (turn/river if not yet
+    visible) are reshuffled — gives independent chance samples per rollout
+    and per branch, drastically reducing regret variance.
+
+    Card-to-deck-position mapping (pokers `from_deck` semantics):
+    - hole cards are dealt 2-at-a-time, starting from button+1 (SB)
+    - position 2*N onwards goes to the public cards in order
+    """
+    import pokers as pkrs
+    button = init_state.button
+
+    # Place hole cards in their correct deal-order slots
+    hole_in_deal_order = [None] * (2 * num_players)
+    for pid in range(num_players):
+        deal_idx = (pid - button - 1) % num_players
+        hole_in_deal_order[2 * deal_idx]     = init_state.players_state[pid].hand[0]
+        hole_in_deal_order[2 * deal_idx + 1] = init_state.players_state[pid].hand[1]
+
+    # init_state.deck is the 40 cards remaining after hole cards. The first
+    # 5 of these become the public cards in order; the rest are burns.
+    full_52 = hole_in_deal_order + list(init_state.deck)
+    n_fixed = (2 * num_players) + n_visible_public
+    fixed = full_52[:n_fixed]
+    suffix = list(full_52[n_fixed:])
+    np.random.shuffle(suffix)
+    return pkrs.State.from_deck(
+        n_players=num_players,
+        button=button,
+        sb=1, bb=2, stake=100,
+        deck=fixed + suffix,
+    )
+
+
+def _select_phase_opponent(current_iter, kbest_pool):
+    """Return (epsilon, opp_nets) for the current training phase.
+
+    Phase 1 (iters 1..PHASE1_END):     random opponents, high exploration
+    Phase 2 (iters PHASE1_END+1..PHASE2_END):  self-play vs advantage net
+    Phase 3 (PHASE2_END+1..):           mixed 70% K-Best pool / 30% self-play
+
+    NL5 mode overrides Phase 2+: always uses K-Best pool (if seeded) with
+    NL5 skew applied at pick_opponent_action time. Prevents co-adaptation
+    collapse into check-check-showdown equilibrium.
+    """
+    if current_iter <= PHASE1_END:
+        return 0.10, None  # random actions
+
+    if _NL5_OPP_MODE:
+        eps = max(0.05, 0.08 * (1.0 - (current_iter - PHASE1_END) / 3000))
+        if kbest_pool:
+            _, opp_nets = kbest_pool[np.random.randint(len(kbest_pool))]
+        else:
+            opp_nets = _SHARED_STRAT_NETS  # fallback if no pool
+        return eps, opp_nets
+
+    if current_iter <= PHASE2_END:
+        # Deep CFR paper: opponents play current iteration's strategy (advantage net),
+        # not the accumulated average.
+        eps = max(0.06, 0.10 * (1.0 - (current_iter - PHASE1_END) / (PHASE2_END - PHASE1_END)))
+        return eps, _SHARED_ADV_NETS
+
+    # Phase 3 — mixed pool
+    opp_nets = _SHARED_ADV_NETS
+    if kbest_pool and np.random.random() < 0.7:
+        _, opp_nets = kbest_pool[np.random.randint(len(kbest_pool))]
+    return 0.05, opp_nets
+
+
+def _create_worker_pool(num_workers, shared_adv, shared_strat, act_size,
+                        args, kbest_pool, eq_path, nl5_opp):
+    """Spawn a worker Pool wired with all current training state.
+
+    Used both for initial pool creation and after K-Best updates (which
+    terminate + rebuild the pool so workers see the new opponent list).
+    """
+    return Pool(
+        processes=num_workers, initializer=_worker_init,
+        initargs=(shared_adv, shared_strat, act_size,
+                  args.preflop_ranges, args.archetype_mode,
+                  kbest_pool if kbest_pool else None,
+                  eq_path, nl5_opp, args.deck_reshuffle,
+                  args.bluff_penalty, args.call_bonus),
+    )
+
+
 def _traversal_worker(args):
     """
     External-sampling MCCFR with exact regrets at every traversal player decision.
@@ -176,42 +291,10 @@ def _traversal_worker(args):
     of the neural network. Regrets are still computed and stored so the
     advantage network learns the correct preflop values over time.
     """
-    global _SHARED_ADV_NETS, _SHARED_STRAT_NETS, _ACT_SIZE, _PREFLOP_RANGES
-    global _ARCHETYPE_MODE, _KBEST_POOL
     player_idx, num_players, current_iter = args
 
-    # ── Three-phase training ─────────────────────────────────────────────
-    # Phase 1 (iter 1-600):    vs random opponents — learn basic hand values
-    # Phase 2 (iter 601-1600): self-play — refine strategy against itself
-    # Phase 3 (iter 3001+):    mixed training — 70% K-Best pool, 30% current
-    PHASE1_END = 600
-    PHASE2_END = 1600
-
-    if current_iter <= PHASE1_END:
-        # Phase 1: random opponents, high exploration
-        epsilon = 0.10
-        opp_nets = None  # random actions
-    elif _NL5_OPP_MODE:
-        # NL5 opponent mode: use FIXED opponent from pool + NL5 skew postflop.
-        # Pool should contain the base model (e.g. 2700) via --kbest-seed.
-        # Fixed opponent prevents feedback loop where hero and opponent
-        # co-adapt into check-check-showdown equilibrium.
-        epsilon = max(0.05, 0.08 * (1.0 - (current_iter - PHASE1_END) / 3000))
-        if _KBEST_POOL and len(_KBEST_POOL) > 0:
-            _, opp_nets = _KBEST_POOL[np.random.randint(len(_KBEST_POOL))]
-        else:
-            opp_nets = _SHARED_STRAT_NETS  # fallback if no pool
-    elif current_iter <= PHASE2_END:
-        # Phase 2: self-play — opponents use ADVANTAGE network with regret matching
-        # (Deep CFR paper: opponents play current iteration's strategy, not average)
-        epsilon = max(0.06, 0.10 * (1.0 - (current_iter - PHASE1_END) / (PHASE2_END - PHASE1_END)))
-        opp_nets = _SHARED_ADV_NETS  # advantage network, not strategy
-    else:
-        # Phase 3: mixed pool — pool uses stored strategy nets, self-play uses advantage
-        epsilon = 0.05
-        opp_nets = _SHARED_ADV_NETS  # advantage network for self-play portion
-        if _KBEST_POOL and len(_KBEST_POOL) > 0 and np.random.random() < 0.7:
-            _, opp_nets = _KBEST_POOL[np.random.randint(len(_KBEST_POOL))]
+    # Phase-dependent opponent + exploration ε (see _select_phase_opponent)
+    epsilon, opp_nets = _select_phase_opponent(current_iter, _KBEST_POOL)
 
     # Archetype opponent selection (per-traversal)
     archetype_skew_fn = None
@@ -271,28 +354,74 @@ def _traversal_worker(args):
         _return_engine(eng)
         return reward
 
-    def _fresh_engine_at(history):
-        """Reuse pooled engine with saved state, replay history, return positioned engine."""
+    def _fresh_engine_at(history, init_state=None):
+        """Reuse pooled engine with saved state, replay history, return positioned engine.
+
+        If init_state is provided, use it instead of pre_reset_game_rng — used for
+        deck reshuffle, where each branch rollout gets a state with re-randomized
+        future board cards (hole cards and revealed-so-far public cards preserved).
+        """
         eng = _get_engine(num_players)
         if archetype_profile is not None:
             eng.set_opponent_profile(archetype_profile)
         g   = eng._get_game()
-        g.np_random.set_state(pre_reset_game_rng)
+        g.np_random.set_state(init_state if init_state is not None else pre_reset_game_rng)
         g.dealer_id = pre_reset_dealer_id
         eng.reset()
         for a in history:
             eng.step(a)
         return eng
 
-    def _branch_exact(history, legal_int, n_samples=3):
-        """Branch all legal actions, average n_samples rollouts to reduce variance."""
+    def _branch_exact(history, legal_int, n_samples=3, n_visible_public=0,
+                      hero_equity=None, pot_chips=None, pot_odds=None):
+        """Branch all legal actions, average n_samples rollouts to reduce variance.
+
+        With _DECK_RESHUFFLE on, each rollout uses an independent reshuffle of
+        undealt cards (turn/river not yet visible). This is the variance-reduction
+        trick from Steinberger Deep-CFR (MultiOutcomeSampler.reshuffle_remaining_deck).
+
+        With _BLUFF_PENALTY > 0, raise-action rewards get a penalty proportional
+        to (0.5 - hero_equity) * pot. This shifts the Nash equilibrium toward
+        value-only play — bluffs need to overcome the penalty to stay in strategy.
+
+        With _CALL_BONUS > 0, the call action reward gets a bonus proportional
+        to how much equity exceeds pot odds (i.e. the call is +EV in a vacuum).
+        Counterbalances the bluff penalty so defender doesn't drift too nitty,
+        which would otherwise inflate fold equity for the aggressor.
+
+        pot_odds: obs[10] — defined as pot / (pot + call). 0 means no call amount
+                  (free check). Required equity to call = 1 - pot_odds.
+        """
         results = {}
+
+        bluff_penalty_chips = 0.0
+        if _BLUFF_PENALTY > 0 and hero_equity is not None and pot_chips is not None:
+            deficit = max(0.0, 0.5 - float(hero_equity))
+            bluff_penalty_chips = deficit * float(pot_chips) * _BLUFF_PENALTY
+
+        # Call bonus: reward +EV calls (equity > required pot-odds equity).
+        # post_call_pot = pot + call = pot / pot_odds (rearranged from obs formula).
+        call_bonus_chips = 0.0
+        if (_CALL_BONUS > 0 and hero_equity is not None and pot_chips is not None
+                and pot_odds is not None and float(pot_odds) > 0):
+            po = float(pot_odds)
+            required_eq = 1.0 - po
+            excess = max(0.0, float(hero_equity) - required_eq)
+            post_call_pot = float(pot_chips) / max(po, 1e-6)
+            call_bonus_chips = excess * post_call_pot * _CALL_BONUS
+
         for ba in legal_int:
-            n = n_samples
-            results[ba] = float(np.mean([
-                _run_to_terminal(_fresh_engine_at(history + [ba]))
-                for _ in range(n)
-            ]))
+            rewards = []
+            for _ in range(n_samples):
+                init = (_reshuffled_init_state(pre_reset_game_rng, num_players, n_visible_public)
+                        if _DECK_RESHUFFLE else None)
+                rewards.append(_run_to_terminal(_fresh_engine_at(history + [ba], init_state=init)))
+            r = float(np.mean(rewards))
+            if bluff_penalty_chips > 0 and ba >= 2:
+                r -= bluff_penalty_chips
+            if call_bonus_chips > 0 and ba == 1:
+                r += call_bonus_chips
+            results[ba] = r
         return results
 
     def _strategy_for(obs, legal_int):
@@ -382,6 +511,8 @@ def _traversal_worker(args):
 
     first_obs   = engine.get_observation().copy()
     first_legal = [int(a) for a in engine.get_legal_actions()]
+    first_n_public = len(engine._state.public_cards)
+    first_pot_chips = engine.get_pot_size()
     _return_engine(engine)
 
     # ── Exact external sampling at every traversal player decision ───────────
@@ -389,8 +520,13 @@ def _traversal_worker(args):
     # Then sample one action from strategy and advance.
     all_steps = []
 
-    # Preflop decision — use range override if available
-    branch_rewards = _branch_exact(history, first_legal)
+    # Preflop decision — use range override if available.
+    # obs[10]=pot_odds, obs[18]=hero equity (see CLAUDE.md observation layout).
+    branch_rewards = _branch_exact(history, first_legal,
+                                    n_visible_public=first_n_public,
+                                    hero_equity=float(first_obs[18]),
+                                    pot_chips=first_pot_chips,
+                                    pot_odds=float(first_obs[10]))
 
     if _PREFLOP_RANGES is not None:
         # Use range chart for preflop strategy (both for action selection
@@ -427,7 +563,12 @@ def _traversal_worker(args):
 
         if ai == player_idx:
             legal_int      = [int(a) for a in legal]
-            branch_rewards = _branch_exact(history, legal_int)
+            n_pub          = len(eng._state.public_cards)
+            branch_rewards = _branch_exact(history, legal_int,
+                                            n_visible_public=n_pub,
+                                            hero_equity=float(obs[18]),
+                                            pot_chips=eng.get_pot_size(),
+                                            pot_odds=float(obs[10]))
 
             if is_pf:
                 # Still preflop (e.g. facing 3bet after our open) — use range override
@@ -455,6 +596,254 @@ def _traversal_worker(args):
     return all_steps
 
 
+# =============================================================================
+# Main-process helpers (setup, used from main())
+# =============================================================================
+
+def _rebuild_linear_lr_schedulers(deep_cfr, end_factor, total_iters):
+    """Rebuild LinearLR schedulers for both advantage + strategy optimizers."""
+    from torch.optim import lr_scheduler
+    deep_cfr.advantage_schedulers = [
+        lr_scheduler.LinearLR(opt, start_factor=1.0,
+                               end_factor=end_factor, total_iters=total_iters)
+        for opt in deep_cfr.advantage_optimizers
+    ]
+    deep_cfr.strategy_schedulers = [
+        lr_scheduler.LinearLR(opt, start_factor=1.0,
+                               end_factor=end_factor, total_iters=total_iters)
+        for opt in deep_cfr.strategy_optimizers
+    ]
+
+
+def _set_all_optimizers_lr(deep_cfr, lr):
+    """Set lr on every param group of every advantage + strategy optimizer."""
+    for opt in deep_cfr.advantage_optimizers + deep_cfr.strategy_optimizers:
+        for pg in opt.param_groups:
+            pg['lr'] = lr
+
+
+def _apply_fine_tune(deep_cfr, args, cfg_lr, cfg_t_max, obs_size, init_obs_size):
+    """Load base checkpoint, extend obs layer, drop LR to 0.2× for fine-tune.
+
+    Returns start_iter (from the loaded checkpoint).
+    """
+    ft_path = Path(args.fine_tune_from)
+    if not ft_path.exists():
+        print(f'Fine-tune checkpoint not found: {ft_path}')
+        sys.exit(1)
+    deep_cfr.load_models(str(ft_path))
+    start_iter = deep_cfr.iteration
+    print(f'Loaded base checkpoint — iteration {start_iter}')
+
+    deep_cfr.extend_first_layer(obs_size)
+    print(f'Extended first layer: {init_obs_size} → {obs_size} dims')
+
+    ft_lr = args.lr if args.lr else cfg_lr * 0.2
+    _set_all_optimizers_lr(deep_cfr, ft_lr)
+    _rebuild_linear_lr_schedulers(deep_cfr, end_factor=0.1, total_iters=cfg_t_max)
+    print(f'Fine-tune LR={ft_lr}, schedulers rebuilt (T_max={cfg_t_max})')
+    return start_iter
+
+
+def _apply_resume(deep_cfr, args, cfg_lr, cfg_t_max):
+    """Load checkpoint + buffer, set LR, rebuild schedulers. Returns start_iter."""
+    deep_cfr.load_models(args.resume)
+    start_iter = deep_cfr.iteration
+    print(f'Resumed from checkpoint — iteration {start_iter}')
+
+    buf_path = args.resume.replace('.pt', '_buffer.npz')
+    if Path(buf_path).exists():
+        deep_cfr.replay_buffer.load(buf_path)
+        print(f'Loaded replay buffer: {len(deep_cfr.replay_buffer):,} entries from {buf_path}')
+    else:
+        print(f'No buffer file found ({buf_path}), starting with empty buffer')
+
+    new_lr = args.lr if args.lr else cfg_lr
+    _set_all_optimizers_lr(deep_cfr, new_lr)
+    _rebuild_linear_lr_schedulers(deep_cfr, end_factor=0.1, total_iters=cfg_t_max)
+    print(f'LR set to {new_lr}, schedulers rebuilt (T_max={cfg_t_max})')
+    return start_iter
+
+
+def _apply_warm_start(deep_cfr, args, num_players, device):
+    """Load supervised model into all strategy networks (only if not resuming)."""
+    ws_path = Path(args.warm_start)
+    if not ws_path.exists():
+        print(f'Warm-start file not found: {ws_path}')
+        sys.exit(1)
+    ckpt = torch.load(str(ws_path), map_location=device)
+    if 'model_state_dict' not in ckpt:
+        print(f'Warning: no model_state_dict in {ws_path.name}, skipping warm-start')
+        return
+    state = ckpt['model_state_dict']
+    for net in deep_cfr.strategy_networks:
+        net.load_state_dict(state)
+    print(f'Warm-start: loaded supervised model into all {num_players} strategy networks')
+    print(f'  source: {ws_path.name}  epoch={ckpt.get("epoch", "?")}  '
+          f'val_acc={ckpt.get("val_acc", 0):.1%}')
+
+
+def _share_networks_to_cpu(nets):
+    """Deep-copy GPU nets to CPU + share_memory() for multiprocessing."""
+    shared = []
+    for net in nets:
+        cpu_net = copy.deepcopy(net).cpu().eval()
+        cpu_net.share_memory()
+        shared.append(cpu_net)
+    return shared
+
+
+def _setup_phase1_lr(deep_cfr, start_iter):
+    """Phase 1 LR schedule: 0.0003 → 0.0001 over 600 iters (only if in Phase 1)."""
+    if start_iter >= 600:
+        return
+    p1_lr, p1_end, p1_dur = 0.0003, 0.0001, 600
+    _set_all_optimizers_lr(deep_cfr, p1_lr)
+    _rebuild_linear_lr_schedulers(deep_cfr, end_factor=p1_end / p1_lr, total_iters=p1_dur)
+    # Step scheduler to match current iteration (for resume mid-Phase 1)
+    for _ in range(start_iter):
+        deep_cfr.step_schedulers()
+    print(f'  Phase 1 LR: {p1_lr} → {p1_end} over {p1_dur} iters')
+
+
+# =============================================================================
+# Training-loop helpers (used from main())
+# =============================================================================
+
+_PHASE_NAMES = {601: 'P2:self-play', 1601: 'P3:mixed'}
+
+
+def _handle_phase_transition(iter_num, deep_cfr, done_set):
+    """On Phase 2/3 boundary: clear replay buffer + reset LR schedule.
+
+    Called once per iteration; no-op unless iter_num is a phase start AND
+    that phase hasn't already been transitioned. `done_set` tracks which
+    phase boundaries have already fired (prevents double-reset on resume).
+
+    Pool is NOT cleared — keeps diverse models from earlier phases.
+    """
+    phase_name = _PHASE_NAMES.get(iter_num)
+    if phase_name is None or iter_num in done_set:
+        return
+    done_set.add(iter_num)
+
+    old_size = len(deep_cfr.replay_buffer)
+    deep_cfr.replay_buffer._size = 0
+    deep_cfr.replay_buffer._total_seen = 0
+    deep_cfr.replay_buffer._dirty = True
+    print(f'  *** Buffer cleared for {phase_name} (was {old_size:,} entries) ***')
+
+    if iter_num in PHASE_LR:
+        from torch.optim import lr_scheduler
+        p_lr, p_end, p_dur = PHASE_LR[iter_num]
+        end_factor = p_end / p_lr
+        for opt in deep_cfr.advantage_optimizers + deep_cfr.strategy_optimizers:
+            for pg in opt.param_groups:
+                pg['lr'] = p_lr
+        deep_cfr.advantage_schedulers = [
+            lr_scheduler.LinearLR(opt, start_factor=1.0,
+                                   end_factor=end_factor,
+                                   total_iters=p_dur)
+            for opt in deep_cfr.advantage_optimizers
+        ]
+        deep_cfr.strategy_schedulers = [
+            lr_scheduler.LinearLR(opt, start_factor=1.0,
+                                   end_factor=end_factor,
+                                   total_iters=p_dur)
+            for opt in deep_cfr.strategy_optimizers
+        ]
+        print(f'  *** LR reset: {p_lr} → {p_end} over {p_dur} iters ***')
+
+
+# =============================================================================
+# Inline evaluation helpers (used inside training loop)
+# =============================================================================
+
+def _selfplay_eval_stats(deep_cfr_ref, num_players, num_hands, eq_path):
+    """Run `num_hands` of self-play and return postflop action-mix stats.
+
+    Preflop locked to GTO ranges. Postflop uses deep_cfr.get_strategy()
+    directly (same path as validation, avoids DecisionEngine obs mismatch).
+
+    Returns dict with: af, fold_pct, chk_pct, call_pct, bet_pct.
+    """
+    import pokers as _pkrs_local
+    from src.engine.factory import make_engine as _mk_eng
+    from src.preflop_ranges import PreflopRanges
+
+    if eq_path:
+        from src.engine.fast_enhanced_engine import load_equity_model
+        load_equity_model(eq_path, device='cpu')
+
+    sp_eng = _mk_eng(num_players=num_players)
+    sp_ranges = PreflopRanges()
+    postflop = {'bets': 0, 'calls': 0, 'checks': 0, 'folds': 0}
+
+    for _ in range(num_hands):
+        sp_eng.reset()
+        while not sp_eng.is_done():
+            ca = sp_eng.current_agent
+            ai = sp_eng.agents.index(ca)
+            obs = sp_eng.get_observation()
+            legal = sp_eng.get_legal_actions()
+            if not legal:
+                break
+            legal_int = [int(a) for a in legal]
+            stage = sp_eng.get_stage()
+
+            # Preflop = GTO ranges; postflop = model
+            if stage == 'Preflop':
+                cards = sp_eng.get_player_cards(ca)
+                if cards and len(cards) >= 2:
+                    rel = (ai - sp_eng._button) % num_players
+                    pot = sp_eng.get_pot_size() / 2.0
+                    strat = sp_ranges.get_strategy(cards, rel, pot, legal_int, 6)
+                else:
+                    strat = np.zeros(6, dtype=np.float32)
+                    strat[legal_int] = 1.0 / len(legal_int)
+            else:
+                raw = deep_cfr_ref.get_strategy(obs, ai % num_players, legal_int)
+                strat = np.zeros(6, dtype=np.float32)
+                for a in legal_int:
+                    if a < len(raw):
+                        strat[a] = max(0.0, float(raw[a]))
+                s = strat.sum()
+                if s > 0:
+                    strat /= s
+                else:
+                    strat[legal_int] = 1.0 / len(legal_int)
+
+            # Sample action
+            probs = np.array([strat[a] for a in legal_int], dtype=np.float64)
+            probs = np.maximum(probs, 0.0)
+            ps = probs.sum()
+            probs = probs / ps if ps > 0 else np.ones(len(legal_int)) / len(legal_int)
+            action = int(np.random.choice(legal_int, p=probs))
+
+            # Track postflop action mix
+            if stage != 'Preflop':
+                if action == 0:
+                    postflop['folds'] += 1
+                elif action == 1:
+                    if _pkrs_local.ActionEnum.Check in sp_eng._state.legal_actions:
+                        postflop['checks'] += 1
+                    else:
+                        postflop['calls'] += 1
+                else:
+                    postflop['bets'] += 1
+
+            sp_eng.step(action)
+
+    t_acts = max(sum(postflop.values()), 1)
+    return {
+        'af':       postflop['bets'] / max(postflop['calls'], 1),
+        'fold_pct': 100 * postflop['folds']  / t_acts,
+        'chk_pct':  100 * postflop['checks'] / t_acts,
+        'call_pct': 100 * postflop['calls']  / t_acts,
+        'bet_pct':  100 * postflop['bets']   / t_acts,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
@@ -473,6 +862,20 @@ def main():
                         help='Disable preflop range override, let neural net learn preflop')
     parser.add_argument('--archetype-mode', action='store_true',
                         help='Mixed archetype opponent training (extends obs to 55 dims)')
+    parser.add_argument('--deck-reshuffle', action='store_true',
+                        help='Reshuffle undealt cards per branch rollout (variance reduction). '
+                             'Each branch gets independent turn/river — Steinberger MultiOutcomeSampler trick.')
+    parser.add_argument('--bluff-penalty', type=float, default=0.0,
+                        help='Penalty coefficient for raising with equity < 0.5. '
+                             '0 = off, 0.3 = soft (allows semi-bluffs), 0.6 = medium, '
+                             '1.0 = value-only play. Applied to raise-action rewards as '
+                             '(0.5 - equity) * pot * coefficient.')
+    parser.add_argument('--call-bonus', type=float, default=0.0,
+                        help='Bonus coefficient for +EV calls (equity > required pot-odds '
+                             'equity). 0 = off, 0.3 = soft, 0.6 = medium. Applied to call '
+                             'action reward as max(0, equity - (1-pot_odds)) * (pot+call) * '
+                             'coefficient. Symmetric to --bluff-penalty — use together so the '
+                             'defender doesn\'t drift too nitty when penalty cuts raising.')
     parser.add_argument('--fine-tune-from', type=str, default=None,
                         help='Base checkpoint to fine-tune from (extends obs 50→55, lower LR)')
     parser.add_argument('--kbest-seed', type=str, nargs='+', default=None,
@@ -566,88 +969,23 @@ def main():
         device=device,
     )
 
-    start_iter = 0
     cfg_lr = config['training']['learning_rate']
     cfg_t_max = config['training'].get('lr_scheduler_t_max', 2000)
 
+    # Checkpoint loading (at most one of fine-tune/resume applies)
     if args.fine_tune_from:
-        ft_path = Path(args.fine_tune_from)
-        if not ft_path.exists():
-            print(f'Fine-tune checkpoint not found: {ft_path}')
-            sys.exit(1)
-        deep_cfr.load_models(str(ft_path))
-        start_iter = deep_cfr.iteration
-        print(f'Loaded base checkpoint — iteration {start_iter}')
-
-        # Extend networks from 50 → 55 dims
-        deep_cfr.extend_first_layer(obs_size)
-        print(f'Extended first layer: {init_obs_size} → {obs_size} dims')
-
-        # Lower LR for fine-tuning (5x lower than config)
-        ft_lr = args.lr if args.lr else cfg_lr * 0.2
-        for opt in deep_cfr.advantage_optimizers + deep_cfr.strategy_optimizers:
-            for pg in opt.param_groups:
-                pg['lr'] = ft_lr
-
-        from torch.optim import lr_scheduler
-        deep_cfr.advantage_schedulers = [
-            lr_scheduler.LinearLR(opt, start_factor=1.0, end_factor=0.1, total_iters=cfg_t_max)
-            for opt in deep_cfr.advantage_optimizers
-        ]
-        deep_cfr.strategy_schedulers = [
-            lr_scheduler.LinearLR(opt, start_factor=1.0, end_factor=0.1, total_iters=cfg_t_max)
-            for opt in deep_cfr.strategy_optimizers
-        ]
-        print(f'Fine-tune LR={ft_lr}, schedulers rebuilt (T_max={cfg_t_max})')
-
+        start_iter = _apply_fine_tune(deep_cfr, args, cfg_lr, cfg_t_max,
+                                       obs_size, init_obs_size)
     elif args.resume:
-        deep_cfr.load_models(args.resume)
-        start_iter = deep_cfr.iteration
-        print(f'Resumed from checkpoint — iteration {start_iter}')
+        start_iter = _apply_resume(deep_cfr, args, cfg_lr, cfg_t_max)
+    else:
+        start_iter = 0
 
-        # Load replay buffer if available
-        buf_path = args.resume.replace('.pt', '_buffer.npz')
-        if Path(buf_path).exists():
-            deep_cfr.replay_buffer.load(buf_path)
-            print(f'Loaded replay buffer: {len(deep_cfr.replay_buffer):,} entries from {buf_path}')
-        else:
-            print(f'No buffer file found ({buf_path}), starting with empty buffer')
-
-        # Override LR: use --lr flag if given, otherwise use config value
-        new_lr = args.lr if args.lr else cfg_lr
-        for opt in deep_cfr.advantage_optimizers + deep_cfr.strategy_optimizers:
-            for pg in opt.param_groups:
-                pg['lr'] = new_lr
-
-        # Rebuild schedulers from config so new T_max / LR take effect
-        from torch.optim import lr_scheduler
-        deep_cfr.advantage_schedulers = [
-            lr_scheduler.LinearLR(opt, start_factor=1.0, end_factor=0.1, total_iters=cfg_t_max)
-            for opt in deep_cfr.advantage_optimizers
-        ]
-        deep_cfr.strategy_schedulers = [
-            lr_scheduler.LinearLR(opt, start_factor=1.0, end_factor=0.1, total_iters=cfg_t_max)
-            for opt in deep_cfr.strategy_optimizers
-        ]
-        print(f'LR set to {new_lr}, schedulers rebuilt (T_max={cfg_t_max})')
-
+    # Warm-start supervised weights (only when not resuming from CFR checkpoint)
     if args.warm_start and not args.resume:
-        ws_path = Path(args.warm_start)
-        if not ws_path.exists():
-            print(f'Warm-start file not found: {ws_path}')
-            sys.exit(1)
-        ckpt = torch.load(str(ws_path), map_location=device)
-        if 'model_state_dict' not in ckpt:
-            print(f'Warning: no model_state_dict in {ws_path.name}, skipping warm-start')
-        else:
-            state = ckpt['model_state_dict']
-            for i, net in enumerate(deep_cfr.strategy_networks):
-                net.load_state_dict(state)
-            print(f'Warm-start: loaded supervised model into all {num_players} strategy networks')
-            print(f'  source: {ws_path.name}  epoch={ckpt.get("epoch", "?")}  '
-                  f'val_acc={ckpt.get("val_acc", 0):.1%}')
+        _apply_warm_start(deep_cfr, args, num_players, device)
 
-    # Load buffer from file (without resuming model weights)
+    # Load replay buffer from file (without resuming model weights)
     if args.load_buffer:
         buf_path = Path(args.load_buffer)
         if buf_path.exists():
@@ -656,18 +994,9 @@ def main():
         else:
             print(f'Warning: buffer file not found: {buf_path}')
 
-    # Shared-memory CPU copies so workers can read current network weights.
-    shared_adv_nets = []
-    for net in deep_cfr.advantage_networks:
-        cpu_net = copy.deepcopy(net).cpu().eval()
-        cpu_net.share_memory()
-        shared_adv_nets.append(cpu_net)
-
-    shared_strat_nets = []
-    for net in deep_cfr.strategy_networks:
-        cpu_net = copy.deepcopy(net).cpu().eval()
-        cpu_net.share_memory()
-        shared_strat_nets.append(cpu_net)
+    # Shared-memory CPU copies so workers can read current network weights
+    shared_adv_nets   = _share_networks_to_cpu(deep_cfr.advantage_networks)
+    shared_strat_nets = _share_networks_to_cpu(deep_cfr.strategy_networks)
 
     num_iterations = config['training']['num_iterations']
     traversals    = config['training']['traversals_per_iteration']
@@ -682,30 +1011,9 @@ def main():
     writer = SummaryWriter(log_dir=str(logs_dir))
     print(f'TensorBoard logs → {logs_dir}  (run: tensorboard --logdir {logs_dir})\n')
 
-    # ── Set Phase 1 LR schedule: 0.0003 → 0.0001 over 600 iters ───────
-    # Override the constructor's default scheduler (which uses config t_max)
-    if start_iter < 600:
-        from torch.optim import lr_scheduler as _lr_sched
-        p1_lr, p1_end, p1_dur = 0.0003, 0.0001, 600
-        for opt in deep_cfr.advantage_optimizers + deep_cfr.strategy_optimizers:
-            for pg in opt.param_groups:
-                pg['lr'] = p1_lr
-        deep_cfr.advantage_schedulers = [
-            _lr_sched.LinearLR(opt, start_factor=1.0,
-                               end_factor=p1_end / p1_lr,
-                               total_iters=p1_dur)
-            for opt in deep_cfr.advantage_optimizers
-        ]
-        deep_cfr.strategy_schedulers = [
-            _lr_sched.LinearLR(opt, start_factor=1.0,
-                               end_factor=p1_end / p1_lr,
-                               total_iters=p1_dur)
-            for opt in deep_cfr.strategy_optimizers
-        ]
-        # Step scheduler to match current iteration (for resume mid-Phase 1)
-        for _ in range(start_iter):
-            deep_cfr.step_schedulers()
-        print(f'  Phase 1 LR: {p1_lr} → {p1_end} over {p1_dur} iters')
+    # Phase 1 LR schedule (0.0003 → 0.0001 over 600 iters) — overrides the
+    # DeepCFR constructor's default scheduler. Noop if past Phase 1.
+    _setup_phase1_lr(deep_cfr, start_iter)
 
     print(f'Training iterations {start_iter + 1} → {num_iterations}')
     print(f'batch_size={batch_size}  train_passes={train_passes}')
@@ -758,7 +1066,9 @@ def main():
             except Exception:
                 pass
 
-    if args.resume:
+    # Auto-discover K-Best pool from model dir on resume, BUT only when the
+    # user didn't specify --kbest-seed explicitly (otherwise we'd double up).
+    if args.resume and not args.kbest_seed:
         ckpt_dir = models_dir
         existing = sorted(ckpt_dir.glob('checkpoint_iter_*.pt'),
                           key=lambda p: int(p.stem.split('_')[-1]))
@@ -771,18 +1081,17 @@ def main():
                         kbest_pool.append(entry)
                 except Exception:
                     pass
-            if kbest_pool:
-                print(f'K-Best pool seeded with {len(kbest_pool)} checkpoints: '
-                      f'{", ".join(l for l, _ in kbest_pool)}')
+
+    if kbest_pool:
+        print(f'K-Best pool seeded with {len(kbest_pool)} checkpoints: '
+              f'{", ".join(l for l, _ in kbest_pool)}')
 
     _eq_path = args.equity_model if args.equity_model else None
     _nl5_opp = getattr(args, 'nl5_opponents', False)
-    pool = Pool(processes=num_workers, initializer=_worker_init,
-                initargs=(shared_adv_nets, shared_strat_nets, act_size,
-                          args.preflop_ranges, args.archetype_mode,
-                          kbest_pool if kbest_pool else None,
-                          _eq_path, _nl5_opp))
-    print('Workers ready.\n')
+    pool = _create_worker_pool(num_workers, shared_adv_nets, shared_strat_nets,
+                                act_size, args, kbest_pool, _eq_path, _nl5_opp)
+    print(f'Workers ready. deck_reshuffle={args.deck_reshuffle} '
+          f'bluff_penalty={args.bluff_penalty} call_bonus={args.call_bonus}\n')
 
     _adv_hist   = deque(maxlen=10)
     _strat_hist = deque(maxlen=10)
@@ -809,141 +1118,21 @@ def main():
         return '→ '
 
     def _run_eval(deep_cfr_ref, eval_engine, iter_num_snap):
-        """Run self-play + validation inline. Wrapped in try/except — never crashes training."""
+        """Self-play + validation eval, guarded so training never crashes."""
+        # ── Self-play postflop mix ──────────────────────────────────────
         try:
-            import io
-            from src.decision_engine import DecisionEngine, DecisionConfig
-            from scripts.analysis.self_play import run_self_play, generate_json
-
-            # Self-play eval using direct deep_cfr.get_strategy() —
-            # same path as validation, avoids DecisionEngine obs mismatch.
-            from src.engine.factory import make_engine as _mk_eng
-            from src.preflop_ranges import PreflopRanges
-
-            if _eq_path:
-                from src.engine.fast_enhanced_engine import load_equity_model
-                load_equity_model(_eq_path, device='cpu')
-
-            _sp_eng = _mk_eng(num_players=num_players)
-            _sp_ranges = PreflopRanges()
-            _sp_stats = {i: {'hands': 0} for i in range(num_players)}
-            _sp_postflop = {'bets': 0, 'calls': 0, 'checks': 0, 'folds': 0}
-            _sp_cbet_opp = 0
-            _sp_cbet = 0
-
-            for _hand in range(EVAL_HANDS):
-                _sp_eng.reset()
-                _preflop_raiser = -1
-                _saw_flop = set()
-                _street = 'Preflop'
-
-                while not _sp_eng.is_done():
-                    _ca = _sp_eng.current_agent
-                    _ai = _sp_eng.agents.index(_ca)
-                    _obs = _sp_eng.get_observation()
-                    _legal = _sp_eng.get_legal_actions()
-                    if not _legal:
-                        break
-                    _legal_int = [int(a) for a in _legal]
-                    _stage = _sp_eng.get_stage()
-
-                    if _stage != _street:
-                        if _stage == 'Flop':
-                            _saw_flop = set(range(num_players))  # simplified
-                        _street = _stage
-
-                    # Preflop: use ranges
-                    if _stage == 'Preflop':
-                        _cards = _sp_eng.get_player_cards(_ca)
-                        if _cards and len(_cards) >= 2:
-                            _rel = (_ai - _sp_eng._button) % num_players
-                            _pot = _sp_eng.get_pot_size() / 2.0
-                            _strat = _sp_ranges.get_strategy(
-                                _cards, _rel, _pot, _legal_int, 6)
-                        else:
-                            _strat = np.zeros(6, dtype=np.float32)
-                            _strat[_legal_int] = 1.0 / len(_legal_int)
-                    else:
-                        # Postflop: direct deep_cfr.get_strategy()
-                        _strat_raw = deep_cfr_ref.get_strategy(_obs, _ai % num_players, _legal_int)
-                        _strat = np.zeros(6, dtype=np.float32)
-                        for _a in _legal_int:
-                            if _a < len(_strat_raw):
-                                _strat[_a] = max(0.0, float(_strat_raw[_a]))
-                        _s = _strat.sum()
-                        if _s > 0:
-                            _strat /= _s
-                        else:
-                            _strat[_legal_int] = 1.0 / len(_legal_int)
-
-                    # Sample action
-                    _probs = np.array([_strat[a] for a in _legal_int], dtype=np.float64)
-                    _probs = np.maximum(_probs, 0.0)
-                    _ps = _probs.sum()
-                    _probs = _probs / _ps if _ps > 0 else np.ones(len(_legal_int)) / len(_legal_int)
-                    _action = int(np.random.choice(_legal_int, p=_probs))
-
-                    # Track postflop stats
-                    if _stage != 'Preflop':
-                        if _action == 0: _sp_postflop['folds'] += 1
-                        elif _action == 1:
-                            if _sp_eng.get_pot_size() > 0:
-                                _sp_postflop['checks' if True else 'calls'] += 1
-                            else:
-                                _sp_postflop['checks'] += 1
-                        else:
-                            _sp_postflop['bets'] += 1
-
-                    if _stage == 'Preflop' and _action >= 2:
-                        _preflop_raiser = _ai
-
-                    _sp_eng.step(_action)
-
-                # Track VPIP/PFR simplified
-                for _i in range(num_players):
-                    _sp_stats[_i]['hands'] += 1
-
-            # Compute stats
-            _total_pf = sum(s.hands for s in _sp_stats.values())
-            _t_acts = _sp_postflop['bets'] + _sp_postflop['calls'] + _sp_postflop['checks'] + _sp_postflop['folds']
-            _af = _sp_postflop['bets'] / max(_sp_postflop['calls'], 1)
-            _fold_pct = 100 * _sp_postflop['folds'] / max(_t_acts, 1)
-            _chk_pct = 100 * _sp_postflop['checks'] / max(_t_acts, 1)
-            _call_pct = 100 * _sp_postflop['calls'] / max(_t_acts, 1)
-            _bet_pct = 100 * _sp_postflop['bets'] / max(_t_acts, 1)
-
+            stats = _selfplay_eval_stats(deep_cfr_ref, num_players, EVAL_HANDS, _eq_path)
             print(
-                f"  [self-play {EVAL_HANDS}h] "
-                f"AF={_af:.1f} "
-                f"| Fold={_fold_pct:.0f}% "
-                f"Chk={_chk_pct:.0f}% "
-                f"Call={_call_pct:.0f}% "
-                f"Bet={_bet_pct:.0f}%"
+                f"  [self-play {EVAL_HANDS}h] AF={stats['af']:.2f} "
+                f"| Fold={stats['fold_pct']:.0f}% Chk={stats['chk_pct']:.0f}% "
+                f"Call={stats['call_pct']:.0f}% Bet={stats['bet_pct']:.0f}%"
             )
-
-            act = sp.get('postflop_actions', {})
-            print(
-                f"  [self-play {EVAL_HANDS}h] "
-                f"VPIP={sp['vpip']:.1f}% PFR={sp['pfr']:.1f}% "
-                f"CBet={sp['cbet']:.1f}% AF={sp['af']:.1f} "
-                f"WTSD={sp['wtsd']:.1f}% W$SD={sp['wsd']:.1f}% "
-                f"| Fold={act.get('fold_pct',0):.0f}% "
-                f"Chk={act.get('check_pct',0):.0f}% "
-                f"Call={act.get('call_pct',0):.0f}% "
-                f"Bet={act.get('bet_raise_pct',0):.0f}%"
-            )
-
-            # TensorBoard
-            for k in ('vpip', 'pfr', 'cbet', 'af', 'wtsd', 'wsd'):
-                writer.add_scalar(f'selfplay/{k}', sp[k], iter_num_snap)
-
-            try:
-                os.remove(tmp_ckpt)
-            except OSError:
-                pass
+            for k in ('af', 'fold_pct', 'chk_pct', 'call_pct', 'bet_pct'):
+                writer.add_scalar(f'selfplay/{k}', stats[k], iter_num_snap)
         except Exception as e:
             print(f'  [self-play ERROR: {e}]')
 
+        # ── Spot validation (AA vs 72o fold rates etc.) ─────────────────
         try:
             val_results = run_validation(deep_cfr_ref, eval_engine,
                                           num_games=500, verbose=False)
@@ -987,49 +1176,8 @@ def main():
             iter_num = iteration + 1
             t0 = time.time()
 
-            # ── Phase transitions: clear buffer + reset LR ──────────────────
-            #
-            # Per-phase LR schedule (start → end, linear decay):
-            #   Phase 1 (1-600):     0.0003 → 0.0001
-            #   Phase 2 (601-1600):  0.0003 → 0.0001
-            #   Phase 3 (1601-5200): 0.0002 → 0.0001
-            PHASE_LR = {
-                601:  (0.0003, 0.0001, 1000),   # (start_lr, end_lr, duration)
-                1601: (0.0002, 0.0001, 3600),
-            }
-            phase_transitions = {601: 'P2:self-play', 1601: 'P3:mixed'}
-            for phase_start, phase_name in phase_transitions.items():
-                if iter_num == phase_start and phase_start not in _phase_transitions_done:
-                    _phase_transitions_done.add(phase_start)
-                    old_size = len(deep_cfr.replay_buffer)
-                    deep_cfr.replay_buffer._size = 0
-                    deep_cfr.replay_buffer._total_seen = 0
-                    deep_cfr.replay_buffer._dirty = True
-                    print(f'  *** Buffer cleared for {phase_name} '
-                          f'(was {old_size:,} entries) ***')
-                    # Pool is NOT cleared — keep diverse models from earlier phases
-
-                    # Reset LR + rebuild scheduler for this phase
-                    if phase_start in PHASE_LR:
-                        from torch.optim import lr_scheduler
-                        p_lr, p_end, p_dur = PHASE_LR[phase_start]
-                        end_factor = p_end / p_lr
-                        for opt in deep_cfr.advantage_optimizers + deep_cfr.strategy_optimizers:
-                            for pg in opt.param_groups:
-                                pg['lr'] = p_lr
-                        deep_cfr.advantage_schedulers = [
-                            lr_scheduler.LinearLR(opt, start_factor=1.0,
-                                                  end_factor=end_factor,
-                                                  total_iters=p_dur)
-                            for opt in deep_cfr.advantage_optimizers
-                        ]
-                        deep_cfr.strategy_schedulers = [
-                            lr_scheduler.LinearLR(opt, start_factor=1.0,
-                                                  end_factor=end_factor,
-                                                  total_iters=p_dur)
-                            for opt in deep_cfr.strategy_optimizers
-                        ]
-                        print(f'  *** LR reset: {p_lr} → {p_end} over {p_dur} iters ***')
+            # Phase transitions: buffer clear + LR reset (Phase 2 & 3 boundaries)
+            _handle_phase_transition(iter_num, deep_cfr, _phase_transitions_done)
 
             # ── Hot-reload config every 10 iterations ───────────────────────
             if iter_num - _last_config_reload >= 10:
@@ -1097,6 +1245,12 @@ def main():
                 warmup_tag = ''
 
             if effective_passes > 0:
+                # Reinitialize advantage networks from scratch every 10 iterations.
+                # Paper-correct version is per-iteration; relaxing to every 10 keeps
+                # the bias-prevention effect while letting each network actually
+                # converge on the buffer between resets.
+                if iter_num % 10 == 0:
+                    deep_cfr.reinitialize_advantage_networks()
                 print(f'Iter {iter_num:4d}  training...        ', end='\r', flush=True)
             deep_cfr.replay_buffer.rebuild_indices()
             adv_losses, strat_losses = [], []
@@ -1176,10 +1330,9 @@ def main():
                         async_result = None
                     pool.terminate()
                     pool.join()
-                    pool = Pool(processes=num_workers, initializer=_worker_init,
-                                initargs=(shared_adv_nets, shared_strat_nets, act_size,
-                                          args.preflop_ranges, args.archetype_mode,
-                                          kbest_pool, _eq_path, _nl5_opp))
+                    pool = _create_worker_pool(num_workers, shared_adv_nets,
+                                               shared_strat_nets, act_size,
+                                               args, kbest_pool, _eq_path, _nl5_opp)
                     pool_labels = ', '.join(l for l, _ in kbest_pool)
                     print(f'  K-Best pool updated: [{pool_labels}]')
                 except Exception as e:
