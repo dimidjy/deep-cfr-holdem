@@ -74,8 +74,12 @@ _OPP_PREFLOP_RANGES = None  # wider NL5 ranges for opponents (if --nl5-opponents
 _ARCHETYPE_MODE = False     # mixed archetype opponents (extends obs 50→55)
 _NL5_OPP_MODE   = False     # force NL5 population skew on all opponents
 _DECK_RESHUFFLE = False     # reshuffle undealt cards per branch rollout
-_BLUFF_PENALTY  = 0.0       # penalize raises with equity<0.5 (value-only nudge)
+_BLUFF_PENALTY  = 0.0       # penalize raises with equity<threshold (value-only nudge)
+_BLUFF_THRESHOLD = 0.60     # equity below this counts as "bluff" — was 0.50, raised
+                            # so marginal spots (e.g. 42% 3-way) get meaningful penalty
 _CALL_BONUS     = 0.0       # reward +EV calls (equity > pot_odds_required)
+_VALUE_BONUS    = 0.0       # reward raises with strong equity when checked to
+_VALUE_THRESHOLD = 0.70     # equity above this counts as "value push" territory
 
 # Engine pool — per-worker reuse to avoid env teardown on every branch
 _ENGINE_POOL = []
@@ -97,10 +101,10 @@ def _return_engine(eng):
 def _worker_init(shared_adv, shared_strat, act_size, use_preflop_ranges=False,
                  archetype_mode=False, kbest_pool=None, equity_model_path=None,
                  nl5_opp_mode=False, deck_reshuffle=False, bluff_penalty=0.0,
-                 call_bonus=0.0):
+                 call_bonus=0.0, value_bonus=0.0):
     global _SHARED_ADV_NETS, _SHARED_STRAT_NETS, _ACT_SIZE, _PREFLOP_RANGES
     global _ARCHETYPE_MODE, _KBEST_POOL, _OPP_PREFLOP_RANGES, _NL5_OPP_MODE
-    global _DECK_RESHUFFLE, _BLUFF_PENALTY, _CALL_BONUS
+    global _DECK_RESHUFFLE, _BLUFF_PENALTY, _CALL_BONUS, _VALUE_BONUS
     _SHARED_ADV_NETS  = shared_adv
     _SHARED_STRAT_NETS = shared_strat
     _ACT_SIZE          = act_size
@@ -110,6 +114,7 @@ def _worker_init(shared_adv, shared_strat, act_size, use_preflop_ranges=False,
     _DECK_RESHUFFLE    = deck_reshuffle
     _BLUFF_PENALTY     = bluff_penalty
     _CALL_BONUS        = call_bonus
+    _VALUE_BONUS       = value_bonus
     if use_preflop_ranges:
         from src.preflop_ranges import PreflopRanges
         _PREFLOP_RANGES = PreflopRanges()
@@ -271,7 +276,8 @@ def _create_worker_pool(num_workers, shared_adv, shared_strat, act_size,
                   args.preflop_ranges, args.archetype_mode,
                   kbest_pool if kbest_pool else None,
                   eq_path, nl5_opp, args.deck_reshuffle,
-                  args.bluff_penalty, args.call_bonus),
+                  args.bluff_penalty, args.call_bonus,
+                  args.value_bonus),
     )
 
 
@@ -381,13 +387,19 @@ def _traversal_worker(args):
         trick from Steinberger Deep-CFR (MultiOutcomeSampler.reshuffle_remaining_deck).
 
         With _BLUFF_PENALTY > 0, raise-action rewards get a penalty proportional
-        to (0.5 - hero_equity) * pot. This shifts the Nash equilibrium toward
-        value-only play — bluffs need to overcome the penalty to stay in strategy.
+        to (_BLUFF_THRESHOLD - hero_equity) * pot. Threshold is 0.60 by default
+        (raised from 0.50 so marginal spots like 42% equity 3-way get penalized).
+        This shifts the Nash equilibrium toward value-only play.
 
         With _CALL_BONUS > 0, the call action reward gets a bonus proportional
         to how much equity exceeds pot odds (i.e. the call is +EV in a vacuum).
         Counterbalances the bluff penalty so defender doesn't drift too nitty,
         which would otherwise inflate fold equity for the aggressor.
+
+        With _VALUE_BONUS > 0, raise-action rewards get a bonus when equity is
+        above _VALUE_THRESHOLD AND hero is checked-to (pot_odds == 0). Fixes the
+        "uncertain with strong value" equilibrium where self-play opponents don't
+        bluff → checking and betting look equal-EV → model under-bets big hands.
 
         pot_odds: obs[10] — defined as pot / (pot + call). 0 means no call amount
                   (free check). Required equity to call = 1 - pot_odds.
@@ -396,7 +408,7 @@ def _traversal_worker(args):
 
         bluff_penalty_chips = 0.0
         if _BLUFF_PENALTY > 0 and hero_equity is not None and pot_chips is not None:
-            deficit = max(0.0, 0.5 - float(hero_equity))
+            deficit = max(0.0, _BLUFF_THRESHOLD - float(hero_equity))
             bluff_penalty_chips = deficit * float(pot_chips) * _BLUFF_PENALTY
 
         # Call bonus: reward +EV calls (equity > required pot-odds equity).
@@ -410,6 +422,15 @@ def _traversal_worker(args):
             post_call_pot = float(pot_chips) / max(po, 1e-6)
             call_bonus_chips = excess * post_call_pot * _CALL_BONUS
 
+        # Value bonus: reward raising with strong equity when checked-to.
+        # Only when facing no bet (pot_odds == 0) — otherwise this would boost
+        # 3-bet bluffs, which is not what we want.
+        value_bonus_chips = 0.0
+        if (_VALUE_BONUS > 0 and hero_equity is not None and pot_chips is not None
+                and pot_odds is not None and float(pot_odds) == 0.0):
+            excess = max(0.0, float(hero_equity) - _VALUE_THRESHOLD)
+            value_bonus_chips = excess * float(pot_chips) * _VALUE_BONUS
+
         for ba in legal_int:
             rewards = []
             for _ in range(n_samples):
@@ -421,6 +442,8 @@ def _traversal_worker(args):
                 r -= bluff_penalty_chips
             if call_bonus_chips > 0 and ba == 1:
                 r += call_bonus_chips
+            if value_bonus_chips > 0 and ba >= 2:
+                r += value_bonus_chips
             results[ba] = r
         return results
 
@@ -866,16 +889,38 @@ def main():
                         help='Reshuffle undealt cards per branch rollout (variance reduction). '
                              'Each branch gets independent turn/river — Steinberger MultiOutcomeSampler trick.')
     parser.add_argument('--bluff-penalty', type=float, default=0.0,
-                        help='Penalty coefficient for raising with equity < 0.5. '
-                             '0 = off, 0.3 = soft (allows semi-bluffs), 0.6 = medium, '
-                             '1.0 = value-only play. Applied to raise-action rewards as '
-                             '(0.5 - equity) * pot * coefficient.')
+                        help='Penalty coefficient for raising with equity < 0.60 threshold. '
+                             '0 = off, 0.6 = soft (allows semi-bluffs), 1.0 = medium, '
+                             '1.5 = strong value-lean. Applied to raise-action rewards as '
+                             '(0.60 - equity) * pot * coefficient. Threshold raised from '
+                             '0.50 so marginal spots like 42%% 3-way get meaningful penalty.')
     parser.add_argument('--call-bonus', type=float, default=0.0,
                         help='Bonus coefficient for +EV calls (equity > required pot-odds '
                              'equity). 0 = off, 0.3 = soft, 0.6 = medium. Applied to call '
                              'action reward as max(0, equity - (1-pot_odds)) * (pot+call) * '
                              'coefficient. Symmetric to --bluff-penalty — use together so the '
                              'defender doesn\'t drift too nitty when penalty cuts raising.')
+    parser.add_argument('--value-bonus', type=float, default=0.0,
+                        help='Bonus coefficient for raising with strong equity when checked to. '
+                             '0 = off, 0.3 = soft, 0.5 = medium, 1.0 = strong value push. '
+                             'Applied to raise-action rewards as max(0, equity - 0.70) * pot * '
+                             'coefficient. Only when pot_odds==0 (hero facing no bet). Fixes '
+                             'the under-betting equilibrium where self-play makes bet and check '
+                             'look equal-EV for strong hands.')
+    parser.add_argument('--imitation-weight', type=float, default=0.0,
+                        help='Weight for supervised imitation loss on annotated spots. '
+                             '0 = off, 0.1 = light nudge, 0.3 = medium, 0.5 = strong. '
+                             'Loads logs/action_debug/*.json with right_action set and '
+                             'pushes strategy network to match them via cross-entropy loss. '
+                             'Applied every iteration after CFR training. Works with 80+ '
+                             'annotated spots — more is better.')
+    parser.add_argument('--imitation-spots-dir', type=str, default='logs/action_debug',
+                        help='Directory with annotated spot JSONs (default: logs/action_debug)')
+    parser.add_argument('--imitation-batch-size', type=int, default=64,
+                        help='Batch size for imitation pass (default: 64). Smaller than CFR '
+                             'batch since the annotated dataset is small.')
+    parser.add_argument('--imitation-passes', type=int, default=3,
+                        help='Gradient steps per iteration on imitation batches (default: 3)')
     parser.add_argument('--fine-tune-from', type=str, default=None,
                         help='Base checkpoint to fine-tune from (extends obs 50→55, lower LR)')
     parser.add_argument('--kbest-seed', type=str, nargs='+', default=None,
@@ -1019,6 +1064,49 @@ def main():
     print(f'batch_size={batch_size}  train_passes={train_passes}')
     print(f'Spawning {num_workers} workers...')
 
+    # ── Imitation-learning dataset (annotated spots) ─────────────────────
+    # Prebuild tensors once so per-iteration imitation steps are fast.
+    # The strategy network is trained via cross-entropy toward `right_action`
+    # on every pass — supervised signal complementing CFR's regret signal.
+    imitation_obs: Optional[torch.Tensor] = None
+    imitation_targets: Optional[torch.Tensor] = None
+    imitation_legal: Optional[torch.Tensor] = None
+    if args.imitation_weight > 0:
+        from scripts.validate_spot_logs import load_annotated_spots
+        raw_spots = load_annotated_spots(args.imitation_spots_dir)
+        # Filter to spots whose obs size matches the model AND whose
+        # right_action is within the model's action space
+        usable = []
+        for s in raw_spots:
+            ov = s.get('obs_vector') or []
+            ra = s.get('right_action')
+            if not isinstance(ra, int) or ra >= act_size:
+                continue
+            # Trim obs if it's larger than the model expects (strip EVO dim)
+            if len(ov) > obs_size:
+                ov = ov[:obs_size]
+            elif len(ov) < obs_size:
+                continue
+            legal = s.get('game_state', {}).get('legal_actions') or list(range(act_size))
+            mask = [1.0 if a in legal else 0.0 for a in range(act_size)]
+            if mask[ra] == 0.0:
+                continue  # target is illegal — skip rather than train nonsense
+            usable.append((ov, ra, mask))
+        if usable:
+            imitation_obs = torch.tensor(
+                [u[0] for u in usable], dtype=torch.float32, device=device)
+            imitation_targets = torch.tensor(
+                [u[1] for u in usable], dtype=torch.long, device=device)
+            imitation_legal = torch.tensor(
+                [u[2] for u in usable], dtype=torch.float32, device=device)
+            print(f'Imitation learning: {len(usable)}/{len(raw_spots)} usable '
+                  f'annotated spots loaded  (weight={args.imitation_weight}, '
+                  f'batch={args.imitation_batch_size}, passes={args.imitation_passes})')
+        else:
+            print(f'Imitation learning: NO usable spots found in '
+                  f'{args.imitation_spots_dir} — disabling')
+            args.imitation_weight = 0.0
+
     # K-Best Self-Play: pool of historical opponent networks
     KBEST_K = 5  # keep top-K historical versions
     kbest_pool = []  # list of (label, [shared_net_per_player])
@@ -1091,7 +1179,8 @@ def main():
     pool = _create_worker_pool(num_workers, shared_adv_nets, shared_strat_nets,
                                 act_size, args, kbest_pool, _eq_path, _nl5_opp)
     print(f'Workers ready. deck_reshuffle={args.deck_reshuffle} '
-          f'bluff_penalty={args.bluff_penalty} call_bonus={args.call_bonus}\n')
+          f'bluff_penalty={args.bluff_penalty} call_bonus={args.call_bonus} '
+          f'value_bonus={args.value_bonus}\n')
 
     _adv_hist   = deque(maxlen=10)
     _strat_hist = deque(maxlen=10)
@@ -1152,6 +1241,32 @@ def main():
                                   summary['passed'] / summary['total'], iter_num_snap)
         except Exception as e:
             print(f'  [validation ERROR: {e}]')
+
+        # ── Real-play spot validation (annotated debug logs) ─────────────
+        # Scores against right_action only. Partial credit 0.5 for same-type
+        # raise mismatches (e.g. Raise½ vs RaisePot); exact match = 1.0.
+        try:
+            from scripts.validate_spot_logs import (
+                load_annotated_spots, score_model, print_report,
+            )
+            spots_dir = Path(__file__).parent.parent / 'logs' / 'action_debug'
+            if spots_dir.is_dir():
+                spots = load_annotated_spots(str(spots_dir))
+                stats = score_model(deep_cfr_ref, spots, num_players=num_players)
+                if stats.get('n', 0) > 0:
+                    print_report(stats)
+                    writer.add_scalar('spots/score_pct',
+                                       stats['percent'], iter_num_snap)
+                    writer.add_scalar('spots/exact_matches',
+                                       stats['exact_matches'], iter_num_snap)
+                    for street in ('preflop', 'flop', 'turn', 'river'):
+                        ps = stats['per_street'].get(street, {})
+                        if ps.get('n', 0) > 0:
+                            pct = 100.0 * ps['score'] / ps['n']
+                            writer.add_scalar(f'spots/score_{street}',
+                                              pct, iter_num_snap)
+        except Exception as e:
+            print(f'  [spots ERROR: {e}]')
 
     def _push_weights():
         """Copy GPU-trained weights into shared-memory CPU nets for workers."""
@@ -1257,6 +1372,28 @@ def main():
             for _ in range(effective_passes):
                 adv_losses.append(deep_cfr.train_advantage_network(batch_size))
                 strat_losses.append(deep_cfr.train_strategy_network(batch_size))
+
+            # ── Imitation pass on annotated spots ────────────────────
+            # Runs only when imitation dataset is loaded AND CFR training
+            # actually ran this iter (skip during buffer warmup).
+            imitation_loss = 0.0
+            if (imitation_obs is not None and imitation_obs.size(0) > 0
+                    and effective_passes > 0 and args.imitation_weight > 0):
+                bs = min(args.imitation_batch_size, imitation_obs.size(0))
+                n_data = imitation_obs.size(0)
+                losses = []
+                for _ in range(args.imitation_passes):
+                    # Random minibatch (use numpy randint — same seed as
+                    # other training randomness)
+                    idx = torch.randint(0, n_data, (bs,), device=device)
+                    losses.append(deep_cfr.train_imitation_step(
+                        imitation_obs[idx],
+                        imitation_targets[idx],
+                        imitation_legal[idx],
+                        weight=args.imitation_weight,
+                    ))
+                imitation_loss = float(np.mean(losses)) if losses else 0.0
+
             deep_cfr.step_schedulers()
             deep_cfr.iteration = iter_num
             t_train = time.time() - t0 - t_trav
@@ -1285,6 +1422,8 @@ def main():
             # ── TensorBoard: per-iteration (always) ─────────────────────────
             writer.add_scalar('loss/advantage',  adv,   iter_num)
             writer.add_scalar('loss/strategy',   strat, iter_num)
+            if args.imitation_weight > 0:
+                writer.add_scalar('loss/imitation', imitation_loss, iter_num)
             writer.add_scalar('perf/trav_time',  t_trav,  iter_num)
             writer.add_scalar('perf/train_time', t_train, iter_num)
             writer.add_scalar('perf/total_time', total,   iter_num)

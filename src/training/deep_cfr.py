@@ -374,8 +374,21 @@ class DeepCFR:
         "trained from scratch" each iteration on the accumulated buffer.
         This prevents the network from accumulating bias (e.g. "call is bad")
         across iterations.
+
+        Preserves the CURRENT learning rate on the existing optimizer rather
+        than resetting to the constructor-time _learning_rate. This matters
+        because: (a) --lr CLI override updates the live optimizer, not the
+        stored attribute; (b) the LR scheduler mutates the live optimizer
+        each step. Using _learning_rate would revert to 0.0003 (config
+        default) every 10 iters, bypassing both.
+
+        Also rebinds the scheduler to the new optimizer so it keeps advancing.
         """
         for i in range(self.num_players):
+            # Snapshot LR + scheduler state BEFORE replacing the optimizer
+            old_opt = self.advantage_optimizers[i]
+            current_lr = old_opt.param_groups[0]['lr']
+
             # Reset network weights
             new_net = AdvantageNetwork(
                 self.observation_size, self.action_size,
@@ -383,11 +396,27 @@ class DeepCFR:
             ).to(self.device)
             self.advantage_networks[i].load_state_dict(new_net.state_dict())
 
-            # Reset optimizer (fresh momentum/Adam state)
-            self.advantage_optimizers[i] = optim.Adam(
+            # Reset optimizer (fresh momentum/Adam state), preserve current LR
+            new_opt = optim.Adam(
                 self.advantage_networks[i].parameters(),
-                lr=self._learning_rate
+                lr=current_lr
             )
+            self.advantage_optimizers[i] = new_opt
+
+            # Rebind the scheduler (if any) to the new optimizer so it keeps
+            # tracking the right thing. Preserves scheduler step count.
+            if i < len(self.advantage_schedulers) and self.advantage_schedulers[i] is not None:
+                old_sched = self.advantage_schedulers[i]
+                # Recreate same scheduler type bound to new optimizer
+                sched_state = old_sched.state_dict()
+                new_sched = type(old_sched)(
+                    new_opt,
+                    **{k: getattr(old_sched, k) for k in ('start_factor', 'end_factor', 'total_iters')
+                       if hasattr(old_sched, k)}
+                ) if hasattr(old_sched, 'start_factor') else None
+                if new_sched is not None:
+                    new_sched.load_state_dict(sched_state)
+                    self.advantage_schedulers[i] = new_sched
 
     def extend_first_layer(self, new_obs_size: int):
         """Extend all networks from current obs_size to new_obs_size.
@@ -595,6 +624,56 @@ class DeepCFR:
             self._scaler.update()
 
             total_loss += loss.item()
+            count += 1
+
+        return total_loss / count if count > 0 else 0.0
+
+    def train_imitation_step(self, obs_batch, target_actions, legal_masks,
+                              weight: float = 0.2) -> float:
+        """Supervised imitation step on (obs, right_action) pairs.
+
+        Pushes every strategy network toward the annotated `right_action`.
+        Meant as a co-signal with CFR's regret signal — not a replacement.
+
+        Args:
+            obs_batch: (N, obs_size) tensor
+            target_actions: (N,) long tensor of action indices
+            legal_masks: (N, action_size) float tensor (1=legal, 0=illegal)
+            weight: scaling factor on the CE loss. 0.2 is a reasonable
+                starting point so imitation doesn't dominate CFR.
+
+        Returns average cross-entropy loss across players (unweighted, for logging).
+        """
+        if obs_batch.size(0) == 0:
+            return 0.0
+
+        total_loss = 0.0
+        count = 0
+        for player_idx in range(self.num_players):
+            self.strategy_optimizers[player_idx].zero_grad()
+
+            with torch.cuda.amp.autocast(enabled=self._amp_enabled):
+                logits = self.strategy_networks[player_idx](obs_batch)
+                # Mask illegal actions out of the softmax
+                logits = logits + (1.0 - legal_masks) * (-1e9)
+                log_probs = torch.log_softmax(logits, dim=-1)
+                # NLL of target action (cross-entropy with one-hot target)
+                batch_size = obs_batch.size(0)
+                idx = torch.arange(batch_size, device=obs_batch.device)
+                nll = -log_probs[idx, target_actions]
+                raw_loss = nll.mean()
+                loss = raw_loss * weight
+
+            self._scaler.scale(loss).backward()
+            self._scaler.unscale_(self.strategy_optimizers[player_idx])
+            torch.nn.utils.clip_grad_norm_(
+                self.strategy_networks[player_idx].parameters(),
+                max_norm=self.gradient_clip,
+            )
+            self._scaler.step(self.strategy_optimizers[player_idx])
+            self._scaler.update()
+
+            total_loss += float(raw_loss.detach().cpu())
             count += 1
 
         return total_loss / count if count > 0 else 0.0
