@@ -51,7 +51,11 @@ IDX_MADE_HAND = 19      # obs[19] = made_hand_cat (0.0=highcard .. 0.875=quads)
 IDX_FLUSH_DRAW = 20     # obs[20] = hero_flush_participation (0/0.5/1.0)
 IDX_STRAIGHT_DRAW = 21  # obs[21] = hero_straight_participation (0/0.5/1.0)
 IDX_TOP_PAIR = 22       # obs[22] = top_pair (0 or 1)
+IDX_BOARD_PAIR = 23     # obs[23] = board_pairing_level (0/0.33/0.67/1.0)
+IDX_BOARD_FLUSH = 24    # obs[24] = board_flush_texture
 IDX_RANK_WITHIN_CAT = 26  # obs[26] = hand_rank_within_cat (0=worst..1=best in category)
+IDX_STACK_TO_POT = 9    # obs[9]  = effective_stack / pot (SPR)
+IDX_IS_RIVER = 30       # obs[30] = is_river flag
 
 # Made hand categories
 HAND_HIGH_CARD = 0.0
@@ -99,6 +103,7 @@ class SpotContext:
     hole_cards: Optional[List[str]] = None
     rel_pos: int = 0
     num_limpers: int = 0
+    num_callers: int = 0  # cold-callers of the open (excludes opener)
     effective_stack: float = 100.0
     num_players: int = 6
     pot_bb: float = 0.0
@@ -210,6 +215,48 @@ def _apply_allin_filter(strategy: np.ndarray, obs: np.ndarray,
     elif non_allin:
         for a in non_allin:
             strategy[a] = excess / len(non_allin)
+    return strategy
+
+
+def _promote_to_allin(strategy: np.ndarray, obs: np.ndarray,
+                       legal_actions: List[int],
+                       shift_frac: float = 0.5) -> np.ndarray:
+    """Promote RaisePot → AllIn on river with near-nut hands.
+
+    Deep CFR model has no all-in head (action_size=4). At deep SPR this leaves
+    value behind when we hold a monster on the river. Shifts `shift_frac` of
+    RaisePot mass to AllIn only when hand is near-nuts within category and
+    board texture doesn't threaten us.
+    """
+    if ALL_IN not in legal_actions:
+        return strategy
+    if len(obs) <= IDX_IS_RIVER:
+        return strategy
+    if float(obs[IDX_IS_RIVER]) < 0.5:
+        return strategy
+    # Need meaningful SPR, otherwise RaisePot ≈ AllIn already
+    if float(obs[IDX_STACK_TO_POT]) < 0.75:
+        return strategy
+    # Straight+ only
+    made_hand = float(obs[IDX_MADE_HAND])
+    if made_hand < HAND_STRAIGHT - 0.01:
+        return strategy
+    # Near-nuts within category
+    if float(obs[IDX_RANK_WITHIN_CAT]) < 0.85:
+        return strategy
+    # Texture safety: flush possible and we don't have one → skip
+    if float(obs[IDX_BOARD_FLUSH]) > 0.75 and made_hand < HAND_FLUSH - 0.01:
+        return strategy
+    # Board paired and we don't have FH+ → opponent can have boat
+    if float(obs[IDX_BOARD_PAIR]) > 0.5 and made_hand < HAND_FULL_HOUSE - 0.01:
+        return strategy
+    rp_mass = float(strategy[RAISE_POT])
+    if rp_mass < 0.1:
+        return strategy
+    strategy = strategy.copy()
+    shift = rp_mass * shift_frac
+    strategy[RAISE_POT] -= shift
+    strategy[ALL_IN] += shift
     return strategy
 
 
@@ -607,7 +654,8 @@ class DecisionEngine:
             strategy = pf.get_strategy(
                 hole_cards=ctx.hole_cards, rel_pos=ctx.rel_pos,
                 pot_bb=pot_bb, legal_actions=ctx.legal_actions,
-                num_limpers=ctx.num_limpers, effective_stack=ctx.effective_stack)
+                num_limpers=ctx.num_limpers, num_callers=ctx.num_callers,
+                effective_stack=ctx.effective_stack)
 
             if strategy is not None:
                 result = np.zeros(NUM_ACTIONS, dtype=np.float32)

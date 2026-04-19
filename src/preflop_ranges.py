@@ -102,7 +102,8 @@ class PreflopRanges:
 
     def get_action(self, hole_cards: List[str], rel_pos: int,
                    pot_bb: float, legal_actions: List[int],
-                   num_limpers: int = 0, effective_stack: float = 100.0) -> Optional[int]:
+                   num_limpers: int = 0, effective_stack: float = 100.0,
+                   num_callers: int = 0) -> Optional[int]:
         """Determine preflop action from range charts.
 
         Args:
@@ -112,6 +113,7 @@ class PreflopRanges:
             legal_actions: list of legal action indices [0,1,2,3,4]
             num_limpers: number of players who limped before us
             effective_stack: smallest relevant stack in BB
+            num_callers: number of cold-callers of the open (excludes opener)
 
         Returns:
             Action index (0-4), or None if ranges don't cover this situation.
@@ -135,6 +137,10 @@ class PreflopRanges:
                                                       legal_actions, num_limpers)
             return self._rfi_decision(combo, pos_key, legal_actions)
         elif pot_bb < 18:
+            # Squeeze spot: open + 1+ cold-callers → premium-only 3-bet
+            if num_callers > 0:
+                return self._facing_squeeze_decision(combo, pos_key,
+                                                      legal_actions, num_callers)
             return self._facing_raise_decision(combo, pos_key, legal_actions)
         elif pot_bb < 50:
             return self._facing_3bet_decision(combo, pos_key, legal_actions)
@@ -145,12 +151,14 @@ class PreflopRanges:
                      pot_bb: float, legal_actions: List[int],
                      action_size: int = 6,
                      num_limpers: int = 0,
-                     effective_stack: float = 100.0) -> np.ndarray:
+                     effective_stack: float = 100.0,
+                     num_callers: int = 0) -> np.ndarray:
         """Get a strategy vector (probability distribution over actions)."""
         strategy = np.zeros(action_size, dtype=np.float32)
         action = self.get_action(hole_cards, rel_pos, pot_bb, legal_actions,
                                  num_limpers=num_limpers,
-                                 effective_stack=effective_stack)
+                                 effective_stack=effective_stack,
+                                 num_callers=num_callers)
 
         if action is None or action not in legal_actions:
             # Fallback: uniform over legal actions
@@ -168,8 +176,22 @@ class PreflopRanges:
         return strategy
 
     def _best_raise(self, legal_actions: List[int]) -> int:
-        """Pick best available raise action."""
+        """Pick best available raise action (biggest sizing)."""
         for a in [RAISE_POT, RAISE_HALF, RAISE_MIN, ALL_IN]:
+            if a in legal_actions:
+                return a
+        if CALL in legal_actions:
+            return CALL
+        return FOLD
+
+    def _best_3bet_raise(self, legal_actions: List[int]) -> int:
+        """Pick sizing for a 3-bet vs a single raiser.
+
+        Proper 3-bet is ~3–3.5x the open, which maps closer to RAISE_HALF
+        than RAISE_POT at typical stack depths. Using pot-raise here bloats
+        the pot and over-commits on non-premium hands.
+        """
+        for a in [RAISE_HALF, RAISE_POT, RAISE_MIN, ALL_IN]:
             if a in legal_actions:
                 return a
         if CALL in legal_actions:
@@ -228,16 +250,52 @@ class PreflopRanges:
 
     def _facing_raise_decision(self, combo: str, pos_key: str,
                                legal_actions: List[int]) -> int:
-        """Facing a single raise — check 3bet or call."""
+        """Facing a single raise, heads-up to the opener — 3bet, call, or fold."""
         # 3-bet range
         key_3b = f'{pos_key}_3b'
         range_3b = self.ranges.get('3b', {}).get(key_3b, {})
         if _is_in_range(combo, range_3b):
-            return self._best_raise(legal_actions)
+            return self._best_3bet_raise(legal_actions)
 
         # Call range
         call_range = self.ranges.get('rfi_call', {}).get(pos_key, {})
         if _is_in_range(combo, call_range):
+            if CALL in legal_actions:
+                return CALL
+
+        return FOLD if FOLD in legal_actions else CALL
+
+    def _facing_squeeze_decision(self, combo: str, pos_key: str,
+                                  legal_actions: List[int],
+                                  num_callers: int) -> int:
+        """Facing open + at least one cold-caller — multiway squeeze spot.
+
+        Multiway facing two+ ranges, so the 3-bet range is much tighter
+        than HU (uses 4-bet range = QQ+/AKs/AKo for most positions).
+        Non-premium hands that would normally 3-bet heads-up should call
+        (if they flat well multiway) or fold.
+
+        Squeeze sizing is pot-raise to charge the cold-caller's equity.
+        """
+        # Premium squeeze range = position's 4-bet range (QQ+, AKs, AKo)
+        key_4b = f'{pos_key}_4b'
+        range_squeeze = self.ranges.get('4b', {}).get(key_4b, {})
+        if _is_in_range(combo, range_squeeze):
+            # Squeeze big — pot raise (or best available)
+            return self._best_raise(legal_actions)
+
+        # Multiway call range: hands that realize equity well multiway
+        # (pairs, suited broadways, suited connectors). Use rfi_call as
+        # the flat range — it's already a "good to call a raise" range.
+        call_range = self.ranges.get('rfi_call', {}).get(pos_key, {})
+        if _is_in_range(combo, call_range):
+            # Tighten further with more callers: 2+ callers = only pairs
+            # and suited broadways realize equity well enough.
+            if num_callers >= 2:
+                is_pair = len(combo) == 2
+                is_suited = combo.endswith('S')
+                if not (is_pair or is_suited):
+                    return FOLD if FOLD in legal_actions else CALL
             if CALL in legal_actions:
                 return CALL
 
