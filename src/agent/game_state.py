@@ -9,6 +9,8 @@ ACTION_RAISE_HALF = 2
 ACTION_RAISE_POT = 3
 ACTION_ALL_IN = 4
 ACTION_RAISE_MIN = 5
+# 6 reserved for fast_fold (agent-only, not a model output)
+ACTION_RAISE_THIRD = 7  # 1/3-pot bet
 
 ACTION_NAMES = {
     ACTION_FOLD: 'Fold',
@@ -17,9 +19,10 @@ ACTION_NAMES = {
     ACTION_RAISE_POT: 'Raise Pot',
     ACTION_ALL_IN: 'All-In',
     ACTION_RAISE_MIN: 'Raise Min',
+    ACTION_RAISE_THIRD: 'Raise 1/3 Pot',
 }
 
-NUM_ACTIONS = 6
+NUM_ACTIONS = 6   # model output width — new actions >=6 are agent-only overrides
 
 
 @dataclass

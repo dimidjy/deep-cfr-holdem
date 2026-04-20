@@ -5,13 +5,15 @@
   "training": {
     "num_iterations": 5000,
     "batch_size": 65536,
-    "learning_rate": 0.0003,
+    "learning_rate": 0.0001,
     "buffer_size": 10000000,
-    "traversals_per_iteration": 8000,
+    "traversals_per_iteration": 5000,
     "checkpoint_interval": 100,
-    "train_passes": 20,
+    "train_passes": 14,
     "gradient_clip": 1.0,
-    "lr_scheduler_t_max": 8000
+    "lr_scheduler_t_max": 8000,
+    "imitation_weight": 0.02,
+    "imitation_passes": 1
   },
   "network": {
     "hidden_layers": [384, 384, 192],
@@ -19,8 +21,19 @@
     "dropout": 0.1
   },
   "paths": {
-    "models": "models/deep_cfr_v10/",
+    "models": "models/v13/",
     "data": "data/",
     "logs": "data/logs/"
+  },
+  "opponent": {
+    "deck_reshuffle": true,
+    "bluff_penalty": 0.5,
+    "call_bonus": 0.05,
+    "value_bonus": 0.15,
+    "fold_penalty": 0.1,
+    "allin_monster_rate": 0.1,
+    "allin_monster_threshold": 0.5,
+    "bluff_draw_exempt": true,
+    "draw_call_boost": 0.15
   }
 }

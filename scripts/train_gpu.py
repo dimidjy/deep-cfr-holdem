@@ -67,19 +67,26 @@ _ACT_SIZE          = None   # action space size
 
 # Opponent pool + preflop ranges
 _KBEST_POOL         = None  # [(label, [net_per_player])] — historical opponents
-_PREFLOP_RANGES     = None  # hero preflop range charts
-_OPP_PREFLOP_RANGES = None  # wider NL5 ranges for opponents (if --nl5-opponents)
+_PREFLOP_RANGES     = None  # hero preflop range charts (tight GTO)
+_OPP_PREFLOP_RANGES = None  # wider NL5 ranges — always used for opponents
 
 # Training modes (flags)
 _ARCHETYPE_MODE = False     # mixed archetype opponents (extends obs 50→55)
-_NL5_OPP_MODE   = False     # force NL5 population skew on all opponents
 _DECK_RESHUFFLE = False     # reshuffle undealt cards per branch rollout
 _BLUFF_PENALTY  = 0.0       # penalize raises with equity<threshold (value-only nudge)
 _BLUFF_THRESHOLD = 0.60     # equity below this counts as "bluff" — was 0.50, raised
                             # so marginal spots (e.g. 42% 3-way) get meaningful penalty
 _CALL_BONUS     = 0.0       # reward +EV calls (equity > pot_odds_required)
-_VALUE_BONUS    = 0.0       # reward raises with strong equity when checked to
+_VALUE_BONUS    = 0.0       # reward raises with strong equity (any position)
 _VALUE_THRESHOLD = 0.70     # equity above this counts as "value push" territory
+_FOLD_PENALTY   = 0.0       # penalize folding when equity beats pot-odds required
+                            # (symmetric counterpart to _BLUFF_PENALTY)
+_FOLD_MARGIN    = 0.15      # must be this many % above required equity to penalize
+_BLUFF_DRAW_EXEMPT = True   # skip bluff penalty for flush draws / OESD / gutshot+overcards
+_DRAW_CALL_BOOST   = 0.0    # extra call-reward bonus when strong draw + small bet (≤½ pot)
+_ALLIN_MONSTER_RATE      = 0.0    # prob. opponent with monster hand auto-shoves
+_ALLIN_MONSTER_THRESHOLD = 0.375  # made_hand_cat cutoff (0.375=trips, 0.5=straight,
+                                  # 0.625=flush, 0.75=full house)
 
 # Engine pool — per-worker reuse to avoid env teardown on every branch
 _ENGINE_POOL = []
@@ -100,31 +107,37 @@ def _return_engine(eng):
 
 def _worker_init(shared_adv, shared_strat, act_size, use_preflop_ranges=False,
                  archetype_mode=False, kbest_pool=None, equity_model_path=None,
-                 nl5_opp_mode=False, deck_reshuffle=False, bluff_penalty=0.0,
-                 call_bonus=0.0, value_bonus=0.0):
+                 deck_reshuffle=False, bluff_penalty=0.0,
+                 call_bonus=0.0, value_bonus=0.0, fold_penalty=0.0,
+                 allin_monster_rate=0.0, allin_monster_threshold=0.375,
+                 bluff_draw_exempt=True, draw_call_boost=0.0):
     global _SHARED_ADV_NETS, _SHARED_STRAT_NETS, _ACT_SIZE, _PREFLOP_RANGES
-    global _ARCHETYPE_MODE, _KBEST_POOL, _OPP_PREFLOP_RANGES, _NL5_OPP_MODE
-    global _DECK_RESHUFFLE, _BLUFF_PENALTY, _CALL_BONUS, _VALUE_BONUS
+    global _ARCHETYPE_MODE, _KBEST_POOL, _OPP_PREFLOP_RANGES
+    global _DECK_RESHUFFLE, _BLUFF_PENALTY, _CALL_BONUS, _VALUE_BONUS, _FOLD_PENALTY
+    global _ALLIN_MONSTER_RATE, _ALLIN_MONSTER_THRESHOLD
+    global _BLUFF_DRAW_EXEMPT, _DRAW_CALL_BOOST
     _SHARED_ADV_NETS  = shared_adv
     _SHARED_STRAT_NETS = shared_strat
     _ACT_SIZE          = act_size
     _ARCHETYPE_MODE    = archetype_mode
     _KBEST_POOL        = kbest_pool
-    _NL5_OPP_MODE      = nl5_opp_mode
     _DECK_RESHUFFLE    = deck_reshuffle
     _BLUFF_PENALTY     = bluff_penalty
     _CALL_BONUS        = call_bonus
     _VALUE_BONUS       = value_bonus
+    _FOLD_PENALTY      = fold_penalty
+    _ALLIN_MONSTER_RATE      = allin_monster_rate
+    _ALLIN_MONSTER_THRESHOLD = allin_monster_threshold
+    _BLUFF_DRAW_EXEMPT = bluff_draw_exempt
+    _DRAW_CALL_BOOST   = draw_call_boost
     if use_preflop_ranges:
         from src.preflop_ranges import PreflopRanges
+        from pathlib import Path
         _PREFLOP_RANGES = PreflopRanges()
-        # Load wider NL5 preflop ranges for opponents
-        if nl5_opp_mode:
-            from pathlib import Path
-            nl5_path = str(Path(__file__).parent.parent / 'configs' / 'preflop_ranges_nl5.json')
-            _OPP_PREFLOP_RANGES = PreflopRanges(ranges_path=nl5_path)
-        else:
-            _OPP_PREFLOP_RANGES = _PREFLOP_RANGES
+        # Opponents always get the wider NL5 preflop ranges so they play
+        # a realistic NL5-population distribution preflop (hero stays GTO).
+        nl5_path = str(Path(__file__).parent.parent / 'configs' / 'preflop_ranges_nl5.json')
+        _OPP_PREFLOP_RANGES = PreflopRanges(ranges_path=nl5_path)
     else:
         _PREFLOP_RANGES = None
         _OPP_PREFLOP_RANGES = None
@@ -234,21 +247,9 @@ def _select_phase_opponent(current_iter, kbest_pool):
     Phase 1 (iters 1..PHASE1_END):     random opponents, high exploration
     Phase 2 (iters PHASE1_END+1..PHASE2_END):  self-play vs advantage net
     Phase 3 (PHASE2_END+1..):           mixed 70% K-Best pool / 30% self-play
-
-    NL5 mode overrides Phase 2+: always uses K-Best pool (if seeded) with
-    NL5 skew applied at pick_opponent_action time. Prevents co-adaptation
-    collapse into check-check-showdown equilibrium.
     """
     if current_iter <= PHASE1_END:
         return 0.10, None  # random actions
-
-    if _NL5_OPP_MODE:
-        eps = max(0.05, 0.08 * (1.0 - (current_iter - PHASE1_END) / 3000))
-        if kbest_pool:
-            _, opp_nets = kbest_pool[np.random.randint(len(kbest_pool))]
-        else:
-            opp_nets = _SHARED_STRAT_NETS  # fallback if no pool
-        return eps, opp_nets
 
     if current_iter <= PHASE2_END:
         # Deep CFR paper: opponents play current iteration's strategy (advantage net),
@@ -264,7 +265,7 @@ def _select_phase_opponent(current_iter, kbest_pool):
 
 
 def _create_worker_pool(num_workers, shared_adv, shared_strat, act_size,
-                        args, kbest_pool, eq_path, nl5_opp):
+                        args, kbest_pool, eq_path):
     """Spawn a worker Pool wired with all current training state.
 
     Used both for initial pool creation and after K-Best updates (which
@@ -275,9 +276,13 @@ def _create_worker_pool(num_workers, shared_adv, shared_strat, act_size,
         initargs=(shared_adv, shared_strat, act_size,
                   args.preflop_ranges, args.archetype_mode,
                   kbest_pool if kbest_pool else None,
-                  eq_path, nl5_opp, args.deck_reshuffle,
+                  eq_path, args.deck_reshuffle,
                   args.bluff_penalty, args.call_bonus,
-                  args.value_bonus),
+                  args.value_bonus, args.fold_penalty,
+                  args.allin_monster_rate,
+                  args.allin_monster_threshold,
+                  args.bluff_draw_exempt,
+                  args.draw_call_boost),
     )
 
 
@@ -311,9 +316,20 @@ def _traversal_worker(args):
         archetype_profile = get_archetype_profile(arch_name)
 
     def _pick_opponent_action(ai, obs, legal, eng=None, is_preflop=False):
+        # Monster all-in override — postflop only, value-heavy teaching signal.
+        # obs[19] = made_hand_cat (0.375=trips, 0.5=straight, 0.625=flush, 0.75=FH).
+        # Forces opponent to shove with strong made hands so hero's regret for
+        # calling big bets is shaped by a realistic value-heavy shove range,
+        # instead of Nash-balanced (which includes too many bluffs for NL5).
+        if (not is_preflop and _ALLIN_MONSTER_RATE > 0.0 and 4 in legal
+                and len(obs) > 19):
+            if (float(obs[19]) >= _ALLIN_MONSTER_THRESHOLD
+                    and np.random.random() < _ALLIN_MONSTER_RATE):
+                return 4  # ALL_IN
+
         # Preflop override for opponents — use NL5 ranges if in nl5 mode
         if is_preflop and _PREFLOP_RANGES is not None and eng is not None:
-            opp_ranges = _OPP_PREFLOP_RANGES if _OPP_PREFLOP_RANGES else _PREFLOP_RANGES
+            opp_ranges = _OPP_PREFLOP_RANGES or _PREFLOP_RANGES
             cards, rel_pos, pot_bb = _get_preflop_info(eng, ai, num_players)
             if cards and len(cards) >= 2:
                 strat = opp_ranges.get_strategy(
@@ -333,10 +349,7 @@ def _traversal_worker(args):
             # σ(I,a) = max(0, R(I,a)) / Σ max(0, R(I,a'))
             strat = _regret_match(adv, legal, epsilon=epsilon)
             # Apply archetype skew if configured
-            if _NL5_OPP_MODE and archetype_skew_fn is None:
-                from src.archetypes import nl5_population_skew
-                strat = nl5_population_skew(strat, legal)
-            elif archetype_skew_fn is not None:
+            if archetype_skew_fn is not None:
                 strat = archetype_skew_fn(strat, legal)
             lp = strat[legal].copy()
             s = lp.sum()
@@ -379,7 +392,8 @@ def _traversal_worker(args):
         return eng
 
     def _branch_exact(history, legal_int, n_samples=3, n_visible_public=0,
-                      hero_equity=None, pot_chips=None, pot_odds=None):
+                      hero_equity=None, pot_chips=None, pot_odds=None,
+                      obs=None):
         """Branch all legal actions, average n_samples rollouts to reduce variance.
 
         With _DECK_RESHUFFLE on, each rollout uses an independent reshuffle of
@@ -391,10 +405,26 @@ def _traversal_worker(args):
         (raised from 0.50 so marginal spots like 42% equity 3-way get penalized).
         This shifts the Nash equilibrium toward value-only play.
 
+        With _BLUFF_DRAW_EXEMPT on, strong semi-bluff draws are exempted from the
+        bluff penalty (legitimate semi-bluff raises shouldn't be punished):
+          - flush draw: obs[20] >= 0.99 (hero has both of board's dominant suit)
+          - straight draw with overcards: obs[21] >= 0.49 AND made_hand_cat < 0.01
+            (covers OESD+overcards and gutshot+overcards; bare gutshots with a
+            pair don't qualify — their equity is already too low to semi-bluff)
+          NB: obs[21] encodes OESD and gutshot identically as 0.5; the made_hand
+          filter approximates "has overcards" since pure high card + straight
+          draw means at least one hole card exceeds the board.
+
         With _CALL_BONUS > 0, the call action reward gets a bonus proportional
         to how much equity exceeds pot odds (i.e. the call is +EV in a vacuum).
         Counterbalances the bluff penalty so defender doesn't drift too nitty,
         which would otherwise inflate fold equity for the aggressor.
+
+        With _DRAW_CALL_BOOST > 0, an additional CALL bonus fires when hero has
+        a strong draw (same definition as bluff exemption) AND pot_odds >= 0.75
+        (= facing ≤ half-pot bet). Bonus = pot_chips * _DRAW_CALL_BOOST. Fixes
+        the "fold draws to small bets" failure mode where CFR regrets don't
+        accumulate enough call signal for drawing hands.
 
         With _VALUE_BONUS > 0, raise-action rewards get a bonus when equity is
         above _VALUE_THRESHOLD AND hero is checked-to (pot_odds == 0). Fixes the
@@ -406,10 +436,23 @@ def _traversal_worker(args):
         """
         results = {}
 
+        # Detect strong semi-bluff draws (exempt bluff penalty + boost call).
+        has_flush_draw = False
+        has_straight_draw_with_overcards = False
+        if obs is not None and len(obs) > 21:
+            flush_part = float(obs[20])
+            straight_part = float(obs[21])
+            made_hand_cat = float(obs[19]) if len(obs) > 19 else 1.0
+            has_flush_draw = flush_part >= 0.99
+            has_straight_draw_with_overcards = (
+                straight_part >= 0.49 and made_hand_cat < 0.01)
+        is_strong_draw = has_flush_draw or has_straight_draw_with_overcards
+
         bluff_penalty_chips = 0.0
         if _BLUFF_PENALTY > 0 and hero_equity is not None and pot_chips is not None:
-            deficit = max(0.0, _BLUFF_THRESHOLD - float(hero_equity))
-            bluff_penalty_chips = deficit * float(pot_chips) * _BLUFF_PENALTY
+            if not (_BLUFF_DRAW_EXEMPT and is_strong_draw):
+                deficit = max(0.0, _BLUFF_THRESHOLD - float(hero_equity))
+                bluff_penalty_chips = deficit * float(pot_chips) * _BLUFF_PENALTY
 
         # Call bonus: reward +EV calls (equity > required pot-odds equity).
         # post_call_pot = pot + call = pot / pot_odds (rearranged from obs formula).
@@ -422,16 +465,48 @@ def _traversal_worker(args):
             post_call_pot = float(pot_chips) / max(po, 1e-6)
             call_bonus_chips = excess * post_call_pot * _CALL_BONUS
 
-        # Value bonus: reward raising with strong equity when checked-to.
-        # Only when facing no bet (pot_odds == 0) — otherwise this would boost
-        # 3-bet bluffs, which is not what we want.
+        # Draw call boost: extra reward for calling small bets (≤ ½ pot) with
+        # a strong draw. pot_odds >= 0.75 ↔ call ≤ ½ pot.
+        draw_call_boost_chips = 0.0
+        if (_DRAW_CALL_BOOST > 0 and is_strong_draw
+                and pot_chips is not None and pot_odds is not None
+                and float(pot_odds) >= 0.75):
+            draw_call_boost_chips = float(pot_chips) * _DRAW_CALL_BOOST
+
+        # Value bonus: reward raising with strong equity.
+        # Previously only fired when checked-to (pot_odds == 0). Now fires
+        # anywhere equity is strong — addresses the "KK facing bet, model won't
+        # raise" failure mode where overpair value-raises were not incentivized.
         value_bonus_chips = 0.0
-        if (_VALUE_BONUS > 0 and hero_equity is not None and pot_chips is not None
-                and pot_odds is not None and float(pot_odds) == 0.0):
+        if (_VALUE_BONUS > 0 and hero_equity is not None and pot_chips is not None):
             excess = max(0.0, float(hero_equity) - _VALUE_THRESHOLD)
             value_bonus_chips = excess * float(pot_chips) * _VALUE_BONUS
 
+        # Fold penalty: punish folding when equity CLEARLY beats the pot-odds
+        # requirement. Symmetric to bluff_penalty. Prevents spots like folding
+        # KK vs small bet on dry board (77% equity, only 17% needed → mandatory
+        # call). Only fires when we're actually facing a bet (pot_odds > 0) AND
+        # the equity edge is at least _FOLD_MARGIN above required.
+        fold_penalty_chips = 0.0
+        if (_FOLD_PENALTY > 0 and hero_equity is not None and pot_chips is not None
+                and pot_odds is not None and float(pot_odds) > 0):
+            po = float(pot_odds)
+            required_eq = 1.0 - po
+            excess = float(hero_equity) - required_eq
+            if excess > _FOLD_MARGIN:
+                post_call_pot = float(pot_chips) / max(po, 1e-6)
+                fold_penalty_chips = excess * post_call_pot * _FOLD_PENALTY
+
+
+        # Seed NumPy RNG identically for each branch so opponent stochasticity
+        # (monster-shove coin flip, regret-match action sampling, deck reshuffle)
+        # plays out the same across branches. This makes regret signal a pure
+        # action-effect — branch A and branch B see the same opponent decisions
+        # at matching rollout index, so variance from opponent randomness cancels.
+        saved_np_state = np.random.get_state()
+        branch_seed = int(np.random.randint(0, 2**31 - 1))
         for ba in legal_int:
+            np.random.seed(branch_seed)
             rewards = []
             for _ in range(n_samples):
                 init = (_reshuffled_init_state(pre_reset_game_rng, num_players, n_visible_public)
@@ -442,9 +517,15 @@ def _traversal_worker(args):
                 r -= bluff_penalty_chips
             if call_bonus_chips > 0 and ba == 1:
                 r += call_bonus_chips
+            if draw_call_boost_chips > 0 and ba == 1:
+                r += draw_call_boost_chips
             if value_bonus_chips > 0 and ba >= 2:
                 r += value_bonus_chips
+            if fold_penalty_chips > 0 and ba == 0:
+                r -= fold_penalty_chips
             results[ba] = r
+        # Restore global RNG state so traversal-level randomness continues unaffected
+        np.random.set_state(saved_np_state)
         return results
 
     def _strategy_for(obs, legal_int):
@@ -549,7 +630,8 @@ def _traversal_worker(args):
                                     n_visible_public=first_n_public,
                                     hero_equity=float(first_obs[18]),
                                     pot_chips=first_pot_chips,
-                                    pot_odds=float(first_obs[10]))
+                                    pot_odds=float(first_obs[10]),
+                                    obs=first_obs)
 
     if _PREFLOP_RANGES is not None:
         # Use range chart for preflop strategy (both for action selection
@@ -567,7 +649,12 @@ def _traversal_worker(args):
     else:
         strategy = _strategy_for(first_obs, first_legal)
 
-    all_steps += _make_steps(first_obs, first_legal, branch_rewards, strategy)
+    # Skip preflop from training buffer when preflop is locked to ranges.
+    # The range chart fully determines preflop play, so model doesn't need to
+    # learn preflop. Avoids equity=0 shaper contamination + frees buffer
+    # capacity for postflop samples (where the model actually drives decisions).
+    if _PREFLOP_RANGES is None:
+        all_steps += _make_steps(first_obs, first_legal, branch_rewards, strategy)
 
     lp = strategy[first_legal].copy(); lp /= lp.sum()
     history.append(int(np.random.choice(first_legal, p=lp)))
@@ -591,7 +678,8 @@ def _traversal_worker(args):
                                             n_visible_public=n_pub,
                                             hero_equity=float(obs[18]),
                                             pot_chips=eng.get_pot_size(),
-                                            pot_odds=float(obs[10]))
+                                            pot_odds=float(obs[10]),
+                                            obs=obs)
 
             if is_pf:
                 # Still preflop (e.g. facing 3bet after our open) — use range override
@@ -604,7 +692,10 @@ def _traversal_worker(args):
             else:
                 strategy = _strategy_for(obs.copy(), legal_int)
 
-            all_steps += _make_steps(obs.copy(), legal_int, branch_rewards, strategy)
+            # Skip preflop samples from training — ranges handle preflop play.
+            # Model only learns postflop. Avoids equity=0 shaper contamination.
+            if not is_pf:
+                all_steps += _make_steps(obs.copy(), legal_int, branch_rewards, strategy)
 
             lp = strategy[legal_int].copy(); lp /= lp.sum()
             action = int(np.random.choice(legal_int, p=lp))
@@ -872,6 +963,13 @@ def _selfplay_eval_stats(deep_cfr_ref, num_players, num_hands, eq_path):
 # ---------------------------------------------------------------------------
 
 def main():
+    # Load config first so its values can serve as argparse defaults.
+    # CLI flags still override config — this just means `--bluff-penalty 0.6`
+    # in the config takes effect without needing to pass it every run.
+    config_path = Path(__file__).parent.parent / 'configs/training_config.json'
+    config = load_config(str(config_path))
+    opp = config.get('opponent', {})
+
     parser = argparse.ArgumentParser(description='Deep CFR — multi-core CPU traversal + GPU training')
     parser.add_argument('--resume',  type=str,   default=None, help='Checkpoint to resume from')
     parser.add_argument('--warm-start', type=str, default=None,
@@ -886,41 +984,53 @@ def main():
     parser.add_argument('--archetype-mode', action='store_true',
                         help='Mixed archetype opponent training (extends obs to 55 dims)')
     parser.add_argument('--deck-reshuffle', action='store_true',
+                        default=bool(opp.get('deck_reshuffle', False)),
                         help='Reshuffle undealt cards per branch rollout (variance reduction). '
-                             'Each branch gets independent turn/river — Steinberger MultiOutcomeSampler trick.')
-    parser.add_argument('--bluff-penalty', type=float, default=0.0,
+                             'Each branch gets independent turn/river — Steinberger MultiOutcomeSampler trick. '
+                             'Config default: opponent.deck_reshuffle.')
+    parser.add_argument('--no-deck-reshuffle', action='store_false', dest='deck_reshuffle',
+                        help='Disable --deck-reshuffle when config has it on.')
+    parser.add_argument('--bluff-penalty', type=float,
+                        default=float(opp.get('bluff_penalty', 0.0)),
                         help='Penalty coefficient for raising with equity < 0.60 threshold. '
                              '0 = off, 0.6 = soft (allows semi-bluffs), 1.0 = medium, '
-                             '1.5 = strong value-lean. Applied to raise-action rewards as '
-                             '(0.60 - equity) * pot * coefficient. Threshold raised from '
-                             '0.50 so marginal spots like 42%% 3-way get meaningful penalty.')
-    parser.add_argument('--call-bonus', type=float, default=0.0,
+                             '1.5 = strong value-lean. Config default: opponent.bluff_penalty.')
+    parser.add_argument('--call-bonus', type=float,
+                        default=float(opp.get('call_bonus', 0.0)),
                         help='Bonus coefficient for +EV calls (equity > required pot-odds '
-                             'equity). 0 = off, 0.3 = soft, 0.6 = medium. Applied to call '
-                             'action reward as max(0, equity - (1-pot_odds)) * (pot+call) * '
-                             'coefficient. Symmetric to --bluff-penalty — use together so the '
-                             'defender doesn\'t drift too nitty when penalty cuts raising.')
-    parser.add_argument('--value-bonus', type=float, default=0.0,
-                        help='Bonus coefficient for raising with strong equity when checked to. '
+                             'equity). 0 = off, 0.3 = soft, 0.6 = medium. '
+                             'Config default: opponent.call_bonus.')
+    parser.add_argument('--value-bonus', type=float,
+                        default=float(opp.get('value_bonus', 0.0)),
+                        help='Bonus coefficient for raising with strong equity '
+                             '(any position, facing bet OR checked-to). '
                              '0 = off, 0.3 = soft, 0.5 = medium, 1.0 = strong value push. '
-                             'Applied to raise-action rewards as max(0, equity - 0.70) * pot * '
-                             'coefficient. Only when pot_odds==0 (hero facing no bet). Fixes '
-                             'the under-betting equilibrium where self-play makes bet and check '
-                             'look equal-EV for strong hands.')
-    parser.add_argument('--imitation-weight', type=float, default=0.0,
+                             'Config default: opponent.value_bonus.')
+    parser.add_argument('--fold-penalty', type=float,
+                        default=float(opp.get('fold_penalty', 0.0)),
+                        help='Penalty coefficient for folding when equity clearly '
+                             'beats pot odds (excess > 15%). Symmetric to --bluff-penalty. '
+                             '0 = off, 0.3 = soft, 0.5 = medium, 1.0 = strong. '
+                             'Prevents folding overpairs / big equity edges vs bets. '
+                             'Config default: opponent.fold_penalty.')
+    parser.add_argument('--imitation-weight', type=float,
+                        default=float(config.get('training', {}).get('imitation_weight', 0.0)),
                         help='Weight for supervised imitation loss on annotated spots. '
                              '0 = off, 0.1 = light nudge, 0.3 = medium, 0.5 = strong. '
                              'Loads logs/action_debug/*.json with right_action set and '
                              'pushes strategy network to match them via cross-entropy loss. '
                              'Applied every iteration after CFR training. Works with 80+ '
-                             'annotated spots — more is better.')
+                             'annotated spots — more is better. '
+                             'Config default: training.imitation_weight.')
     parser.add_argument('--imitation-spots-dir', type=str, default='logs/action_debug',
                         help='Directory with annotated spot JSONs (default: logs/action_debug)')
     parser.add_argument('--imitation-batch-size', type=int, default=64,
                         help='Batch size for imitation pass (default: 64). Smaller than CFR '
                              'batch since the annotated dataset is small.')
-    parser.add_argument('--imitation-passes', type=int, default=3,
-                        help='Gradient steps per iteration on imitation batches (default: 3)')
+    parser.add_argument('--imitation-passes', type=int,
+                        default=int(config.get('training', {}).get('imitation_passes', 3)),
+                        help='Gradient steps per iteration on imitation batches. '
+                             'Config default: training.imitation_passes.')
     parser.add_argument('--fine-tune-from', type=str, default=None,
                         help='Base checkpoint to fine-tune from (extends obs 50→55, lower LR)')
     parser.add_argument('--kbest-seed', type=str, nargs='+', default=None,
@@ -933,9 +1043,33 @@ def main():
                         help='Max rake in chips per hand (default: 6 = 3BB)')
     parser.add_argument('--equity-model', type=str, default=None,
                         help='Path to GPU equity model (.pt) to replace Monte Carlo')
-    parser.add_argument('--nl5-opponents', action='store_true',
-                        help='Opponents use NL5 population behavior: wider preflop ranges + '
-                             'passive postflop skew (less folding, more calling, less raising)')
+    parser.add_argument('--allin-monster-rate', type=float,
+                        default=float(opp.get('allin_monster_rate', 0.0)),
+                        help='Probability an opponent with a monster made hand auto-shoves '
+                             '(postflop only, requires ALL_IN in legal actions). 0 = off, '
+                             '0.3 = occasional, 0.5 = often, 1.0 = always. Teaches hero to '
+                             'respect big bets — counters the MDF-call tendency on bluff-catch '
+                             'spots by making opponent shoves value-heavy in the training distribution. '
+                             'Config default: opponent.allin_monster_rate.')
+    parser.add_argument('--allin-monster-threshold', type=float,
+                        default=float(opp.get('allin_monster_threshold', 0.375)),
+                        help='made_hand_cat cutoff for "monster". 0.375=trips+, 0.5=straight+, '
+                             '0.625=flush+, 0.75=full-house+. Only used when --allin-monster-rate > 0. '
+                             'Config default: opponent.allin_monster_threshold.')
+    parser.add_argument('--bluff-draw-exempt', action='store_true',
+                        default=bool(opp.get('bluff_draw_exempt', True)),
+                        help='Exempt strong semi-bluff draws from bluff penalty '
+                             '(flush draw, OESD+overcards, gutshot+overcards). '
+                             'Config default: opponent.bluff_draw_exempt.')
+    parser.add_argument('--no-bluff-draw-exempt', action='store_false',
+                        dest='bluff_draw_exempt',
+                        help='Disable --bluff-draw-exempt when config has it on.')
+    parser.add_argument('--draw-call-boost', type=float,
+                        default=float(opp.get('draw_call_boost', 0.0)),
+                        help='Extra CALL reward bonus when hero has strong draw + '
+                             'facing ≤½ pot bet. 0 = off, 0.15 = soft, 0.3 = moderate, '
+                             '0.5 = strong. Fixes "fold draws to small bets" failure. '
+                             'Config default: opponent.draw_call_boost.')
     args = parser.parse_args()
 
     if args.no_preflop_ranges:
@@ -943,9 +1077,6 @@ def main():
     # --fine-tune-from implies --archetype-mode
     if args.fine_tune_from:
         args.archetype_mode = True
-
-    config_path = Path(__file__).parent.parent / 'configs/training_config.json'
-    config = load_config(str(config_path))
 
     device      = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
     num_workers = args.workers or max(1, mp.cpu_count() - 1)
@@ -976,8 +1107,8 @@ def main():
         print(f'  rake     : {args.rake*100:.1f}% (cap {args.rake_cap:.0f} chips = {args.rake_cap/2:.1f}BB)')
     if args.archetype_mode:
         print(f'  archetype: ON (mixed opponent training)')
-    if args.nl5_opponents:
-        print(f'  nl5-opp  : ON (NL5 preflop ranges + passive postflop skew)')
+    if args.preflop_ranges:
+        print(f'  opp-pf   : NL5 ranges (configs/preflop_ranges_nl5.json)')
     if args.fine_tune_from:
         print(f'  fine-tune: {Path(args.fine_tune_from).name}')
     if args.warm_start:
@@ -1175,12 +1306,15 @@ def main():
               f'{", ".join(l for l, _ in kbest_pool)}')
 
     _eq_path = args.equity_model if args.equity_model else None
-    _nl5_opp = getattr(args, 'nl5_opponents', False)
     pool = _create_worker_pool(num_workers, shared_adv_nets, shared_strat_nets,
-                                act_size, args, kbest_pool, _eq_path, _nl5_opp)
+                                act_size, args, kbest_pool, _eq_path)
     print(f'Workers ready. deck_reshuffle={args.deck_reshuffle} '
           f'bluff_penalty={args.bluff_penalty} call_bonus={args.call_bonus} '
-          f'value_bonus={args.value_bonus}\n')
+          f'value_bonus={args.value_bonus} fold_penalty={args.fold_penalty} '
+          f'allin_monster_rate={args.allin_monster_rate} '
+          f'allin_monster_threshold={args.allin_monster_threshold} '
+          f'bluff_draw_exempt={args.bluff_draw_exempt} '
+          f'draw_call_boost={args.draw_call_boost}\n')
 
     _adv_hist   = deque(maxlen=10)
     _strat_hist = deque(maxlen=10)
@@ -1360,11 +1494,14 @@ def main():
                 warmup_tag = ''
 
             if effective_passes > 0:
-                # Reinitialize advantage networks from scratch every 10 iterations.
-                # Paper-correct version is per-iteration; relaxing to every 10 keeps
-                # the bias-prevention effect while letting each network actually
-                # converge on the buffer between resets.
-                if iter_num % 10 == 0:
+                # Reinitialize advantage networks from scratch every 50 iterations.
+                # Paper-correct version is per-iteration; relaxed to every 50 so the
+                # adv net has time to fully converge between resets. With shapers
+                # active + K-Best pool opponents, more frequent resets left the
+                # adv net mid-convergence when traversals sampled strategies,
+                # filling the buffer with inconsistent targets and causing strat
+                # loss to climb.
+                if iter_num % 50 == 0:
                     deep_cfr.reinitialize_advantage_networks()
                 print(f'Iter {iter_num:4d}  training...        ', end='\r', flush=True)
             deep_cfr.replay_buffer.rebuild_indices()
@@ -1451,8 +1588,8 @@ def main():
                 _batch_trav.clear()
                 _batch_train.clear()
 
-            # ── K-Best pool update (skip in NL5 mode — no pool used) ─────
-            if iter_num % 100 == 0 and iter_num > 1600 and not _nl5_opp:
+            # ── K-Best pool update ───────────────────────────────────────
+            if iter_num % 100 == 0 and iter_num > 1600:
                 try:
                     pool_nets = []
                     for net in deep_cfr.strategy_networks:
@@ -1471,7 +1608,7 @@ def main():
                     pool.join()
                     pool = _create_worker_pool(num_workers, shared_adv_nets,
                                                shared_strat_nets, act_size,
-                                               args, kbest_pool, _eq_path, _nl5_opp)
+                                               args, kbest_pool, _eq_path)
                     pool_labels = ', '.join(l for l, _ in kbest_pool)
                     print(f'  K-Best pool updated: [{pool_labels}]')
                 except Exception as e:
@@ -1486,6 +1623,23 @@ def main():
                         'config': config['training']}
                 with open(ckpt.replace('.pt', '_metadata.json'), 'w') as f:
                     json.dump(meta, f, indent=2)
+
+                # Also save buffer so resume can pick up where training left off.
+                # Matches the name pattern validate_vs_hh / train_gpu expect
+                # (checkpoint_iter_N_buffer.npz). Only keep the LATEST buffer to
+                # avoid filling disk — old buffer files are deleted.
+                buf_path = ckpt.replace('.pt', '_buffer.npz')
+                try:
+                    deep_cfr.replay_buffer.save(buf_path)
+                    # Remove older buffer files (keep only the latest)
+                    for old_buf in models_dir.glob('checkpoint_iter_*_buffer.npz'):
+                        if str(old_buf) != buf_path:
+                            try:
+                                old_buf.unlink()
+                            except OSError:
+                                pass
+                except Exception as e:
+                    print(f'  [buffer save warning: {e}]')
 
             # ── Self-play + validation every EVAL_INTERVAL iters ────────────
             if iter_num % EVAL_INTERVAL == 0:

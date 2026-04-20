@@ -56,6 +56,7 @@ IDX_BOARD_FLUSH = 24    # obs[24] = board_flush_texture
 IDX_RANK_WITHIN_CAT = 26  # obs[26] = hand_rank_within_cat (0=worst..1=best in category)
 IDX_STACK_TO_POT = 9    # obs[9]  = effective_stack / pot (SPR)
 IDX_IS_RIVER = 30       # obs[30] = is_river flag
+IDX_HIGH_CARD = 13      # obs[13] = high_card_norm ((hi-2)/12, A=1.0, J≈0.75)
 
 # Made hand categories
 HAND_HIGH_CARD = 0.0
@@ -74,10 +75,13 @@ RAISE_HALF = 2
 RAISE_POT = 3
 ALL_IN = 4
 RAISE_MIN = 5
+# 6 reserved for fast_fold (agent pre-turn fold, not a normal action)
+RAISE_THIRD = 7  # 1/3-pot bet
 
 NUM_ACTIONS = 6  # model outputs 5 (0-4), action 5 only used by preflop ranges
 
-ACTION_NAMES = ['Fold', 'Call', 'RaiseHalf', 'RaisePot', 'AllIn', 'RaiseMin']
+ACTION_NAMES = ['Fold', 'Call', 'RaiseHalf', 'RaisePot', 'AllIn', 'RaiseMin',
+                'FastFold', 'RaiseThird']
 
 # 3bet pot threshold
 _3BET_POT_BB = 12
@@ -134,6 +138,14 @@ class DecisionConfig:
 
     # Sampling
     raise_randomize: bool = True  # 80/20 raise size randomization
+    mix_raise_sizes: bool = True  # when top-2 are Raise½ + RaisePot, sample
+                                  # between them proportional to their probs
+                                  # (e.g. 30%/40% → pick half 43%, pot 57%)
+    bet_over_check: bool = True   # when argmax is Check/Call but
+                                  # (Raise½ + RaisePot) > Check, override to
+                                  # a small bet (Raise½) — "trust the model
+                                  # that betting is correct when combined
+                                  # raise probability beats check"
 
     # Model temperature (used when loading, not at inference)
     temperature: float = 1.0
@@ -595,7 +607,7 @@ class DecisionEngine:
         """
         strategy = self.get_strategy(ctx)
         strategy_list = [float(strategy[i]) for i in range(NUM_ACTIONS)]
-        action = self._sample_action(strategy_list, ctx.legal_actions)
+        action = self._sample_action(strategy_list, ctx.legal_actions, ctx.obs)
         return action, strategy_list
 
     # ── Model routing ────────────────────────────────────────────────────
@@ -724,23 +736,98 @@ class DecisionEngine:
     # ── Action sampling ──────────────────────────────────────────────────
 
     def _sample_action(self, strategy: List[float],
-                        legal_actions: List[int]) -> int:
-        """Argmax with optional 80/20 raise randomization."""
+                        legal_actions: List[int],
+                        obs: Optional[np.ndarray] = None) -> int:
+        """Pick an action from model output.
+
+        Default: argmax.
+
+        With `mix_raise_sizes`: when the top 2 actions are Raise½ (2) and
+        RaisePot (3), sample between them proportional to their probabilities.
+        E.g., strategy [30% half, 40% pot] → pick half 43% of hands, pot 57%.
+        This preserves CFR's mixed-strategy intent for raise-sizing spots.
+
+        With `raise_randomize`: additional 80/20 randomization among all raise
+        sizes (legacy behavior).
+
+        With `bet_over_check`: if `obs` provided, converts Check to small bet
+        when model wants to bet (split across sizes) AND hand has semi-bluff
+        equity (draws) or overcard air. Without `obs`, override is skipped.
+        """
+        # Safely pull probability even if action index exceeds strategy length
+        # (happens for agent-side overrides like RaiseThird=7 that the model
+        # doesn't output — treat as probability 0)
+        def _prob(a: int) -> float:
+            return strategy[a] if 0 <= a < len(strategy) else 0.0
+
         best_action = legal_actions[0]
         best_prob = -1.0
         for a in legal_actions:
-            if strategy[a] > best_prob:
-                best_prob = strategy[a]
+            if _prob(a) > best_prob:
+                best_prob = _prob(a)
                 best_action = a
+
+        # ── Check → Bet override ─────────────────────────────────────────
+        # When argmax is Check/Call (action 1) but the COMBINED probability
+        # of Raise½ + RaisePot exceeds Check's probability, the model actually
+        # prefers betting (just split across two sizes). Override to a small bet
+        # — but only for hands with semi-bluff equity (flush/straight draw) or
+        # air with strong overcards. Without this filter, marginal made hands
+        # (middle pair etc.) get small-bet-spewed where checking is correct.
+        # Prefer RaiseThird (1/3 pot), fall back to RaiseMin
+        # (~2BB), then Raise½ if neither available.
+        if (self.config.bet_over_check
+                and best_action == CALL
+                and RAISE_HALF in legal_actions
+                and RAISE_POT in legal_actions
+                and obs is not None
+                and len(obs) > IDX_STRAIGHT_DRAW):
+            combined_raise = strategy[RAISE_HALF] + strategy[RAISE_POT]
+            if combined_raise > strategy[CALL]:
+                has_flush_draw = float(obs[IDX_FLUSH_DRAW]) > 0.0
+                has_straight_draw = float(obs[IDX_STRAIGHT_DRAW]) > 0.0
+                made_hand = float(obs[IDX_MADE_HAND])
+                high_card = float(obs[IDX_HIGH_CARD]) if len(obs) > IDX_HIGH_CARD else 0.0
+                # Air with J+ high card = bluff candidate with backdoor equity
+                has_high_cards_air = (made_hand < HAND_ONE_PAIR - 0.01
+                                      and high_card >= 0.75)
+                if has_flush_draw or has_straight_draw or has_high_cards_air:
+                    if RAISE_THIRD in legal_actions:
+                        best_action = RAISE_THIRD
+                    elif RAISE_MIN in legal_actions:
+                        best_action = RAISE_MIN
+                    else:
+                        best_action = RAISE_HALF
+
+        # ── Raise-size mixing (Raise½ vs RaisePot) ───────────────────────
+        # When those two are the top 2 by probability, sample between them
+        # proportionally. Keeps model's mixed-strategy intent for sizing.
+        if (self.config.mix_raise_sizes
+                and RAISE_HALF in legal_actions
+                and RAISE_POT in legal_actions):
+            # Find the two largest probabilities among legal actions
+            # (use _prob to safely handle actions beyond strategy length)
+            legal_sorted = sorted(legal_actions, key=lambda a: -_prob(a))
+            if len(legal_sorted) >= 2:
+                top1, top2 = legal_sorted[0], legal_sorted[1]
+                top_pair = {top1, top2}
+                if top_pair == {RAISE_HALF, RAISE_POT}:
+                    p_half = _prob(RAISE_HALF)
+                    p_pot = _prob(RAISE_POT)
+                    total = p_half + p_pot
+                    if total > 0:
+                        best_action = (RAISE_HALF
+                                        if random.random() * total < p_half
+                                        else RAISE_POT)
 
         # 80% keep model's raise, 20% randomize among other raise sizes
         if self.config.raise_randomize and best_action >= RAISE_HALF:
             raise_actions = [a for a in legal_actions
-                             if a >= RAISE_HALF and strategy[a] > 0.01]
+                             if a >= RAISE_HALF and _prob(a) > 0.01]
             if len(raise_actions) > 1 and random.random() > 0.80:
                 others = [a for a in raise_actions if a != best_action]
                 if others:
-                    probs = [strategy[a] for a in others]
+                    probs = [_prob(a) for a in others]
                     total = sum(probs)
                     if total > 0:
                         r = random.random() * total
