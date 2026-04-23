@@ -17,10 +17,15 @@ import numpy as np
 
 # Position mapping: relative_pos → range key, per table size
 # rel_pos: 0=BTN, 1=SB, 2=BB, 3+=EP positions
+#
+# Short-handed adjustment: in 4-max and 5-max, the "first to act" position is
+# structurally UTG-equivalent (more players behind than 6-max CO). Map those
+# positions to the TIGHTEST 6-max EP range (LJ) so we don't over-open. Same
+# logic for 5-max: first-to-act → LJ (tight), second-to-act → HJ (medium).
 _POS_TO_RANGE_KEY_BY_PLAYERS = {
     6: {0: 'BTN', 1: 'SB', 2: 'BB', 3: 'LJ', 4: 'HJ', 5: 'CO'},
-    5: {0: 'BTN', 1: 'SB', 2: 'BB', 3: 'HJ', 4: 'CO'},
-    4: {0: 'BTN', 1: 'SB', 2: 'BB', 3: 'CO'},
+    5: {0: 'BTN', 1: 'SB', 2: 'BB', 3: 'LJ', 4: 'HJ'},
+    4: {0: 'BTN', 1: 'SB', 2: 'BB', 3: 'LJ'},
     3: {0: 'BTN', 1: 'SB', 2: 'BB'},
     2: {0: 'BTN', 1: 'BB'},
 }
@@ -112,7 +117,9 @@ class PreflopRanges:
             pot_bb: current pot size in big blinds
             legal_actions: list of legal action indices [0,1,2,3,4]
             num_limpers: number of players who limped before us
-            effective_stack: smallest relevant stack in BB
+            effective_stack: (unused) kept for API compatibility; preflop
+                logic now relies entirely on range charts regardless of
+                stack depth
             num_callers: number of cold-callers of the open (excludes opener)
 
         Returns:
@@ -124,10 +131,12 @@ class PreflopRanges:
         combo = _cards_to_combo(hole_cards[0], hole_cards[1])
         pos_key = self.pos_map.get(rel_pos, 'BTN')
 
-        # ── Short stack mode: <25BB → shove or fold with premium ──
-        if effective_stack < 25:
-            return self._short_stack_decision(combo, pos_key, legal_actions,
-                                               effective_stack)
+        # Preflop decisions are fully driven by range charts (hand + position +
+        # scenario). Stack depth is intentionally ignored — the ranges are the
+        # single source of truth. Previously a "short-stack override" (<25BB →
+        # push/fold) fired here, but it caused edge-case bugs when an opponent
+        # was already all-in (effective_stack collapsed to that opponent's
+        # committed amount, triggering shove-mode for non-shove spots).
 
         # Determine scenario based on pot size (in BB)
         if pot_bb < 4:
@@ -214,12 +223,10 @@ class PreflopRanges:
             range_3b = self.ranges.get('3b', {}).get(key_3b, {})
             is_premium = _is_in_range(combo, range_3b)
 
-            # SB non-premium: 40% just complete (out of position, avoid bloating pot)
-            if pos_key == 'SB' and not is_premium:
-                sb_def = self.ranges.get('SB_DEF', {}).get('SB_DEF_call', {})
-                if _is_in_range(combo, sb_def) and np.random.random() < 0.4:
-                    if CALL in legal_actions:
-                        return CALL
+            # Previously: SB non-premium had 40% complete (limp) logic here.
+            # Removed — at NL5 the exploit value of open-raising as SB vs
+            # passive BB outweighs the OOP pot-control benefit of completing.
+            # Net effect: SB opens its full RFI range → PFR up, VPIP gap down.
 
             rng = np.random.random()
             if is_premium:
@@ -369,55 +376,6 @@ class PreflopRanges:
                     if fb in legal_actions:
                         return fb
             return action
-
-        return FOLD if FOLD in legal_actions else CALL
-
-    def _short_stack_decision(self, combo: str, pos_key: str,
-                              legal_actions: List[int],
-                              effective_stack: float) -> int:
-        """Short stack (<25BB): push/fold strategy.
-
-        With short stacks, raising small is bad (committed anyway).
-        Either shove all-in or fold.
-        """
-        # Very short (<10BB): shove wider
-        if effective_stack < 10:
-            # Shove range: any pair, Ax, Kx suited, broadways
-            r1 = _RANK_ORDER.index(combo[0]) if combo[0] in _RANK_ORDER else 0
-            is_pair = len(combo) == 2 and combo[0] == combo[1]
-            has_ace = combo[0] == 'A'
-            has_king = combo[0] == 'K'
-            is_suited = combo.endswith('S')
-            is_broadway = r1 >= _RANK_ORDER.index('T') and (
-                len(combo) < 3 or _RANK_ORDER.index(combo[1]) >= _RANK_ORDER.index('T'))
-
-            if is_pair or has_ace or (has_king and is_suited) or is_broadway:
-                if ALL_IN in legal_actions:
-                    return ALL_IN
-                return self._best_raise(legal_actions)
-
-        # Short (10-25BB): shove with strong range only
-        else:
-            # Use 3bet range as shove range (strong hands)
-            key_3b = f'{pos_key}_3b'
-            range_3b = self.ranges.get('3b', {}).get(key_3b, {})
-            rfi_range = self.ranges.get('rfi', {}).get(pos_key, {})
-
-            if _is_in_range(combo, range_3b):
-                # Premium: shove
-                if ALL_IN in legal_actions:
-                    return ALL_IN
-                return self._best_raise(legal_actions)
-
-            if _is_in_range(combo, rfi_range):
-                # Standard open hand: raise small (still viable at 15-25BB)
-                if effective_stack > 15:
-                    action = RAISE_MIN if RAISE_MIN in legal_actions else RAISE_HALF
-                    if action in legal_actions:
-                        return action
-                # 10-15BB: shove or fold, no small raises
-                if ALL_IN in legal_actions:
-                    return ALL_IN
 
         return FOLD if FOLD in legal_actions else CALL
 

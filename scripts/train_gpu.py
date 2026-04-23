@@ -83,10 +83,23 @@ _FOLD_PENALTY   = 0.0       # penalize folding when equity beats pot-odds requir
                             # (symmetric counterpart to _BLUFF_PENALTY)
 _FOLD_MARGIN    = 0.15      # must be this many % above required equity to penalize
 _BLUFF_DRAW_EXEMPT = True   # skip bluff penalty for flush draws / OESD / gutshot+overcards
-_DRAW_CALL_BOOST   = 0.0    # extra call-reward bonus when strong draw + small bet (≤½ pot)
+_DRAW_CALL_BOOST   = 0.0    # extra CALL-reward bonus when strong draw + small bet (≤⅓ pot).
+                            # Fires ONLY for action==CALL and only when facing a bet.
+                            # Never applies to check-spots or raise-spots.
+_DRAW_BET_BOOST    = 0.0    # extra RAISE-reward bonus when checked-to with a draw.
+                            # Encourages semi-bluffing with flush draws, straight draws,
+                            # and overcard air (J+ high, no made hand). Fires ONLY when
+                            # hero is checked to (pot_odds == 0) and chose a raise action.
 _ALLIN_MONSTER_RATE      = 0.0    # prob. opponent with monster hand auto-shoves
 _ALLIN_MONSTER_THRESHOLD = 0.375  # made_hand_cat cutoff (0.375=trips, 0.5=straight,
                                   # 0.625=flush, 0.75=full house)
+
+# Training table size + forced preflop folds (simulates shorter tables).
+# _RANDOM_PREFLOP_FOLDS_DIST is a list of (num_forced_folds, weight) tuples.
+# Each hand samples k from this distribution; first k non-hero active players
+# in order are forced to fold preflop. Default None = no forced folds.
+_NUM_PLAYERS = 6
+_RANDOM_PREFLOP_FOLDS_DIST = None
 
 # Engine pool — per-worker reuse to avoid env teardown on every branch
 _ENGINE_POOL = []
@@ -110,12 +123,14 @@ def _worker_init(shared_adv, shared_strat, act_size, use_preflop_ranges=False,
                  deck_reshuffle=False, bluff_penalty=0.0,
                  call_bonus=0.0, value_bonus=0.0, fold_penalty=0.0,
                  allin_monster_rate=0.0, allin_monster_threshold=0.375,
-                 bluff_draw_exempt=True, draw_call_boost=0.0):
+                 bluff_draw_exempt=True, draw_call_boost=0.0, draw_bet_boost=0.0,
+                 num_players=6, random_preflop_folds_dist=None):
     global _SHARED_ADV_NETS, _SHARED_STRAT_NETS, _ACT_SIZE, _PREFLOP_RANGES
     global _ARCHETYPE_MODE, _KBEST_POOL, _OPP_PREFLOP_RANGES
     global _DECK_RESHUFFLE, _BLUFF_PENALTY, _CALL_BONUS, _VALUE_BONUS, _FOLD_PENALTY
     global _ALLIN_MONSTER_RATE, _ALLIN_MONSTER_THRESHOLD
-    global _BLUFF_DRAW_EXEMPT, _DRAW_CALL_BOOST
+    global _BLUFF_DRAW_EXEMPT, _DRAW_CALL_BOOST, _DRAW_BET_BOOST
+    global _NUM_PLAYERS, _RANDOM_PREFLOP_FOLDS_DIST
     _SHARED_ADV_NETS  = shared_adv
     _SHARED_STRAT_NETS = shared_strat
     _ACT_SIZE          = act_size
@@ -130,10 +145,15 @@ def _worker_init(shared_adv, shared_strat, act_size, use_preflop_ranges=False,
     _ALLIN_MONSTER_THRESHOLD = allin_monster_threshold
     _BLUFF_DRAW_EXEMPT = bluff_draw_exempt
     _DRAW_CALL_BOOST   = draw_call_boost
+    _DRAW_BET_BOOST    = draw_bet_boost
+    _NUM_PLAYERS       = num_players
+    _RANDOM_PREFLOP_FOLDS_DIST = random_preflop_folds_dist
     if use_preflop_ranges:
         from src.preflop_ranges import PreflopRanges
         from pathlib import Path
-        _PREFLOP_RANGES = PreflopRanges()
+        # Hero uses num_players-specific range (auto-selects preflop_ranges_Np.json
+        # if present, falls back to generic preflop_ranges.json).
+        _PREFLOP_RANGES = PreflopRanges(num_players=num_players)
         # Opponents always get the wider NL5 preflop ranges so they play
         # a realistic NL5-population distribution preflop (hero stays GTO).
         nl5_path = str(Path(__file__).parent.parent / 'configs' / 'preflop_ranges_nl5.json')
@@ -282,7 +302,10 @@ def _create_worker_pool(num_workers, shared_adv, shared_strat, act_size,
                   args.allin_monster_rate,
                   args.allin_monster_threshold,
                   args.bluff_draw_exempt,
-                  args.draw_call_boost),
+                  args.draw_call_boost,
+                  args.draw_bet_boost,
+                  getattr(args, '_num_players', 6),
+                  getattr(args, '_random_preflop_folds_dist', None)),
     )
 
 
@@ -315,7 +338,32 @@ def _traversal_worker(args):
         archetype_skew_fn = get_archetype_skew(arch_name)
         archetype_profile = get_archetype_profile(arch_name)
 
+    # Random preflop forced folds — simulates shorter-handed tables.
+    # Sample K from the config distribution; the first K opponents that
+    # haven't acted yet and aren't hero will auto-fold preflop regardless
+    # of their hand. This exposes hero to 3-4-max-like postflop spots
+    # without needing separate table-size training runs.
+    forced_fold_seats = set()
+    if _RANDOM_PREFLOP_FOLDS_DIST:
+        weights = np.array([w for _, w in _RANDOM_PREFLOP_FOLDS_DIST],
+                            dtype=np.float64)
+        probs = weights / weights.sum()
+        ks = [k for k, _ in _RANDOM_PREFLOP_FOLDS_DIST]
+        k = int(np.random.choice(ks, p=probs))
+        if k > 0:
+            # Pick K random non-hero seats to force-fold preflop
+            non_hero_seats = [s for s in range(num_players) if s != player_idx]
+            if k > len(non_hero_seats):
+                k = len(non_hero_seats)
+            forced_fold_seats = set(
+                int(s) for s in np.random.choice(
+                    non_hero_seats, size=k, replace=False))
+
     def _pick_opponent_action(ai, obs, legal, eng=None, is_preflop=False):
+        # Forced preflop fold (simulates shorter-handed tables)
+        if is_preflop and ai in forced_fold_seats and 0 in legal:
+            return 0  # FOLD
+
         # Monster all-in override — postflop only, value-heavy teaching signal.
         # obs[19] = made_hand_cat (0.375=trips, 0.5=straight, 0.625=flush, 0.75=FH).
         # Forces opponent to shove with strong made hands so hero's regret for
@@ -439,13 +487,18 @@ def _traversal_worker(args):
         # Detect strong semi-bluff draws (exempt bluff penalty + boost call).
         has_flush_draw = False
         has_straight_draw_with_overcards = False
+        has_overcards_air = False
+        made_hand_cat = 1.0
         if obs is not None and len(obs) > 21:
             flush_part = float(obs[20])
             straight_part = float(obs[21])
             made_hand_cat = float(obs[19]) if len(obs) > 19 else 1.0
+            high_card = float(obs[13]) if len(obs) > 13 else 0.0
             has_flush_draw = flush_part >= 0.99
             has_straight_draw_with_overcards = (
                 straight_part >= 0.49 and made_hand_cat < 0.01)
+            # Air with J+ high card (draw-like hand that can turn TP)
+            has_overcards_air = (made_hand_cat < 0.11 and high_card >= 0.75)
         is_strong_draw = has_flush_draw or has_straight_draw_with_overcards
 
         bluff_penalty_chips = 0.0
@@ -465,13 +518,25 @@ def _traversal_worker(args):
             post_call_pot = float(pot_chips) / max(po, 1e-6)
             call_bonus_chips = excess * post_call_pot * _CALL_BONUS
 
-        # Draw call boost: extra reward for calling small bets (≤ ½ pot) with
-        # a strong draw. pot_odds >= 0.75 ↔ call ≤ ½ pot.
+        # Draw call boost: extra reward for CALLING small bets (≤ ⅓ pot) with
+        # a strong draw. pot_odds >= 0.75 ↔ call ≤ ⅓ pot.
+        # Only fires for action==CALL (applied at ba==1 below).
         draw_call_boost_chips = 0.0
         if (_DRAW_CALL_BOOST > 0 and is_strong_draw
                 and pot_chips is not None and pot_odds is not None
                 and float(pot_odds) >= 0.75):
             draw_call_boost_chips = float(pot_chips) * _DRAW_CALL_BOOST
+
+        # Draw bet boost: extra reward for BETTING/RAISING with draws or
+        # overcard-air when CHECKED TO (no bet to face). Encourages semi-bluffing
+        # with flush draws, straight draws, and J+ high-card air — fixes the
+        # "100% check with nut flush draw" failure mode. Only fires for raise
+        # actions (ba >= 2) and only in unopened-flop-like spots (pot_odds==0).
+        draw_bet_boost_chips = 0.0
+        if (_DRAW_BET_BOOST > 0 and pot_chips is not None
+                and pot_odds is not None and float(pot_odds) == 0.0
+                and (is_strong_draw or has_overcards_air)):
+            draw_bet_boost_chips = float(pot_chips) * _DRAW_BET_BOOST
 
         # Value bonus: reward raising with strong equity.
         # Previously only fired when checked-to (pot_odds == 0). Now fires
@@ -519,6 +584,8 @@ def _traversal_worker(args):
                 r += call_bonus_chips
             if draw_call_boost_chips > 0 and ba == 1:
                 r += draw_call_boost_chips
+            if draw_bet_boost_chips > 0 and ba >= 2:
+                r += draw_bet_boost_chips
             if value_bonus_chips > 0 and ba >= 2:
                 r += value_bonus_chips
             if fold_penalty_chips > 0 and ba == 0:
@@ -890,7 +957,7 @@ def _selfplay_eval_stats(deep_cfr_ref, num_players, num_hands, eq_path):
         load_equity_model(eq_path, device='cpu')
 
     sp_eng = _mk_eng(num_players=num_players)
-    sp_ranges = PreflopRanges()
+    sp_ranges = PreflopRanges(num_players=num_players)
     postflop = {'bets': 0, 'calls': 0, 'checks': 0, 'folds': 0}
 
     for _ in range(num_hands):
@@ -1042,6 +1109,16 @@ def main():
                              'restore old behavior (update every 100 iters). '
                              'Pool rotation was found to cause training drift — '
                              'frozen pool converges more reliably.')
+    parser.add_argument('--random-preflop-folds',
+                        type=str,
+                        default=config.get('training', {}).get(
+                            'random_preflop_folds', '0:20,1:20,2:35,3:15,4:10'),
+                        help='Distribution of forced-preflop-folds per hand — '
+                             'simulates shorter-handed tables. Format is '
+                             '"K1:W1,K2:W2,..." where Ki = num forced folds, '
+                             'Wi = weight. Default "0:20,1:20,2:35,3:15,4:10" '
+                             'at 6-max gives avg ~2 forced folds → avg 3-4 '
+                             'active players. Pass empty string to disable.')
     parser.add_argument('--load-buffer', type=str, default=None,
                         help='Load replay buffer from .npz file (without resuming model weights)')
     parser.add_argument('--rake', type=float, default=0.0,
@@ -1074,9 +1151,19 @@ def main():
     parser.add_argument('--draw-call-boost', type=float,
                         default=float(opp.get('draw_call_boost', 0.0)),
                         help='Extra CALL reward bonus when hero has strong draw + '
-                             'facing ≤½ pot bet. 0 = off, 0.15 = soft, 0.3 = moderate, '
+                             'facing ≤⅓ pot bet. 0 = off, 0.15 = soft, 0.3 = moderate, '
                              '0.5 = strong. Fixes "fold draws to small bets" failure. '
+                             'Applies ONLY to CALL action. '
                              'Config default: opponent.draw_call_boost.')
+    parser.add_argument('--draw-bet-boost', type=float,
+                        default=float(opp.get('draw_bet_boost', 0.0)),
+                        help='Extra RAISE reward bonus when hero has flush draw, '
+                             'straight draw, or J+ overcard air AND is checked to. '
+                             '0 = off, 0.15 = soft, 0.3 = moderate, 0.5 = strong. '
+                             'Fixes "100%% check with nut flush draw" failure — '
+                             'encourages semi-bluffing draws in checked-to spots. '
+                             'Applies ONLY to raise actions (Raise½, RaisePot, etc). '
+                             'Config default: opponent.draw_bet_boost.')
     args = parser.parse_args()
 
     if args.no_preflop_ranges:
@@ -1088,6 +1175,22 @@ def main():
     device      = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
     num_workers = args.workers or max(1, mp.cpu_count() - 1)
     num_players = config['game']['num_players']
+
+    # Parse random_preflop_folds distribution "K1:W1,K2:W2,..." into list
+    def _parse_folds_dist(s):
+        if not s or not s.strip():
+            return None
+        pairs = []
+        for part in s.split(','):
+            k, w = part.strip().split(':')
+            pairs.append((int(k), float(w)))
+        # Cap k at num_players-2 (must leave at least 2 players for game)
+        max_k = num_players - 2
+        pairs = [(min(k, max_k), w) for k, w in pairs]
+        return pairs
+    fold_dist = _parse_folds_dist(args.random_preflop_folds)
+    args._num_players = num_players
+    args._random_preflop_folds_dist = fold_dist
 
     # Set globals so _make_engine() uses them in workers
     global _ARCHETYPE_MODE, _RAKE_PCT, _RAKE_CAP
@@ -1122,6 +1225,14 @@ def main():
         print(f'  warm-start: {Path(args.warm_start).name}')
     print(f'  workers  : {num_workers}')
     print(f'  players  : {num_players}')
+    if fold_dist:
+        dist_str = ', '.join(f'{k}:{w:.0f}' for k, w in fold_dist)
+        total = sum(w for _, w in fold_dist)
+        avg = sum(k * w / total for k, w in fold_dist)
+        print(f'  fold-dist: {{{dist_str}}} → avg {avg:.1f} forced folds '
+              f'(avg ~{num_players - avg:.1f} active)')
+    else:
+        print(f'  fold-dist: disabled (full {num_players}-max)')
     print(f'  iters    : {config["training"]["num_iterations"]}')
     print(f'  phases   : 1-600 random, 601-1600 self-play, 1601+ mixed (K-Best)')
     print(f'  trav/iter: {config["training"]["traversals_per_iteration"]}')
@@ -1321,7 +1432,8 @@ def main():
           f'allin_monster_rate={args.allin_monster_rate} '
           f'allin_monster_threshold={args.allin_monster_threshold} '
           f'bluff_draw_exempt={args.bluff_draw_exempt} '
-          f'draw_call_boost={args.draw_call_boost}\n')
+          f'draw_call_boost={args.draw_call_boost} '
+          f'draw_bet_boost={args.draw_bet_boost}\n')
 
     _adv_hist   = deque(maxlen=10)
     _strat_hist = deque(maxlen=10)
