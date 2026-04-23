@@ -1035,6 +1035,13 @@ def main():
                         help='Base checkpoint to fine-tune from (extends obs 50→55, lower LR)')
     parser.add_argument('--kbest-seed', type=str, nargs='+', default=None,
                         help='Checkpoint(s) to seed K-Best opponent pool (e.g. --kbest-seed models/best.pt models/iter200.pt)')
+    parser.add_argument('--kbest-update-interval', type=int, default=0,
+                        help='How often (iters) to auto-add current checkpoint '
+                             'to K-Best pool. Default 0 = FROZEN (pool stays at '
+                             'seeded models, no auto-updates). Set to 100 to '
+                             'restore old behavior (update every 100 iters). '
+                             'Pool rotation was found to cause training drift — '
+                             'frozen pool converges more reliably.')
     parser.add_argument('--load-buffer', type=str, default=None,
                         help='Load replay buffer from .npz file (without resuming model weights)')
     parser.add_argument('--rake', type=float, default=0.0,
@@ -1589,7 +1596,10 @@ def main():
                 _batch_train.clear()
 
             # ── K-Best pool update ───────────────────────────────────────
-            if iter_num % 100 == 0 and iter_num > 1600:
+            # Skip entirely when --kbest-update-interval 0 (pool frozen to seeds)
+            if (args.kbest_update_interval > 0
+                    and iter_num % args.kbest_update_interval == 0
+                    and iter_num > 1600):
                 try:
                     pool_nets = []
                     for net in deep_cfr.strategy_networks:

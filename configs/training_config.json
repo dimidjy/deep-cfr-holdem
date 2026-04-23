@@ -5,14 +5,14 @@
   "training": {
     "num_iterations": 5000,
     "batch_size": 65536,
-    "learning_rate": 0.0001,
+    "learning_rate": 0.00005,
     "buffer_size": 10000000,
     "traversals_per_iteration": 5000,
     "checkpoint_interval": 100,
     "train_passes": 14,
     "gradient_clip": 1.0,
     "lr_scheduler_t_max": 8000,
-    "imitation_weight": 0.02,
+    "imitation_weight": 0.01,
     "imitation_passes": 1
   },
   "network": {
@@ -21,15 +21,15 @@
     "dropout": 0.1
   },
   "paths": {
-    "models": "models/v13/",
+    "models": "models/v16/",
     "data": "data/",
     "logs": "data/logs/"
   },
   "opponent": {
     "deck_reshuffle": true,
-    "bluff_penalty": 0.5,
-    "call_bonus": 0.05,
-    "value_bonus": 0.15,
+    "bluff_penalty": 1,
+    "call_bonus": 0.02,
+    "value_bonus": 0.1,
     "fold_penalty": 0.1,
     "allin_monster_rate": 0.1,
     "allin_monster_threshold": 0.5,
