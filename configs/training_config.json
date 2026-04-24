@@ -3,7 +3,7 @@
     "num_players": 6
   },
   "training": {
-    "num_iterations": 5000,
+    "num_iterations": 6000,
     "batch_size": 65536,
     "learning_rate": 0.00005,
     "buffer_size": 10000000,
@@ -12,9 +12,9 @@
     "train_passes": 14,
     "gradient_clip": 1.0,
     "lr_scheduler_t_max": 8000,
-    "imitation_weight": 0.01,
+    "imitation_weight": 0.02,
     "imitation_passes": 1,
-    "random_preflop_folds": "0:20,1:20,2:35,3:15,4:10"
+    "random_preflop_folds": "0:100"
   },
   "network": {
     "hidden_layers": [384, 384, 192],
@@ -22,20 +22,20 @@
     "dropout": 0.1
   },
   "paths": {
-    "models": "models/v16/",
+    "models": "models/v18/",
     "data": "data/",
     "logs": "data/logs/"
   },
   "opponent": {
     "deck_reshuffle": true,
-    "bluff_penalty": 1,
-    "call_bonus": 0.02,
-    "value_bonus": 0.1,
+    "bluff_penalty": 0.5,
+    "call_bonus": 0.05,
+    "value_bonus": 0.15,
     "fold_penalty": 0.1,
     "allin_monster_rate": 0.1,
     "allin_monster_threshold": 0.5,
     "bluff_draw_exempt": true,
     "draw_call_boost": 0.15,
-    "draw_bet_boost": 0.25
+    "draw_bet_boost": 0.05
   }
 }

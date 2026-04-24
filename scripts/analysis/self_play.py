@@ -175,15 +175,22 @@ class ArchetypeEngine:
 def run_self_play(engine: DecisionEngine, num_hands: int,
                   num_players: int = 6,
                   engine_b: DecisionEngine = None) -> Dict[int, PlayerStats]:
-    """Play num_hands of 6-max poker.
+    """Play num_hands of poker with effective `num_players` seats.
+
+    Engine is always 6-max so observation shape matches training (50 dims).
+    Shorter tables are simulated by force-folding (6 - num_players) random
+    non-blind seats preflop each hand — same mechanism as random_preflop_folds
+    in training.
 
     If engine_b is provided: seats 0,2,4 use engine (A), seats 1,3,5 use engine_b (B).
     Returns dict of seat_index → PlayerStats.
     """
     from src.engine.factory import make_engine
-    eng = make_engine(num_players=num_players)
+    ENGINE_PLAYERS = 6  # always 6-max engine to keep obs shape consistent
+    eng = make_engine(num_players=ENGINE_PLAYERS)
+    num_force_fold = max(0, ENGINE_PLAYERS - num_players)
 
-    stats = {i: PlayerStats() for i in range(num_players)}
+    stats = {i: PlayerStats() for i in range(ENGINE_PLAYERS)}
     t0 = time.time()
 
     for hand_idx in range(num_hands):
@@ -202,10 +209,25 @@ def run_self_play(engine: DecisionEngine, num_hands: int,
         prev_stage = 'Preflop'
         first_to_act_flop = {}    # stage → first actor seat
 
-        # Mark hands dealt
-        for i in range(num_players):
+        # Pick random seats to force-fold preflop (simulates shorter tables).
+        # Excludes SB/BB so the blinds structure stays intact; only non-blind
+        # positions become "inactive" — matches training's random_preflop_folds.
+        forced_fold = set()
+        if num_force_fold > 0:
+            sb_seat = (button + 1) % ENGINE_PLAYERS
+            bb_seat = (button + 2) % ENGINE_PLAYERS
+            candidates = [s for s in range(ENGINE_PLAYERS)
+                          if s != sb_seat and s != bb_seat]
+            k = min(num_force_fold, len(candidates))
+            forced_fold = set(int(s) for s in np.random.choice(
+                candidates, size=k, replace=False))
+
+        # Mark hands dealt — skip forced-fold seats (they don't effectively play)
+        for i in range(ENGINE_PLAYERS):
+            if i in forced_fold:
+                continue
             pos_label = _POS_LABELS_6.get(
-                (i - button) % num_players, f'P{i}')
+                (i - button) % ENGINE_PLAYERS, f'P{i}')
             stats[i].hands += 1
             stats[i].hands_by_pos[pos_label] += 1
 
@@ -219,16 +241,23 @@ def run_self_play(engine: DecisionEngine, num_hands: int,
 
             seat = eng.agents.index(agent)
             stage = eng.get_stage()
+
+            # Forced fold preflop for inactive-table seats (before any obs/stats work)
+            if stage == 'Preflop' and seat in forced_fold and FOLD in legal:
+                hand_actions.append((seat, 'Preflop', FOLD))
+                eng.step(FOLD)
+                continue
+
             obs = eng.get_observation()
             cards = eng.get_player_cards(agent)
-            rel_pos = (seat - button) % num_players
+            rel_pos = (seat - button) % ENGINE_PLAYERS
             pos_label = _POS_LABELS_6.get(rel_pos, f'P{rel_pos}')
 
             # Detect street change
             if stage != prev_stage:
                 # Players still in at flop
                 if stage == 'Flop':
-                    for i in range(num_players):
+                    for i in range(ENGINE_PLAYERS):
                         a = eng.agents[i]
                         try:
                             if eng.get_player_chips(a) > 0 or any(
@@ -264,7 +293,9 @@ def run_self_play(engine: DecisionEngine, num_hands: int,
                 hole_cards=hole_cards,
                 rel_pos=rel_pos,
                 pot_bb=pot_bb,
-                num_players=num_players,
+                # Use engine's 6 so preflop range lookup matches training
+                # (training always uses 6-max ranges even with forced folds).
+                num_players=ENGINE_PLAYERS,
                 effective_stack=eng.get_player_chips(agent) / 2.0,
             )
 
@@ -376,11 +407,13 @@ def run_self_play(engine: DecisionEngine, num_hands: int,
 
         # ── Hand finished — record results ──
         rewards = eng.get_rewards()
-        for i in range(num_players):
+        for i in range(ENGINE_PLAYERS):
+            if i in forced_fold:
+                continue  # seat didn't effectively play this hand
             agent_name = eng.agents[i]
             reward = rewards.get(agent_name, 0)
             reward_bb = reward / 2.0  # chips → BB (blinds are 1/2)
-            rp = (i - button) % num_players
+            rp = (i - button) % ENGINE_PLAYERS
             pl = _POS_LABELS_6.get(rp, f'P{rp}')
 
             stats[i].total_won_bb += reward_bb
@@ -773,8 +806,11 @@ def _generate_vs_report(stats: Dict[int, PlayerStats], num_players: int,
     lines = []
     w = lines.append
 
-    seats_a = [i for i in range(num_players) if i % 2 == 0]
-    seats_b = [i for i in range(num_players) if i % 2 == 1]
+    # Engine is always 6-max; `num_players` here is effective table size.
+    # Aggregate across all engine seats (forced-fold seats contribute zero hands).
+    engine_seats = sorted(stats.keys())
+    seats_a = [i for i in engine_seats if i % 2 == 0]
+    seats_b = [i for i in engine_seats if i % 2 == 1]
 
     def _agg(seat_list):
         a = PlayerStats()
@@ -841,8 +877,10 @@ def _generate_vs_report(stats: Dict[int, PlayerStats], num_players: int,
     w('─' * 70)
     w(f'  {"Seat":>4} {"Model":>7} {"Hands":>7} {"BB/100":>8} {"Won BB":>10}')
     w(f'  {"-"*4} {"-"*7} {"-"*7} {"-"*8} {"-"*10}')
-    for i in range(num_players):
+    for i in engine_seats:
         s = stats[i]
+        if s.hands == 0:
+            continue  # seat was forced-fold every hand (shouldn't happen)
         label = 'A' if i % 2 == 0 else 'B'
         sbb = s.total_won_bb / s.hands * 100 if s.hands > 0 else 0
         w(f'  {i:>4} {label:>7} {s.hands:>7} {sbb:>+8.1f} {s.total_won_bb:>+10.0f}')

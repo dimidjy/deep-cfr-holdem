@@ -1442,6 +1442,9 @@ def main():
     LOG_INTERVAL = 20       # print avg loss every N iterations
     EVAL_INTERVAL = 200     # self-play + validation every N iterations
     EVAL_HANDS = 2000       # hands per self-play eval
+    BUFFER_SAVE_INTERVAL = 200  # save replay buffer every N iterations (old
+                                # buffers retained — each is ~hundreds of MB;
+                                # at 200 iters × 10 saves = ~several GB per run)
     _batch_adv = []
     _batch_strat = []
     _batch_trav = []
@@ -1746,22 +1749,18 @@ def main():
                 with open(ckpt.replace('.pt', '_metadata.json'), 'w') as f:
                     json.dump(meta, f, indent=2)
 
-                # Also save buffer so resume can pick up where training left off.
-                # Matches the name pattern validate_vs_hh / train_gpu expect
-                # (checkpoint_iter_N_buffer.npz). Only keep the LATEST buffer to
-                # avoid filling disk — old buffer files are deleted.
-                buf_path = ckpt.replace('.pt', '_buffer.npz')
-                try:
-                    deep_cfr.replay_buffer.save(buf_path)
-                    # Remove older buffer files (keep only the latest)
-                    for old_buf in models_dir.glob('checkpoint_iter_*_buffer.npz'):
-                        if str(old_buf) != buf_path:
-                            try:
-                                old_buf.unlink()
-                            except OSError:
-                                pass
-                except Exception as e:
-                    print(f'  [buffer save warning: {e}]')
+                # Save replay buffer every BUFFER_SAVE_INTERVAL iterations so
+                # you can resume training / rollback cleanly to specific points.
+                # Historical buffers are KEPT (not deleted) — gives you multiple
+                # restart candidates if training diverges. Buffer files are large
+                # (~hundreds of MB each), so choose the interval carefully.
+                if iter_num % BUFFER_SAVE_INTERVAL == 0:
+                    buf_path = ckpt.replace('.pt', '_buffer.npz')
+                    try:
+                        deep_cfr.replay_buffer.save(buf_path)
+                        print(f'  [buffer saved: {Path(buf_path).name}]')
+                    except Exception as e:
+                        print(f'  [buffer save warning: {e}]')
 
             # ── Self-play + validation every EVAL_INTERVAL iters ────────────
             if iter_num % EVAL_INTERVAL == 0:
