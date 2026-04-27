@@ -5,24 +5,24 @@
   "training": {
     "num_iterations": 6000,
     "batch_size": 65536,
-    "learning_rate": 0.00005,
+    "learning_rate": 0.0003,
     "buffer_size": 10000000,
     "traversals_per_iteration": 5000,
     "checkpoint_interval": 100,
-    "train_passes": 14,
+    "train_passes": 10,
     "gradient_clip": 1.0,
-    "lr_scheduler_t_max": 8000,
+    "lr_scheduler_t_max": 6000,
     "imitation_weight": 0.02,
     "imitation_passes": 1,
     "random_preflop_folds": "0:100"
   },
   "network": {
-    "hidden_layers": [384, 384, 192],
+    "hidden_layers": [512, 512, 256],
     "activation": "leaky_relu",
-    "dropout": 0.1
+    "dropout": 0.15
   },
   "paths": {
-    "models": "models/v18/",
+    "models": "models/v20/",
     "data": "data/",
     "logs": "data/logs/"
   },
@@ -30,12 +30,14 @@
     "deck_reshuffle": true,
     "bluff_penalty": 0.5,
     "call_bonus": 0.05,
-    "value_bonus": 0.15,
-    "fold_penalty": 0.1,
+    "value_bonus": 0.2,
+    "fold_penalty": 0.2,
     "allin_monster_rate": 0.1,
     "allin_monster_threshold": 0.5,
     "bluff_draw_exempt": true,
-    "draw_call_boost": 0.15,
-    "draw_bet_boost": 0.05
+    "draw_call_boost": 0.1,
+    "draw_bet_boost": 0.1,
+    "barrel_fold_bonus": 0.15,
+    "mid_pair_fold_bonus": 0.15
   }
 }

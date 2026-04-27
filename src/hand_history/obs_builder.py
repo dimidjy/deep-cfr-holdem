@@ -102,6 +102,9 @@ def _bh_track_action(action, bh):
     bh['player_total'][name] += 1
     if is_agg:
         bh['player_agg'][name] += 1
+        # Betting-line: most recent aggressor across hand + per-street count
+        bh['last_aggressor'] = name
+        bh['street_agg_count'] = bh.get('street_agg_count', 0) + 1
     if atype == 'fold':
         bh['player_fold'][name] += 1
 
@@ -185,6 +188,28 @@ def _bh_compute(bh, hero_name):
     return feats
 
 
+# Number of betting-line features appended to observation
+BETTING_LINE_DIM = 3
+
+
+def _bl_compute(bh, hero_name):
+    """Compute 3-dim betting-line features.
+
+    0. pot_at_street_start_norm — pot at start of current street / avg_stack
+    1. hero_has_initiative — 1.0 if hero made the most recent aggressive
+       action across the hand
+    2. agg_count_this_street_norm — aggressive actions this street / 4
+    """
+    feats = np.zeros(BETTING_LINE_DIM, dtype=np.float32)
+    feats[0] = float(np.clip(
+        bh.get('street_start_pot', 0) / max(bh.get('avg_stack', 1), 1),
+        0.0, 1.0))
+    feats[1] = 1.0 if bh.get('last_aggressor') == hero_name else 0.0
+    feats[2] = float(np.clip(
+        bh.get('street_agg_count', 0) / 4.0, 0.0, 1.0))
+    return feats
+
+
 class ObservationBuilder:
     """Build observation vectors from parsed hand histories.
 
@@ -249,6 +274,10 @@ class ObservationBuilder:
                 'raise_count': 0,
                 'street_actions': [],    # (name, action_type, is_all_in)
                 'avg_stack': avg_stack,
+                # Betting-line tracking (3 features)
+                'last_aggressor': None,    # name of most recent aggressor across hand
+                'street_agg_count': 0,     # aggressive actions on current street
+                'street_start_pot': 0,     # pot at start of current street
             }
 
         # Legacy action history tracking for range estimator
@@ -281,6 +310,9 @@ class ObservationBuilder:
                     bh['pot_committed'] += sum(bh['street_bets'].values())
                     bh['street_bets'].clear()
                     bh['street_actions'] = []
+                    # Betting-line: snapshot pot at street start, reset per-street counter
+                    bh['street_start_pot'] = sum(p.pot_chips for p in players)
+                    bh['street_agg_count'] = 0
 
                 if track_action_history:
                     ah_pot_chips += sum(ah_player_bets.values())
@@ -345,10 +377,11 @@ class ObservationBuilder:
                 # Pot in dollars (chips / 40.0 for NL5)
                 pot_dollars = pot / 40.0
 
-                # Append behavioral stats to observation
+                # Append behavioral stats + betting-line features to observation
                 if bh is not None:
                     bh_features = _bh_compute(bh, player.name)
-                    obs = np.concatenate([obs, bh_features])
+                    bl_features = _bl_compute(bh, player.name)
+                    obs = np.concatenate([obs, bh_features, bl_features])
 
                 dp_kwargs = dict(
                     player_name=player.name,

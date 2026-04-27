@@ -106,6 +106,12 @@ _BEHAVIORAL_NAMES = [
     'num_raises_norm', 'street_aggression',
     'opp_check_ratio', 'pot_escalation',
 ]
+_BETTING_LINE_NAMES = [
+    'pot_at_street_start_norm',
+    'hero_has_initiative',
+    'agg_count_this_street_norm',
+]
+BETTING_LINE_DIM = 3
 _EQUITY_VS_ODDS_NAMES = ['equity_vs_odds']
 _OPP_PROFILE_NAMES = [
     'opp_vpip', 'opp_pfr', 'opp_af_norm', 'opp_fold_to_cbet', 'opp_wtsd',
@@ -137,6 +143,7 @@ def feature_names(num_players: int = 6, pad_to_6p: bool = True,
     names += _BETTING_HIST_NAMES
     if behavioral_stats:
         names += _BEHAVIORAL_NAMES
+        names += _BETTING_LINE_NAMES
     if opp_profile:
         names += _OPP_PROFILE_NAMES
     if equity_vs_odds:
@@ -178,20 +185,32 @@ class ObservationBuilder:
         if not my_player or not my_player.hole_cards:
             return None
 
-        # Find indices
+        # Find player index in active list (used for stack/pot lookups)
         player_idx = 0
-        button_idx = 0
         for i, p in enumerate(players):
             if p.seat == game_state.my_seat:
                 player_idx = i
+                break
+
+        # >>> TEMP REVERT TO BUGGY POSITION CALC FOR A/B TEST <<<
+        # Reproduces the pre-2026-04-25 bug where, when the BTN seat is
+        # inactive (dead button), button_idx silently stays at 0 because the
+        # loop never matches — making the first active player look like BTN.
+        # To restore correct behavior, replace this block with:
+        #     rel_pos = game_state.compute_rel_pos()
+        button_idx = 0
+        for i, p in enumerate(players):
             if p.seat == game_state.button_seat:
                 button_idx = i
+        rel_pos = (player_idx - button_idx) % self.num_players
+        # >>> END TEMP REVERT <<<
 
         hole_cards = [str(c) for c in my_player.hole_cards]
         community = [str(c) for c in game_state.community_cards]
 
         features = []
-        features.append(self._position_features(player_idx, button_idx))
+        features.append(self._position_features(rel_pos,
+                                                 num_active=len(players)))
         features.append(self._pot_odds_features(game_state, players, player_idx))
         features.append(self._hand_strength_features(hole_cards))
         features.append(self._stack_features(game_state, players, player_idx))
@@ -203,6 +222,8 @@ class ObservationBuilder:
 
         if self.behavioral_stats:
             features.append(self._behavioral_stats_features(
+                game_state, players, player_idx))
+            features.append(self._betting_line_features(
                 game_state, players, player_idx))
 
         if opponent_profile is not None:
@@ -221,33 +242,33 @@ class ObservationBuilder:
         return obs
 
     def get_position_label(self, game_state: GameState) -> str:
-        players = game_state.active_players
-        player_idx = 0
-        button_idx = 0
-        for i, p in enumerate(players):
-            if p.seat == game_state.my_seat:
-                player_idx = i
-            if p.seat == game_state.button_seat:
-                button_idx = i
-        rel_pos = (player_idx - button_idx) % self.num_players
-        return _POS_LABELS.get(rel_pos, 'MP')
+        n = max(len(game_state.active_players), 1)
+        rel_pos_actual = game_state.compute_rel_pos() % n
+        mapped_pos = _POS_MAP_TO_6P.get(n, {}).get(rel_pos_actual, rel_pos_actual)
+        return _POS_LABELS.get(mapped_pos, 'MP')
 
-    def _position_features(self, player_idx: int, button_idx: int) -> np.ndarray:
-        rel_pos = (player_idx - button_idx) % self.num_players
+    def _position_features(self, rel_pos: int,
+                           num_active: Optional[int] = None) -> np.ndarray:
+        # Modulo by actual active count, not configured num_players.
+        # Runtime sees varying active counts (HU/3-handed); modulo by 6 when
+        # only 3 are active gave wrong rel_pos (e.g. SB labeled as MP).
+        n = num_active if num_active is not None else self.num_players
+        rel_pos_actual = rel_pos % n if n > 0 else 0
+        # Map short-handed rel_pos to its 6-handed equivalent so output stays
+        # in the distribution the model was trained on (6-handed only).
+        mapped_pos = _POS_MAP_TO_6P.get(n, {}).get(rel_pos_actual, rel_pos_actual)
 
         if self.pad_to_6p:
-            # Map to 6p position and build 8-dim (6+2) position block
-            mapped_pos = _POS_MAP_TO_6P[self.num_players].get(rel_pos, 0)
             one_hot = np.zeros(6, dtype=np.float32)
             one_hot[mapped_pos] = 1.0
             norm_pos = mapped_pos / 6.0
-            is_button = 1.0 if rel_pos == 0 else 0.0
+            is_button = 1.0 if rel_pos_actual == 0 else 0.0
             return np.array([*one_hot, norm_pos, is_button], dtype=np.float32)
         else:
             one_hot = np.zeros(self.num_players, dtype=np.float32)
-            one_hot[rel_pos] = 1.0
-            norm_pos = rel_pos / self.num_players
-            is_button = 1.0 if rel_pos == 0 else 0.0
+            one_hot[mapped_pos] = 1.0
+            norm_pos = mapped_pos / self.num_players
+            is_button = 1.0 if rel_pos_actual == 0 else 0.0
             return np.array([*one_hot, norm_pos, is_button], dtype=np.float32)
 
     def _pot_odds_features(self, gs: GameState, players: List[PlayerInfo],
@@ -650,5 +671,50 @@ class ObservationBuilder:
         # Approximate starting stack: current stack + pot share (since total_invested may be 0)
         avg_stack = max(sum(p.stack for p in all_players) / max(num_total, 1) + pot / max(num_total, 1), 1.0)
         feats[7] = min(pot / avg_stack, 1.0)
+
+        return feats
+
+    def _betting_line_features(self, gs: GameState, players: List[PlayerInfo],
+                               player_idx: int) -> np.ndarray:
+        """Compute 3-dim betting-line features as snapshot proxies.
+
+        Mirrors src/engine/fast_enhanced_engine._get_betting_line_features
+        and src/hand_history/obs_builder._bl_compute, but reconstructs
+        from a single GameState frame (no action history is available
+        at runtime).
+
+        0. pot_at_street_start_norm — (pot - sum bet_current_round) / avg_stack
+        1. hero_has_initiative — 1 if hero has the strict-max bet_current_round
+           on this street (proxy for "hero is the most recent aggressor")
+        2. agg_count_this_street_norm — log2(max_bet/BB) / 4 (proxy for raise
+           count this street)
+        """
+        feats = np.zeros(BETTING_LINE_DIM, dtype=np.float32)
+
+        all_players = gs.players
+        num_total = max(len(all_players), 1)
+        pot = max(gs.pot_total, 1.0)
+        big_blind = 1.0  # gs uses BB-normalized chips
+
+        # Pot at start of current street ≈ total pot minus what's been bet
+        # this round so far.
+        round_bets = sum(p.bet_current_round for p in all_players)
+        prior_streets_pot = max(pot - round_bets, 0.0)
+        avg_stack = max(
+            sum(p.stack for p in all_players) / num_total + pot / num_total,
+            1.0)
+        feats[0] = float(np.clip(prior_streets_pot / avg_stack, 0.0, 1.0))
+
+        # Hero has initiative ≈ hero has the strict max bet this round and
+        # has actually bet (else nobody is "last aggressor" yet on this street)
+        my_bet = players[player_idx].bet_current_round
+        max_bet = max((p.bet_current_round for p in all_players), default=0)
+        feats[1] = 1.0 if my_bet > 0 and my_bet >= max_bet else 0.0
+
+        # Aggression count this street ≈ log2 of how many BB the max bet is
+        # at, normalized by /4 so 16BB ≈ 1.0.
+        if max_bet > big_blind:
+            feats[2] = float(np.clip(
+                math.log2(max(max_bet / big_blind, 1.0)) / 4.0, 0.0, 1.0))
 
         return feats

@@ -436,6 +436,7 @@ class FastEnhancedPokerEngine(FastPokerEngine):
     """
 
     BEHAVIORAL_STATS_DIM = 8
+    BETTING_LINE_DIM = 3
     OPPONENT_PROFILE_DIM = 5
 
     def __init__(self, num_players: int = 6,
@@ -449,6 +450,7 @@ class FastEnhancedPokerEngine(FastPokerEngine):
                  add_betting_history_features: bool = True,
                  legacy_game_state: bool = False,
                  behavioral_stats: bool = False,
+                 betting_line: bool = True,
                  opponent_profile: bool = False,
                  rake_pct: float = 0.0,
                  rake_cap: float = 0.0):
@@ -462,6 +464,9 @@ class FastEnhancedPokerEngine(FastPokerEngine):
         self.add_betting_history_features = add_betting_history_features
         self.legacy_game_state = legacy_game_state  # 3 dims instead of 6
         self.add_behavioral_stats = behavioral_stats
+        # Betting-line block piggybacks on the _bh tracker, so it requires
+        # behavioral_stats. Off when behavioral_stats is off.
+        self.add_betting_line = betting_line and behavioral_stats
         self.add_opponent_profile = opponent_profile
         self._opponent_profile = None  # 5-dim array, set via set_opponent_profile()
         self.rake_pct = rake_pct  # e.g. 0.05 = 5%
@@ -493,6 +498,8 @@ class FastEnhancedPokerEngine(FastPokerEngine):
             size += 5
         if self.add_behavioral_stats:
             size += self.BEHAVIORAL_STATS_DIM
+        if self.add_betting_line:
+            size += self.BETTING_LINE_DIM
         if self.add_opponent_profile:
             size += self.OPPONENT_PROFILE_DIM
         return size
@@ -523,6 +530,8 @@ class FastEnhancedPokerEngine(FastPokerEngine):
             features.append(self._get_betting_history_features())
         if self.add_behavioral_stats:
             features.append(self._get_behavioral_stats_features())
+        if self.add_betting_line:
+            features.append(self._get_betting_line_features())
         if self.add_opponent_profile:
             features.append(self._get_opponent_profile_features())
 
@@ -932,7 +941,14 @@ class FastEnhancedPokerEngine(FastPokerEngine):
                 'raise_count': 0,
                 'street_actions': [],        # (player_idx, action_type) tuples
                 'avg_stack': avg_stack,
-                'last_stage': 'Preflop',
+                # str(stage) yields 'Stage.Preflop' (enum repr) — match that
+                # so the first action of the hand doesn't trigger a spurious
+                # transition.
+                'last_stage': str(self._state.stage),
+                # Betting-line tracking (BETTING_LINE_DIM features)
+                'last_aggressor': None,      # pidx of most recent aggressor across hand
+                'street_agg_count': 0,       # aggressive actions on current street
+                'street_start_pot': self._state.pot,  # blinds at start of preflop
             }
         return result
 
@@ -954,6 +970,9 @@ class FastEnhancedPokerEngine(FastPokerEngine):
             bh['street_bets'] = {}
             bh['street_actions'] = []
             bh['last_stage'] = stage
+            # Betting-line: record pot at street start, reset per-street counter
+            bh['street_start_pot'] = self._state.pot
+            bh['street_agg_count'] = 0
 
         pidx = self._state.current_player
         ps = self._state.players_state[pidx]
@@ -970,6 +989,9 @@ class FastEnhancedPokerEngine(FastPokerEngine):
         if is_aggressive:
             bh['player_agg'][pidx] = bh['player_agg'].get(pidx, 0) + 1
             bh['raise_count'] += 1
+            # Betting-line: track most recent aggressor (initiative) and per-street count
+            bh['last_aggressor'] = pidx
+            bh['street_agg_count'] = bh.get('street_agg_count', 0) + 1
         if is_fold:
             bh['player_fold'][pidx] = bh['player_fold'].get(pidx, 0) + 1
 
@@ -1063,4 +1085,29 @@ class FastEnhancedPokerEngine(FastPokerEngine):
         except Exception:
             pass
 
+        return feats
+
+    def _get_betting_line_features(self) -> np.ndarray:
+        """Compute 3-dim betting-line features tracked across the hand:
+          0. pot_at_street_start_norm — pot at the start of the current street
+             (i.e. before any betting this street), normalized by avg stack.
+          1. hero_has_initiative — 1.0 if hero made the most recent aggressive
+             action across all streets in the hand.
+          2. agg_count_this_street_norm — count of aggressive actions on the
+             current street, normalized /4.
+        """
+        feats = np.zeros(self.BETTING_LINE_DIM, dtype=np.float32)
+        bh = self._bh
+        if bh is None:
+            return feats
+        try:
+            hero_idx = self._cur_idx()
+            feats[0] = float(np.clip(
+                bh.get('street_start_pot', 0) / max(bh['avg_stack'], 1),
+                0.0, 1.0))
+            feats[1] = 1.0 if bh.get('last_aggressor') == hero_idx else 0.0
+            feats[2] = float(np.clip(
+                bh.get('street_agg_count', 0) / 4.0, 0.0, 1.0))
+        except Exception:
+            pass
         return feats

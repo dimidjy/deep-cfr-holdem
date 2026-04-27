@@ -364,6 +364,21 @@ class PreflopRanges:
             if CALL in legal_actions:
                 return CALL
 
+        # SB OOP vs limpers: limp-behind any non-broadway non-premium RFI hand.
+        # Iso-raising marginal hands (T7s, K5s, Q8s) OOP bloats the pot and
+        # forces tough decisions postflop. Iso only with broadway combos
+        # (both cards ≥T) and medium+ pairs (88+).
+        if pos_key == 'SB' and num_limpers >= 1:
+            T_idx = _RANK_ORDER.index('T')
+            iso_ok = (
+                (is_pair and r1 >= _RANK_ORDER.index('8'))
+                or (not is_pair and r1 >= T_idx and r2 >= T_idx)
+            )
+            if not iso_ok:
+                if _is_in_range(combo, rfi_range) and CALL in legal_actions:
+                    return CALL
+                return FOLD if FOLD in legal_actions else CALL
+
         if _is_in_range(combo, rfi_range):
             # Standard RFI hand (not speculative): iso-raise
             rng = np.random.random()

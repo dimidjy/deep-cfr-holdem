@@ -130,6 +130,29 @@ class GameState:
     def active_players(self) -> List[PlayerInfo]:
         return [p for p in self.players if p.is_active and not p.is_sitting_out]
 
+    def compute_rel_pos(self, seat: Optional[int] = None) -> int:
+        """Relative position from button: 0=BTN, 1=SB, 2=BB, ...
+
+        Dead-button safe: if `button_seat` is inactive (player busted/sitting),
+        the closest active seat clockwise from the button maps to BTN. Sort
+        key uses the full seat layout (`len(self.players)`), not active-only
+        space, so distance is measured in real seat ring.
+
+        Returns 0 if seat is not active or no active players exist.
+        """
+        if seat is None:
+            seat = self.my_seat
+        n_seats = len(self.players)
+        if n_seats == 0:
+            return 0
+        active_seats = [p.seat for p in self.players
+                        if p.is_active and not p.is_sitting_out]
+        if not active_seats or seat not in active_seats:
+            return 0
+        sorted_seats = sorted(active_seats,
+                              key=lambda s: (s - self.button_seat) % n_seats)
+        return sorted_seats.index(seat)
+
     def to_dict(self) -> dict:
         return {
             'players': [p.to_dict() for p in self.players],

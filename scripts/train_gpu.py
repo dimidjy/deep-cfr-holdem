@@ -93,6 +93,19 @@ _DRAW_BET_BOOST    = 0.0    # extra RAISE-reward bonus when checked-to with a dr
 _ALLIN_MONSTER_RATE      = 0.0    # prob. opponent with monster hand auto-shoves
 _ALLIN_MONSTER_THRESHOLD = 0.375  # made_hand_cat cutoff (0.375=trips, 0.5=straight,
                                   # 0.625=flush, 0.75=full house)
+_BARREL_FOLD_BONUS = 0.0          # extra FOLD-reward bonus when hero is in a heavy
+                                  # 3-street barrel pot (facing_3bet_plus + high
+                                  # pot_escalation + villain near-all-in) and holds
+                                  # a weak made hand (one pair, no top pair).
+                                  # Teaches "fold middle pair to triple barrels at NL5"
+                                  # since real NL5 villains rarely bluff full-pot lines.
+                                  # Fires ONLY when action == FOLD.
+_MID_PAIR_FOLD_BONUS = 0.0        # extra FOLD-reward bonus when hero faces ANY bet
+                                  # holding a low / middle pair (one pair, not top
+                                  # pair, not overpair). Generalises the "fold weak
+                                  # pair to aggression" exploit beyond just heavy
+                                  # 3-barrel lines — single bets, turn probes, etc.
+                                  # Fires ONLY when action == FOLD and pot_odds > 0.
 
 # Training table size + forced preflop folds (simulates shorter tables).
 # _RANDOM_PREFLOP_FOLDS_DIST is a list of (num_forced_folds, weight) tuples.
@@ -124,12 +137,14 @@ def _worker_init(shared_adv, shared_strat, act_size, use_preflop_ranges=False,
                  call_bonus=0.0, value_bonus=0.0, fold_penalty=0.0,
                  allin_monster_rate=0.0, allin_monster_threshold=0.375,
                  bluff_draw_exempt=True, draw_call_boost=0.0, draw_bet_boost=0.0,
+                 barrel_fold_bonus=0.0, mid_pair_fold_bonus=0.0,
                  num_players=6, random_preflop_folds_dist=None):
     global _SHARED_ADV_NETS, _SHARED_STRAT_NETS, _ACT_SIZE, _PREFLOP_RANGES
     global _ARCHETYPE_MODE, _KBEST_POOL, _OPP_PREFLOP_RANGES
     global _DECK_RESHUFFLE, _BLUFF_PENALTY, _CALL_BONUS, _VALUE_BONUS, _FOLD_PENALTY
     global _ALLIN_MONSTER_RATE, _ALLIN_MONSTER_THRESHOLD
-    global _BLUFF_DRAW_EXEMPT, _DRAW_CALL_BOOST, _DRAW_BET_BOOST
+    global _BLUFF_DRAW_EXEMPT, _DRAW_CALL_BOOST, _DRAW_BET_BOOST, _BARREL_FOLD_BONUS
+    global _MID_PAIR_FOLD_BONUS
     global _NUM_PLAYERS, _RANDOM_PREFLOP_FOLDS_DIST
     _SHARED_ADV_NETS  = shared_adv
     _SHARED_STRAT_NETS = shared_strat
@@ -146,6 +161,8 @@ def _worker_init(shared_adv, shared_strat, act_size, use_preflop_ranges=False,
     _BLUFF_DRAW_EXEMPT = bluff_draw_exempt
     _DRAW_CALL_BOOST   = draw_call_boost
     _DRAW_BET_BOOST    = draw_bet_boost
+    _BARREL_FOLD_BONUS = barrel_fold_bonus
+    _MID_PAIR_FOLD_BONUS = mid_pair_fold_bonus
     _NUM_PLAYERS       = num_players
     _RANDOM_PREFLOP_FOLDS_DIST = random_preflop_folds_dist
     if use_preflop_ranges:
@@ -304,6 +321,8 @@ def _create_worker_pool(num_workers, shared_adv, shared_strat, act_size,
                   args.bluff_draw_exempt,
                   args.draw_call_boost,
                   args.draw_bet_boost,
+                  args.barrel_fold_bonus,
+                  args.mid_pair_fold_bonus,
                   getattr(args, '_num_players', 6),
                   getattr(args, '_random_preflop_folds_dist', None)),
     )
@@ -562,6 +581,40 @@ def _traversal_worker(args):
                 post_call_pot = float(pot_chips) / max(po, 1e-6)
                 fold_penalty_chips = excess * post_call_pot * _FOLD_PENALTY
 
+        # Barrel fold bonus: reward FOLDING weak made hands to a committed
+        # multi-street barrel. Triggers ONLY when villain shows full commitment:
+        # facing 3+ aggressive actions in pot, pot heavily escalated, and
+        # villain near all-in. NL5 villains rarely bluff this line — folding
+        # one pair (no top pair) is +EV exploit even when CFR-balanced math
+        # says call. Hard fix for the "99 calls 3 streets vs barrel" leak.
+        # obs indices: 19=made_hand_cat, 22=top_pair, 39=facing_3bet_plus,
+        #              41=min_opp_stack_norm, 49=pot_escalation
+        barrel_fold_bonus_chips = 0.0
+        if (_BARREL_FOLD_BONUS > 0 and obs is not None and len(obs) > 49
+                and pot_chips is not None):
+            facing_3bet_plus = float(obs[39])
+            pot_escalation = float(obs[49])
+            min_opp_stack = float(obs[41])
+            top_pair = float(obs[22])
+            if (facing_3bet_plus > 0.5
+                    and pot_escalation > 0.7
+                    and min_opp_stack < 0.15
+                    and made_hand_cat < 0.25
+                    and top_pair < 0.5):
+                barrel_fold_bonus_chips = float(pot_chips) * _BARREL_FOLD_BONUS
+
+        # MID-PAIR FOLD BONUS: extra fold reward when hero holds a low/middle
+        # pair (one-pair class, not top pair) and faces ANY bet. Treys puts
+        # one-pair at made_hand_cat == 0.125; the 0.05–0.20 band excludes
+        # high-card air and two-pair+. Applied to FOLD only.
+        mid_pair_fold_bonus_chips = 0.0
+        if (_MID_PAIR_FOLD_BONUS > 0 and obs is not None and len(obs) > 22
+                and pot_chips is not None
+                and pot_odds is not None and float(pot_odds) > 0):
+            top_pair = float(obs[22])
+            if (0.05 < made_hand_cat < 0.20 and top_pair < 0.5):
+                mid_pair_fold_bonus_chips = float(pot_chips) * _MID_PAIR_FOLD_BONUS
+
 
         # Seed NumPy RNG identically for each branch so opponent stochasticity
         # (monster-shove coin flip, regret-match action sampling, deck reshuffle)
@@ -590,6 +643,10 @@ def _traversal_worker(args):
                 r += value_bonus_chips
             if fold_penalty_chips > 0 and ba == 0:
                 r -= fold_penalty_chips
+            if barrel_fold_bonus_chips > 0 and ba == 0:
+                r += barrel_fold_bonus_chips
+            if mid_pair_fold_bonus_chips > 0 and ba == 0:
+                r += mid_pair_fold_bonus_chips
             results[ba] = r
         # Restore global RNG state so traversal-level randomness continues unaffected
         np.random.set_state(saved_np_state)
@@ -1033,17 +1090,40 @@ def main():
     # Load config first so its values can serve as argparse defaults.
     # CLI flags still override config — this just means `--bluff-penalty 0.6`
     # in the config takes effect without needing to pass it every run.
-    config_path = Path(__file__).parent.parent / 'configs/training_config.json'
+    # Pre-scan argv for --config so we can load it before the rest of argparse runs.
+    _default_config = Path(__file__).parent.parent / 'configs/training_config.json'
+    _config_override = None
+    for i, a in enumerate(sys.argv):
+        if a == '--config' and i + 1 < len(sys.argv):
+            _config_override = sys.argv[i + 1]
+            break
+        if a.startswith('--config='):
+            _config_override = a.split('=', 1)[1]
+            break
+    config_path = Path(_config_override) if _config_override else _default_config
     config = load_config(str(config_path))
     opp = config.get('opponent', {})
 
     parser = argparse.ArgumentParser(description='Deep CFR — multi-core CPU traversal + GPU training')
+    parser.add_argument('--config', type=str, default=str(_default_config),
+                        help=f'Path to training config JSON (default: {_default_config})')
     parser.add_argument('--resume',  type=str,   default=None, help='Checkpoint to resume from')
     parser.add_argument('--warm-start', type=str, default=None,
                         help='Supervised model (.pt) to warm-start strategy networks from')
     parser.add_argument('--workers', type=int,   default=None, help='CPU worker count (default: cpu_count - 1)')
     parser.add_argument('--device',  type=str,   default=None, help='cuda | cpu (auto-detected if omitted)')
     parser.add_argument('--lr',      type=float, default=None, help='Override learning rate after resume')
+    parser.add_argument('--models-dir', type=str, default=None,
+                        help='Override config.paths.models — write checkpoints to this dir instead. '
+                             'Useful for burst-training scripts that need per-cycle output folders.')
+    parser.add_argument('--num-iterations', type=int, default=None,
+                        help='Override config.training.num_iterations (target end iteration).')
+    parser.add_argument('--checkpoint-interval', type=int, default=None,
+                        help='Override config.training.checkpoint_interval.')
+    parser.add_argument('--buffer-save-interval', type=int, default=None,
+                        help='Override BUFFER_SAVE_INTERVAL (default 200). Set this equal '
+                             'to --checkpoint-interval so every checkpoint has a matching '
+                             '_buffer.npz for resumable burst training.')
     parser.add_argument('--preflop-ranges', action='store_true', default=True,
                         help='Lock preflop play to GTO ranges from configs/preflop_ranges.json (default: on)')
     parser.add_argument('--no-preflop-ranges', action='store_true',
@@ -1164,6 +1244,26 @@ def main():
                              'encourages semi-bluffing draws in checked-to spots. '
                              'Applies ONLY to raise actions (Raise½, RaisePot, etc). '
                              'Config default: opponent.draw_bet_boost.')
+    parser.add_argument('--barrel-fold-bonus', type=float,
+                        default=float(opp.get('barrel_fold_bonus', 0.0)),
+                        help='Extra FOLD reward bonus when hero faces a heavy '
+                             '3-street barrel (facing_3bet_plus, pot_escalation>0.7, '
+                             'villain near-all-in) with a weak made hand (one pair, '
+                             'no top pair). 0 = off, 0.1 = soft, 0.2 = moderate, '
+                             '0.3 = strong. Fixes "calls down 99 vs triple barrel" '
+                             'NL5 leak where CFR balance disagrees with population. '
+                             'Applies ONLY to FOLD action. '
+                             'Config default: opponent.barrel_fold_bonus.')
+    parser.add_argument('--mid-pair-fold-bonus', type=float,
+                        default=float(opp.get('mid_pair_fold_bonus', 0.0)),
+                        help='Extra FOLD reward bonus when hero faces ANY bet '
+                             'with a low / middle pair (one-pair class, not top '
+                             'pair, not overpair). 0 = off, 0.1 = soft, '
+                             '0.2 = moderate, 0.3 = strong. Generalises the '
+                             'fold-weak-pair-vs-aggression exploit beyond heavy '
+                             'barrels — useful at NL5 where flop bets get too '
+                             'much respect. Applies ONLY to FOLD action. '
+                             'Config default: opponent.mid_pair_fold_bonus.')
     args = parser.parse_args()
 
     if args.no_preflop_ranges:
@@ -1171,6 +1271,14 @@ def main():
     # --fine-tune-from implies --archetype-mode
     if args.fine_tune_from:
         args.archetype_mode = True
+
+    # Apply CLI overrides to config (used by burst-training wrapper)
+    if args.models_dir is not None:
+        config['paths']['models'] = args.models_dir
+    if args.num_iterations is not None:
+        config['training']['num_iterations'] = args.num_iterations
+    if args.checkpoint_interval is not None:
+        config['training']['checkpoint_interval'] = args.checkpoint_interval
 
     device      = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
     num_workers = args.workers or max(1, mp.cpu_count() - 1)
@@ -1433,7 +1541,9 @@ def main():
           f'allin_monster_threshold={args.allin_monster_threshold} '
           f'bluff_draw_exempt={args.bluff_draw_exempt} '
           f'draw_call_boost={args.draw_call_boost} '
-          f'draw_bet_boost={args.draw_bet_boost}\n')
+          f'draw_bet_boost={args.draw_bet_boost} '
+          f'barrel_fold_bonus={args.barrel_fold_bonus} '
+          f'mid_pair_fold_bonus={args.mid_pair_fold_bonus}\n')
 
     _adv_hist   = deque(maxlen=10)
     _strat_hist = deque(maxlen=10)
@@ -1442,9 +1552,10 @@ def main():
     LOG_INTERVAL = 20       # print avg loss every N iterations
     EVAL_INTERVAL = 200     # self-play + validation every N iterations
     EVAL_HANDS = 2000       # hands per self-play eval
-    BUFFER_SAVE_INTERVAL = 200  # save replay buffer every N iterations (old
-                                # buffers retained — each is ~hundreds of MB;
-                                # at 200 iters × 10 saves = ~several GB per run)
+    # Buffer save cadence — defaults to 200 iters but can be overridden by CLI.
+    # Burst-training wrappers should set this to match --checkpoint-interval so
+    # every saved .pt has a matching _buffer.npz alongside it for clean resume.
+    BUFFER_SAVE_INTERVAL = args.buffer_save_interval or 200
     _batch_adv = []
     _batch_strat = []
     _batch_trav = []
