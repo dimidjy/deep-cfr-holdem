@@ -45,6 +45,24 @@ from validate_spots import (
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Constants for EV / counterfactual analysis
+# ──────────────────────────────────────────────────────────────────────────────
+# NL5 big-blind size (used to convert dollar EV to BB).
+_BB_DOLLARS = 0.05
+# Default fold equity assumption when model raises where the NL5 player did not.
+# Calibrated to NL5 average fold-to-CBet (~37%) and fold-to-3bet (~50-65%) blends.
+_DEFAULT_P_FOLD = 0.30
+# Approximate raise size as a fraction of pot, by action code.
+# Raise½ ≈ 0.5×pot; RaisePot ≈ 1.0×pot; AllIn ≈ 2×pot (conservative).
+_RAISE_SIZE_MULT = {RAISE_HALF: 0.5, RAISE_FULL: 1.0, ALL_IN: 2.0}
+# When opponent calls the model's raise, model invests extra chips into a
+# bigger pot. Some fraction of that extra is recovered through showdown
+# equity. 0.50 ≈ heads-up coinflip; lower for bluff-heavy ranges, higher
+# for value-heavy ranges. Used to scale the "premium cost" in the raise
+# counterfactual.
+_DEFAULT_CONTINUATION_EQUITY = 0.50
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Strong-hand fold guard
 # ──────────────────────────────────────────────────────────────────────────────
 # Observation layout for 6p: Position(8) + PotOdds(3) + HandStrength(5) + Stack(2) + Equity(8)
@@ -61,11 +79,29 @@ from src.decision_engine import (
 # Strategy functions
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _fit_obs(deep_cfr, obs):
+    """Truncate or zero-pad obs to match the model's expected observation size.
+
+    Needed when the script's obs builder produces a different feature count
+    than the model was trained with (e.g. older 50-dim model vs current 53-dim
+    obs builder, or vice versa).
+    """
+    target = getattr(deep_cfr, 'observation_size', None)
+    if target is None or target == len(obs):
+        return obs
+    if len(obs) > target:
+        return obs[:target]
+    padded = np.zeros(target, dtype=np.float32)
+    padded[:len(obs)] = obs
+    return padded
+
+
 def _avg_strategy(deep_cfr, obs, player_idx, legal):
-    return deep_cfr.get_strategy(obs, player_idx, legal)
+    return deep_cfr.get_strategy(_fit_obs(deep_cfr, obs), player_idx, legal)
 
 
 def _current_strategy(deep_cfr, obs, player_idx, legal):
+    obs = _fit_obs(deep_cfr, obs)
     advantages = deep_cfr.compute_counterfactual_values(obs, player_idx, legal)
     pos_adv = np.maximum(advantages, 0.0)
     s = pos_adv.sum()
@@ -81,7 +117,8 @@ def _current_strategy(deep_cfr, obs, player_idx, legal):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _make_engine(num_players: int, legacy_game_state: bool = False,
-                  behavioral_stats: bool = False) -> EnhancedPokerEngine:
+                  behavioral_stats: bool = False,
+                  betting_line: bool = False) -> EnhancedPokerEngine:
     return EnhancedPokerEngine(
         num_players=num_players,
         add_position_features=True,
@@ -94,6 +131,7 @@ def _make_engine(num_players: int, legacy_game_state: bool = False,
         add_betting_history_features=True,
         legacy_game_state=legacy_game_state,
         behavioral_stats=behavioral_stats,
+        betting_line=betting_line,
     )
 
 
@@ -175,22 +213,46 @@ class _SupervisedWrapper:
 
 
 def _autodetect_players(model_path: Path, default: int = 6, force_legacy: bool = False):
-    """Returns (num_players, legacy_game_state)."""
+    """Returns (num_players, legacy_game_state).
+
+    For Deep CFR checkpoints, num_players is taken directly from the
+    advantage-network count (one network per player position). Falls back
+    to obs-size search for older / non-standard checkpoints.
+    """
     try:
         ckpt = torch.load(str(model_path), map_location='cpu')
         if _is_cql_checkpoint(ckpt) or _is_supervised_checkpoint(ckpt):
             return ckpt.get('num_players', default), False
+        # Deep CFR: trust network count
+        adv = ckpt.get('advantage_networks')
+        if adv and isinstance(adv, list) and len(adv) >= 2:
+            return len(adv), force_legacy
+        # Fallback: search by obs size
         input_size = ckpt['advantage_networks'][0]['network.0.weight'].shape[1]
+        bh_opts = (False, True)
+        bl_opts = (False, True)
         if force_legacy:
             for p in range(2, 10):
-                if _make_engine(p, legacy_game_state=True).get_observation_space_size() == input_size:
-                    return p, True
+                for bh in bh_opts:
+                    for bl in bl_opts:
+                        if bl and not bh:
+                            continue
+                        if _make_engine(p, legacy_game_state=True, behavioral_stats=bh, betting_line=bl).get_observation_space_size() == input_size:
+                            return p, True
         for p in range(2, 10):
-            if _make_engine(p).get_observation_space_size() == input_size:
-                return p, False
+            for bh in bh_opts:
+                for bl in bl_opts:
+                    if bl and not bh:
+                        continue
+                    if _make_engine(p, behavioral_stats=bh, betting_line=bl).get_observation_space_size() == input_size:
+                        return p, False
         for p in range(2, 10):
-            if _make_engine(p, legacy_game_state=True).get_observation_space_size() == input_size:
-                return p, True
+            for bh in bh_opts:
+                for bl in bl_opts:
+                    if bl and not bh:
+                        continue
+                    if _make_engine(p, legacy_game_state=True, behavioral_stats=bh, betting_line=bl).get_observation_space_size() == input_size:
+                        return p, True
     except Exception:
         pass
     return default, False
@@ -198,7 +260,8 @@ def _autodetect_players(model_path: Path, default: int = 6, force_legacy: bool =
 
 def _load_model(model_path: Path, config: dict, num_players: int,
                 legacy: bool = False, model_num_players: int = None,
-                behavioral_stats: bool = False):
+                behavioral_stats: bool = False,
+                betting_line: bool = False):
     """Load model. If model_num_players is set and differs from num_players,
     observations will be padded from num_players to model_num_players format."""
     ckpt = torch.load(str(model_path), map_location='cpu')
@@ -219,7 +282,8 @@ def _load_model(model_path: Path, config: dict, num_players: int,
         # Use model's trained player count for obs_size/action_size
         model_np = mnp or ckpt.get('num_players', num_players)
         engine_for_model = _make_engine(model_np, legacy_game_state=legacy,
-                                         behavioral_stats=behavioral_stats)
+                                         behavioral_stats=behavioral_stats,
+                                         betting_line=betting_line)
         obs_size = ckpt.get('obs_size', engine_for_model.get_observation_space_size())
         action_size = ckpt.get('action_size', engine_for_model.get_action_space_size())
         hidden = ckpt.get('hidden_layers', config['network']['hidden_layers'])
@@ -232,12 +296,26 @@ def _load_model(model_path: Path, config: dict, num_players: int,
             ckpt.get('epoch', 0),
             model_num_players=model_np if model_np != num_players else None)
     engine = _make_engine(num_players, legacy_game_state=legacy,
-                          behavioral_stats=behavioral_stats)
+                          behavioral_stats=behavioral_stats,
+                          betting_line=betting_line)
+    # Auto-detect hidden layer dims from checkpoint state_dict (layers 0/5/9
+    # are the three Linear layers between residual blocks). Falls back to
+    # config-file value for older / non-standard architectures.
+    hidden = config['network']['hidden_layers']
+    try:
+        adv = ckpt['advantage_networks'][0]
+        hidden = [
+            adv['network.0.weight'].shape[0],
+            adv['network.5.weight'].shape[0],
+            adv['network.9.weight'].shape[0],
+        ]
+    except (KeyError, IndexError):
+        pass
     deep_cfr = DeepCFR(
         observation_size=engine.get_observation_space_size(),
         action_size=engine.get_action_space_size(),
         num_players=num_players,
-        hidden_layers=config['network']['hidden_layers'],
+        hidden_layers=hidden,
         device='cpu',
     )
     deep_cfr.load_models(str(model_path))
@@ -393,7 +471,7 @@ def analyze_decision_points(deep_cfr, decision_points: list,
             nl5_samples[cat].append((nl5_strat, legal_set, ctx))
 
         # Position stats (preflop only, first action per player per hand)
-        dp_key = (id(dp), dp.player_name)  # unique enough
+        dp_key = (dp.hand_id, dp.player_name)
         if street == 'preflop' and dp_key not in seen_preflop:
             seen_preflop.add(dp_key)
             pos = dp.position_label
@@ -546,16 +624,28 @@ def compute_nl5_population_stats(all_6p_hands: list, num_players: int = 6):
 def compute_showdown_ev(showdown_hands: list, all_decision_points: list,
                         strategy_fn, deep_cfr, num_players: int,
                         preflop_ranges=None, strong_hand_guard=False,
-                        good_players=None, bad_players=None):
+                        good_players=None, bad_players=None,
+                        p_fold_to_raise: float = _DEFAULT_P_FOLD,
+                        continuation_equity: float = _DEFAULT_CONTINUATION_EQUITY):
     """Estimate model's EV advantage vs NL5 players at showdown hands.
 
-    For each showdown player with known hole cards:
-    - Compute their actual net result (collected - invested)
-    - Walk through their decisions; if model would fold at some point,
-      compute model's net = -(invested up to that fold point)
-    - If model never folds, model gets same result as player
+    For each showdown player with known hole cards we walk their decision
+    sequence and stop at the first deviation from what the player did:
 
-    Returns dict with EV stats.
+    - Model FOLD where player did not → model_net = -(invested up to fold).
+      Avoided loss / missed gain accounted by player_net sign.
+    - Model RAISE (½/pot/all-in) where player called/checked → assumed crude
+      fold-equity counterfactual: with prob p_fold_to_raise opponent folds and
+      model collects pot_at_action; with prob (1 - p_fold_to_raise) the hand
+      plays out as the player's path but with extra chips invested due to
+      the raise size. Net contribution is added to the player's actual net.
+    - Otherwise → model_net = player_net (same as player).
+
+    The raise counterfactual is approximate (no real opponent simulation),
+    but it gives aggressive models partial credit for fold equity that the
+    fold-only baseline ignored.
+
+    Returns dict with EV stats including raise-deviation breakdowns.
     """
     good_players = good_players or set()
     bad_players = bad_players or set()
@@ -566,74 +656,85 @@ def compute_showdown_ev(showdown_hands: list, all_decision_points: list,
         dp_by_hand_player[(dp.hand_id, dp.player_name)].append(dp)
 
     # Per-hand results
-    player_ev_diffs = []   # model_net - player_net per player per hand
-    avoided_losses = []    # losses model avoids by folding
-    missed_gains = []      # gains model misses by folding
-    same_play = []         # hands where model plays the same
+    player_ev_diffs = []
+    avoided_losses = []
+    missed_gains = []
+    same_play = []
     model_nets = []
     player_nets = []
 
-    # Calling efficiency: when model continues, does it win?
-    continue_wins = 0      # model continues AND player won
-    continue_losses = 0    # model continues AND player lost
-    # Fold accuracy: when model folds, was the player losing?
-    fold_correct = 0       # model folds AND player lost
-    fold_wrong = 0         # model folds AND player won
+    # Calling efficiency / fold accuracy
+    continue_wins = 0
+    continue_losses = 0
+    fold_correct = 0
+    fold_wrong = 0
 
-    # Split by player quality
+    # Raise-upgrade deviation tracking (model raises where player didn't)
+    raise_upgrade_count = 0
+    raise_fe_gains = []   # estimated fold-equity gains
+    raise_premium_costs = []  # estimated extra investment when not folded
+    street_raises = defaultdict(lambda: {
+        'count': 0, 'fe_gain': 0.0, 'premium_cost': 0.0,
+    })
+
     ev_by_quality = {
         'good': {'ev_diffs': [], 'model_nets': [], 'player_nets': []},
         'bad': {'ev_diffs': [], 'model_nets': [], 'player_nets': []},
         'unknown': {'ev_diffs': [], 'model_nets': [], 'player_nets': []},
     }
 
-    # Per-street fold savings
     street_folds = defaultdict(lambda: {'count': 0, 'saved': 0.0, 'missed': 0.0})
 
+    _POS_TO_REL_EV = {'BTN': 0, 'SB': 1, 'BB': 2,
+                      'UTG': 3, 'MP': 4, 'CO': 5}
+
     for hand in showdown_hands:
-        # Compute total $ invested per player from all actions
         invested = _compute_all_invested(hand)
 
-        # Compute per-player net result
         collected = defaultdict(float)
         for w in hand.result.winners:
             collected[w['name']] += w['amount_dollars']
 
-        # Only analyze showdown players (whose cards we know)
+        # Cache invested-timeline once per (hand, player) — avoids O(n²) recompute
+        invested_timelines = {}
+
         for player_name in hand.shown_hands:
             player_invested = invested.get(player_name, 0.0)
             player_collected = collected.get(player_name, 0.0)
             player_net = player_collected - player_invested
 
-            # Get this player's decision points in order
             dps = dp_by_hand_player.get((hand.hand_id, player_name), [])
             if not dps:
                 continue
 
-            # Walk decisions: find first point model would fold
+            timeline = invested_timelines.get(player_name)
+            if timeline is None:
+                timeline = _build_invested_timeline(hand, player_name)
+                invested_timelines[player_name] = timeline
+
+            # Walk decisions: stop at first deviation (fold or raise upgrade)
             model_would_fold = False
             invested_at_fold = 0.0
             fold_street = None
-            running_invested = 0.0
+
+            raise_upgrade = False
+            raise_pot_at_action = 0.0
+            raise_action_code = None
+            raise_street = None
 
             for dp in dps:
                 legal = dp.legal_actions
                 if not legal:
                     continue
 
-                # Track investment up to this point
-                running_invested = _invested_up_to_action(
-                    hand, player_name, dp.action_index)
-
+                running_invested = timeline.get(dp.action_index, 0.0)
                 rel_pos = _pos_to_idx(dp.position_label, num_players)
 
-                # Preflop range override
                 if (dp.street == 'preflop' and preflop_ranges is not None
                         and dp.hole_cards and len(dp.hole_cards) >= 2):
-                    _POS_TO_REL_EV = {'BTN': 0, 'SB': 1, 'BB': 2,
-                                      'UTG': 3, 'MP': 4, 'CO': 5}
                     pf_rel = _POS_TO_REL_EV.get(dp.position_label, 0)
-                    pot_bb = dp.pot_dollars / 0.05 if dp.pot_dollars > 0 else 1.5
+                    pot_bb = (dp.pot_dollars / _BB_DOLLARS
+                              if dp.pot_dollars > 0 else 1.5)
                     model_strategy = preflop_ranges.get_strategy(
                         dp.hole_cards, pf_rel, pot_bb, legal,
                         deep_cfr.action_size)
@@ -641,9 +742,11 @@ def compute_showdown_ev(showdown_hands: list, all_decision_points: list,
                     model_strategy = strategy_fn(dp.observation, rel_pos, legal)
 
                 if strong_hand_guard and dp.street != 'preflop':
-                    model_strategy = apply_strong_hand_guard(model_strategy, dp.observation, legal)
+                    model_strategy = apply_strong_hand_guard(
+                        model_strategy, dp.observation, legal)
 
                 model_top = int(np.argmax(model_strategy))
+                actual = dp.actual_action
 
                 if model_top == FOLD and FOLD in legal:
                     model_would_fold = True
@@ -651,11 +754,40 @@ def compute_showdown_ev(showdown_hands: list, all_decision_points: list,
                     fold_street = dp.street
                     break
 
+                # Raise upgrade: model raises where player did not raise
+                # (and didn't fold either — folds are handled above).
+                if (model_top in AGGRESSIVE
+                        and actual not in AGGRESSIVE
+                        and actual != FOLD):
+                    raise_upgrade = True
+                    raise_pot_at_action = dp.pot_dollars
+                    raise_action_code = model_top
+                    raise_street = dp.street
+                    break
+
             if model_would_fold:
-                # Model folds: its net = -(invested up to fold point)
                 model_net = -invested_at_fold
+            elif raise_upgrade:
+                # Crude fold-equity counterfactual:
+                #   p_fold * pot_won_immediately            (gain when opp folds)
+                # - (1 - p_fold) * extra_invest * (1 - cont_equity)
+                #                                            (cost when called)
+                # cont_equity = expected pot-share recovered through showdown
+                # in the bigger called pot. 0.50 ≈ neutral assumption.
+                fe_gain = p_fold_to_raise * raise_pot_at_action
+                size_mult = _RAISE_SIZE_MULT.get(raise_action_code, 0.5)
+                extra_invest = raise_pot_at_action * size_mult
+                premium = ((1.0 - p_fold_to_raise) * extra_invest
+                           * (1.0 - continuation_equity))
+                model_net = player_net + fe_gain - premium
+
+                raise_upgrade_count += 1
+                raise_fe_gains.append(fe_gain)
+                raise_premium_costs.append(premium)
+                street_raises[raise_street]['count'] += 1
+                street_raises[raise_street]['fe_gain'] += fe_gain
+                street_raises[raise_street]['premium_cost'] += premium
             else:
-                # Model plays same as player through to showdown
                 model_net = player_net
 
             ev_diff = model_net - player_net
@@ -663,7 +795,6 @@ def compute_showdown_ev(showdown_hands: list, all_decision_points: list,
             model_nets.append(model_net)
             player_nets.append(player_net)
 
-            # Quality split
             if player_name in good_players:
                 q = 'good'
             elif player_name in bad_players:
@@ -676,15 +807,13 @@ def compute_showdown_ev(showdown_hands: list, all_decision_points: list,
 
             if model_would_fold:
                 if player_net < 0:
-                    # Player lost, model folds = avoided loss
                     saved = (-player_net) - invested_at_fold
                     avoided_losses.append(saved)
                     street_folds[fold_street]['count'] += 1
                     street_folds[fold_street]['saved'] += saved
                     fold_correct += 1
                 else:
-                    # Player won, model folds = missed gain
-                    missed = player_net + invested_at_fold  # total missed
+                    missed = player_net + invested_at_fold
                     missed_gains.append(missed)
                     street_folds[fold_street]['count'] += 1
                     street_folds[fold_street]['missed'] += missed
@@ -711,6 +840,12 @@ def compute_showdown_ev(showdown_hands: list, all_decision_points: list,
         'fold_correct': fold_correct,
         'fold_wrong': fold_wrong,
         'ev_by_quality': ev_by_quality,
+        # Raise-upgrade counterfactual
+        'raise_upgrade_count': raise_upgrade_count,
+        'raise_fe_gains': raise_fe_gains,
+        'raise_premium_costs': raise_premium_costs,
+        'street_raises': dict(street_raises),
+        'p_fold_used': p_fold_to_raise,
     }
 
 
@@ -750,7 +885,21 @@ def _compute_all_invested(hand) -> dict:
 
 
 def _invested_up_to_action(hand, player_name: str, action_index: int) -> float:
-    """Compute $ invested by player up to (but not including) action at action_index."""
+    """Compute $ invested by player up to (but not including) action at action_index.
+
+    Kept for backwards compatibility. Per-decision callers should prefer
+    _build_invested_timeline() — O(n) once per (hand, player) instead of O(n²).
+    """
+    return _build_invested_timeline(hand, player_name).get(action_index, 0.0)
+
+
+def _build_invested_timeline(hand, player_name: str) -> dict:
+    """Return {action_index: invested_up_to_but_not_including_that_action}.
+
+    One pass over hand.actions for the named player. The returned dict can
+    be reused across all of that player's decision points in the hand.
+    """
+    timeline = {}
     invested = 0.0
     street_bet = 0.0
     current_street = 'preflop'
@@ -762,8 +911,7 @@ def _invested_up_to_action(hand, player_name: str, action_index: int) -> float:
             current_street = action.street
 
         if action.player_name == player_name:
-            if idx >= action_index:
-                break
+            timeline[idx] = invested
             if action.action_type in ('blind_sb', 'blind_bb'):
                 invested += action.amount_dollars
                 street_bet = action.amount_dollars
@@ -779,7 +927,7 @@ def _invested_up_to_action(hand, player_name: str, action_index: int) -> float:
                 street_bet = action.amount_dollars
             idx += 1
 
-    return invested
+    return timeline
 
 
 def print_report(metrics: dict, parse_stats: dict, deep_cfr, num_dp: int):
@@ -1018,6 +1166,32 @@ def print_report(metrics: dict, parse_stats: dict, deep_cfr, num_dp: int):
                           f"   missed: ${s['missed']:>7.2f}"
                           f"   net: ${net:>+.2f}")
 
+        # ── Raise-upgrade counterfactual ──────────────────────────────
+        ru_count = ev_data.get('raise_upgrade_count', 0)
+        if ru_count > 0:
+            fe_total = sum(ev_data['raise_fe_gains'])
+            prem_total = sum(ev_data['raise_premium_costs'])
+            net_raise = fe_total - prem_total
+            p_fold = ev_data.get('p_fold_used', _DEFAULT_P_FOLD)
+            print(f"\n  Model raises where player called/checked:  {ru_count}"
+                  f"  ({ru_count/max(total_sp,1)*100:.1f}%)")
+            print(f"    Assumed fold equity p_fold = {p_fold:.2f}")
+            print(f"    Estimated FE gain:    ${fe_total:>+8.2f}")
+            print(f"    Estimated premium:    ${prem_total:>+8.2f}")
+            print(f"    Net raise estimate:   ${net_raise:>+8.2f}")
+
+            sr = ev_data.get('street_raises', {})
+            if sr:
+                print(f"\n  Raise-by-street breakdown:")
+                for street in ['preflop', 'flop', 'turn', 'river']:
+                    if street in sr:
+                        s = sr[street]
+                        net = s['fe_gain'] - s['premium_cost']
+                        print(f"    {street:<8} raises: {s['count']:>4}"
+                              f"   FE: ${s['fe_gain']:>7.2f}"
+                              f"   prem: ${s['premium_cost']:>7.2f}"
+                              f"   net: ${net:>+.2f}")
+
         # ── Fold accuracy & calling efficiency ────────────────────────
         fc = ev_data.get('fold_correct', 0)
         fw = ev_data.get('fold_wrong', 0)
@@ -1060,10 +1234,31 @@ def print_report(metrics: dict, parse_stats: dict, deep_cfr, num_dp: int):
                       f"${m_total:>+9.2f}  ${ev_d:>+9.2f}  {bb_h:>+7.2f}")
 
         # Per-hand EV
-        ev_per_hand = ev_diff_total / total_sp
-        bb_per_hand = ev_per_hand / 0.05  # convert to BB
-        print(f"\n  Model edge:  {bb_per_hand:>+.2f} BB/hand  "
-              f"({bb_per_hand * 100:>+.1f} BB/100)")
+        ev_per_hand_sd = ev_diff_total / total_sp
+        bb_per_hand_sd = ev_per_hand_sd / _BB_DOLLARS
+
+        # Project to all-hands edge: showdown hands are a subset, and
+        # for non-showdown hands EV diff is structurally 0 (no hole cards
+        # to query the model). So the population edge is scaled down by
+        # the showdown fraction. This is a more honest table-edge proxy.
+        all_6p = parse_stats.get('all_6p_hands') or 0
+        sd_count = parse_stats.get('filtered_hands') or 0
+        if all_6p > 0 and sd_count > 0:
+            sd_fraction = sd_count / all_6p
+            bb_per_hand_proj = bb_per_hand_sd * sd_fraction
+        else:
+            sd_fraction = None
+            bb_per_hand_proj = None
+
+        print(f"\n  ── EV HEADLINE ──")
+        print(f"  Showdown-only edge:  {bb_per_hand_sd:>+.2f} BB/hand  "
+              f"({bb_per_hand_sd * 100:>+.1f} BB/100)")
+        print(f"    (per showdown player-hand; aggressive models under-credited)")
+        if bb_per_hand_proj is not None:
+            print(f"  All-hands projection: {bb_per_hand_proj:>+.2f} BB/hand  "
+                  f"({bb_per_hand_proj * 100:>+.1f} BB/100)")
+            print(f"    (scaled by showdown fraction {sd_fraction:.1%}; "
+                  f"lower bound on table edge)")
 
     # ── Summary ───────────────────────────────────────────────────────────
     print()
@@ -1072,9 +1267,14 @@ def print_report(metrics: dict, parse_stats: dict, deep_cfr, num_dp: int):
         avg_p = np.mean(p_actual)
         agree = agreement.get('overall', {})
         rate = agree.get('match', 0) / max(agree.get('total', 1), 1)
-        if rate > 0.35 and avg_p > 0.20:
+        # Tightened thresholds. Showdown-player agreement is biased low for
+        # tight folders, so 50% is a meaningful "reasonable" floor and 60%
+        # is "good". Old 35% threshold mainly checked "not uniform random".
+        if rate > 0.60 and avg_p > 0.30:
+            verdict = "Model plays strong poker vs NL5 field"
+        elif rate > 0.50 and avg_p > 0.25:
             verdict = "Model plays reasonable poker vs NL5 field"
-        elif rate > 0.25:
+        elif rate > 0.40:
             verdict = "Model shows basic understanding but differs from NL5"
         else:
             verdict = "Model strategy diverges significantly from NL5 play"
@@ -1245,11 +1445,25 @@ def main():
                         help='Override game player count (e.g. use 6p model on 4p hands)')
     parser.add_argument('--behavioral-stats', action='store_true',
                         help='Append behavioral stats to observations (for models trained with them)')
+    parser.add_argument('--betting-line', action='store_true',
+                        help='Append 3-dim betting-line features (requires behavioral stats)')
+    parser.add_argument('--fold-equity', type=float, default=_DEFAULT_P_FOLD,
+                        help=f'Assumed opponent fold probability when model raises '
+                             f'where NL5 player did not (default {_DEFAULT_P_FOLD}). '
+                             f'Set to 0 to disable raise counterfactual.')
+    parser.add_argument('--continuation-equity', type=float,
+                        default=_DEFAULT_CONTINUATION_EQUITY,
+                        help=f'Fraction of model raise extra-invest recovered '
+                             f'through showdown equity when opponent calls '
+                             f'(default {_DEFAULT_CONTINUATION_EQUITY}).')
     parser.add_argument('--good-players', type=str, default='',
                         help='Path to good players list (for split metrics)')
     parser.add_argument('--bad-players', type=str, default='',
                         help='Path to bad players list (for split metrics)')
     args = parser.parse_args()
+
+    if args.betting_line and not args.behavioral_stats:
+        args.behavioral_stats = True
 
     game_players_override = args.game_players if args.game_players > 0 else None
 
@@ -1368,7 +1582,8 @@ def main():
 
         deep_cfr = _load_model(model_path, config, num_players, legacy,
                                model_num_players=model_np if num_players != model_np else None,
-                               behavioral_stats=args.behavioral_stats)
+                               behavioral_stats=args.behavioral_stats,
+                               betting_line=args.betting_line)
         for net in deep_cfr.advantage_networks + deep_cfr.strategy_networks:
             net.eval()
         print(f'Loaded model: {model_path.name}  (iteration {deep_cfr.iteration})')
@@ -1472,7 +1687,9 @@ def main():
         preflop_ranges=pf_ranges,
         strong_hand_guard=args.strong_hand_guard,
         good_players=good_players,
-        bad_players=bad_players)
+        bad_players=bad_players,
+        p_fold_to_raise=args.fold_equity,
+        continuation_equity=args.continuation_equity)
     metrics['showdown_ev'] = ev_data
 
     parse_stats = {

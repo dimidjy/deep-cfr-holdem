@@ -42,9 +42,13 @@ _ACTION_NAMES = {
     4: 'AllIn', 5: 'RaiseMin',
 }
 
-# Valid obs sizes we know how to score against (50/51 engine/agent,
-# 55/56 with opponent profile). Anything else is a checkpoint mismatch.
-_VALID_OBS_SIZES = {50, 51, 55, 56}
+# Valid obs sizes we know how to score against. Each entry corresponds to a
+# historical or current schema. New rows must be added here whenever the obs
+# layout changes, otherwise spots from that schema get silently dropped.
+#   50/51 — engine/agent base schema (pre-betting-line)
+#   53/54 — engine/agent with the betting-line block (3 extra dims)
+#   55/56 — engine/agent with opponent profile (5 extra dims)
+_VALID_OBS_SIZES = {50, 51, 53, 54, 55, 56}
 
 
 def score_action(model_action: int, right_action: int) -> float:
@@ -120,7 +124,14 @@ def score_model(deep_cfr, spots: List[Dict], num_players: int = 6) -> Dict:
         if model_obs_size and len(obs) > model_obs_size:
             obs = obs[:model_obs_size]
         elif model_obs_size and len(obs) < model_obs_size:
-            continue
+            # Spot log was generated under an older obs builder. Zero-pad up
+            # to the model's expected size so newer-architecture models can
+            # still be scored against legacy spot logs (the missing features
+            # default to 0, which biases scores DOWN — actual model quality
+            # may be higher once the agent's obs_builder is upgraded).
+            padded = np.zeros(model_obs_size, dtype=np.float32)
+            padded[:len(obs)] = obs
+            obs = padded
 
         gs = spot.get('game_state', {})
         legal = gs.get('legal_actions') or list(range(6))

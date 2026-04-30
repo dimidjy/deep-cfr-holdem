@@ -73,7 +73,7 @@ def _eval_checkpoint(ckpt_path: Path) -> float | None:
         str(_PROJECT_ROOT / 'scripts/validate_spot_logs.py'),
         '--model', str(ckpt_path),
     ]
-    print(f'  Evaluating {ckpt_path.name} ...', flush=True)
+    print(f'  Evaluating {ckpt_path.name} (spot logs) ...', flush=True)
     t0 = time.time()
     result = subprocess.run(cmd, capture_output=True, text=True,
                             cwd=str(_PROJECT_ROOT))
@@ -85,8 +85,147 @@ def _eval_checkpoint(ckpt_path: Path) -> float | None:
     if score is None:
         print(f'    [no score parsed in {dt:.1f}s]')
         return None
-    print(f'    score = {score:.2f}%  ({dt:.1f}s)')
+    print(f'    spot logs = {score:.2f}%  ({dt:.1f}s)')
     return score
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Composite scoring: spot logs + HH validation + self-play GTO compliance
+# ──────────────────────────────────────────────────────────────────────────────
+# GTO bands per CLAUDE.md (project root) — used for self-play compliance score.
+# Postflop stats only. Preflop (VPIP/PFR/3Bet) is forced by GTO range override
+# in DecisionEngine, so it's always near-target regardless of model quality.
+# Including preflop stats would inflate every model's GTO score by ~50%.
+GTO_RANGES = {
+    'cbet':      (55.0, 70.0),
+    'af':        (2.0, 3.5),
+    'wtsd':      (25.0, 32.0),
+}
+
+# Composite weights — money first, decision quality second, robustness third.
+DEFAULT_WEIGHTS = {'hh': 0.50, 'spot': 0.30, 'gto': 0.20}
+
+# HH BB/h normalization anchor: 0 = break-even, +2.0 BB/h showdown = score 100.
+# Top current-gen models score ~+1.36 → 68 on this scale.
+HH_BBH_CEILING = 2.0
+
+
+def _eval_hh_validation(ckpt_path: Path, max_hands: int = 10000,
+                        behavioral_stats: bool = True,
+                        betting_line: bool = True) -> tuple:
+    """Run validate_vs_hh.py, parse showdown BB/h and HH agreement.
+
+    Returns (bb_h_showdown, agreement_pct) or (None, None) on failure.
+    """
+    cmd = [
+        'python3',
+        str(_PROJECT_ROOT / 'scripts/validate_vs_hh.py'),
+        '--model', str(ckpt_path),
+        '--max-hands', str(max_hands),
+    ]
+    if behavioral_stats:
+        cmd.append('--behavioral-stats')
+    if betting_line:
+        cmd.append('--betting-line')
+    print(f'  Evaluating {ckpt_path.name} (HH {max_hands}) ...', flush=True)
+    t0 = time.time()
+    result = subprocess.run(cmd, capture_output=True, text=True,
+                            cwd=str(_PROJECT_ROOT))
+    dt = time.time() - t0
+    if result.returncode != 0:
+        print(f'    [HH FAILED in {dt:.1f}s]: '
+              f'{result.stderr.splitlines()[-3:] if result.stderr else "no stderr"}')
+        return None, None
+    bb_h = None
+    agreement = None
+    for line in result.stdout.splitlines():
+        m = re.search(r'Showdown-only edge:\s+([+-]?[\d.]+)\s+BB/hand', line)
+        if m and bb_h is None:
+            bb_h = float(m.group(1))
+        m = re.search(r'agreement=([\d.]+)%', line)
+        if m and agreement is None:
+            agreement = float(m.group(1))
+    if bb_h is None:
+        print(f'    [HH no BB/h parsed in {dt:.1f}s]')
+        return None, None
+    print(f'    HH BB/h = {bb_h:+.2f}  agreement = '
+          f'{agreement:.1f}%  ({dt:.1f}s)' if agreement is not None
+          else f'    HH BB/h = {bb_h:+.2f}  ({dt:.1f}s)')
+    return bb_h, agreement
+
+
+def _eval_self_play(ckpt_path: Path, hands: int = 10000) -> dict | None:
+    """Run self_play.py, return dict of GTO-relevant stats (or None on fail)."""
+    cmd = [
+        'python3',
+        str(_PROJECT_ROOT / 'scripts/analysis/self_play.py'),
+        '--model', str(ckpt_path),
+        '--hands', str(hands),
+        '--no-guards',
+    ]
+    print(f'  Evaluating {ckpt_path.name} (self-play {hands}) ...', flush=True)
+    t0 = time.time()
+    result = subprocess.run(cmd, capture_output=True, text=True,
+                            cwd=str(_PROJECT_ROOT))
+    dt = time.time() - t0
+    if result.returncode != 0:
+        print(f'    [self-play FAILED in {dt:.1f}s]')
+        return None
+    patterns = {
+        'vpip':      r'^\s+VPIP:\s+([\d.]+)%',
+        'pfr':       r'^\s+PFR:\s+([\d.]+)%',
+        'three_bet': r'^\s+3Bet:\s+([\d.]+)%',
+        'cbet':      r'^\s+CBet:\s+([\d.]+)%',
+        'af':        r'^\s+AF \(agg factor\):\s+([\d.]+)',
+        'wtsd':      r'^\s+WTSD \(went to SD\):\s+([\d.]+)%',
+    }
+    stats = {}
+    for line in result.stdout.splitlines():
+        for key, pat in patterns.items():
+            if key in stats:
+                continue
+            m = re.match(pat, line)
+            if m:
+                stats[key] = float(m.group(1))
+    if len(stats) < 5:
+        print(f'    [self-play parsed only {len(stats)}/6 stats in {dt:.1f}s]')
+        return None
+    in_band = sum(1 for k, (lo, hi) in GTO_RANGES.items()
+                  if k in stats and lo <= stats[k] <= hi)
+    print(f'    self-play GTO in-band: {in_band}/{len(GTO_RANGES)}  '
+          f'(CBet={stats.get("cbet", 0):.1f} AF={stats.get("af", 0):.2f} '
+          f'WTSD={stats.get("wtsd", 0):.1f})  ({dt:.1f}s)')
+    return stats
+
+
+def _gto_score(self_play_stats: dict | None) -> float:
+    """0-100 score: fraction of GTO stats in band."""
+    if not self_play_stats:
+        return 0.0
+    in_band = sum(1 for k, (lo, hi) in GTO_RANGES.items()
+                  if k in self_play_stats and lo <= self_play_stats[k] <= hi)
+    return in_band / len(GTO_RANGES) * 100.0
+
+
+def _hh_score(bb_h_showdown: float | None) -> float:
+    """0-100 score: HH BB/h normalized.
+    0   = break-even (0 BB/h)
+    100 = +HH_BBH_CEILING BB/h (currently 2.0 = aspirational)
+    """
+    if bb_h_showdown is None:
+        return 0.0
+    return max(0.0, min(100.0, bb_h_showdown / HH_BBH_CEILING * 100.0))
+
+
+def _composite_score(spot_pct: float | None,
+                     bb_h_showdown: float | None,
+                     self_play_stats: dict | None,
+                     weights: dict = DEFAULT_WEIGHTS) -> float:
+    """Weighted blend of HH (50%), spot logs (30%), GTO compliance (20%)."""
+    spot = spot_pct if spot_pct is not None else 0.0
+    hh   = _hh_score(bb_h_showdown)
+    gto  = _gto_score(self_play_stats)
+    return weights['hh'] * hh + weights['spot'] * spot + weights['gto'] * gto
 
 
 def _find_cycle_checkpoints(cycle_dir: Path,
@@ -114,7 +253,11 @@ def _run_cycle(*,
                cycle_dir: Path,
                config_path: Path,
                kbest_seed: list[str],
-               workers: int) -> dict:
+               workers: int,
+               selector: str = 'composite',
+               hh_hands: int = 10000,
+               self_play_hands: int = 10000,
+               composite_weights: dict = None) -> dict:
     """Run one training cycle and return cycle stats."""
     cycle_dir.mkdir(parents=True, exist_ok=True)
     print()
@@ -157,22 +300,62 @@ def _run_cycle(*,
     print(f'  Saved {len(new_checkpoints)} checkpoints: '
           f'{[p.name for p in new_checkpoints]}')
 
-    # Evaluate each
-    print('\n  Evaluating cycle checkpoints...')
-    scores: dict[str, float] = {}
+    # Evaluate each — spot logs always; HH and self-play if composite mode
+    print(f'\n  Evaluating cycle checkpoints (selector={selector})...')
+    weights = composite_weights or DEFAULT_WEIGHTS
+    metrics: dict[str, dict] = {}
+    scores: dict[str, float] = {}  # primary score used for selection
     for cp in new_checkpoints:
-        score = _eval_checkpoint(cp)
-        if score is not None:
-            scores[cp.name] = score
+        print(f'\n  --- {cp.name} ---')
+        spot_pct = _eval_checkpoint(cp)
+
+        bb_h = None
+        agreement = None
+        sp_stats = None
+        if selector == 'composite':
+            bb_h, agreement = _eval_hh_validation(cp, max_hands=hh_hands)
+            sp_stats = _eval_self_play(cp, hands=self_play_hands)
+
+        if selector == 'composite':
+            primary = _composite_score(spot_pct, bb_h, sp_stats, weights=weights)
+        else:
+            primary = spot_pct if spot_pct is not None else 0.0
+
+        metrics[cp.name] = {
+            'spot_pct': spot_pct,
+            'hh_bb_h_showdown': bb_h,
+            'hh_agreement_pct': agreement,
+            'self_play': sp_stats,
+            'gto_score': _gto_score(sp_stats),
+            'hh_score': _hh_score(bb_h),
+            'composite': _composite_score(spot_pct, bb_h, sp_stats, weights=weights),
+            'selector_score': primary,
+        }
+        scores[cp.name] = primary
+
+        print(f'    --> primary score = {primary:.2f}  '
+              f'(spot={spot_pct or 0:.1f}  hh={_hh_score(bb_h):.1f}  '
+              f'gto={_gto_score(sp_stats):.1f})')
 
     if not scores:
         raise RuntimeError(f'Cycle {cycle_idx} produced no evaluable checkpoints')
 
-    # Pick winner
+    # Pick winner by primary (composite or spot-only)
     best_name = max(scores, key=lambda k: scores[k])
     best_path = cycle_dir / best_name
-    print(f'\n  Best in cycle {cycle_idx}: {best_name} '
-          f'(score={scores[best_name]:.2f}%)')
+    best_metrics = metrics[best_name]
+    print(f'\n  Best in cycle {cycle_idx}: {best_name}  '
+          f'(primary={scores[best_name]:.2f})')
+    print(f'    spot logs       : {best_metrics["spot_pct"]:.1f}%'
+          if best_metrics["spot_pct"] is not None else '    spot logs       : <failed>')
+    if best_metrics["hh_bb_h_showdown"] is not None:
+        print(f'    HH BB/h         : {best_metrics["hh_bb_h_showdown"]:+.2f}'
+              f'  (score {best_metrics["hh_score"]:.1f})')
+        if best_metrics["hh_agreement_pct"] is not None:
+            print(f'    HH agreement    : {best_metrics["hh_agreement_pct"]:.1f}%')
+    print(f'    GTO in band     : {int(best_metrics["gto_score"] / 100 * len(GTO_RANGES))}'
+          f'/{len(GTO_RANGES)}  (score {best_metrics["gto_score"]:.1f})')
+    print(f'    composite       : {best_metrics["composite"]:.2f}')
 
     cycle_summary = {
         'cycle': cycle_idx,
@@ -181,10 +364,15 @@ def _run_cycle(*,
         'resume_from': str(resume_path),
         'output_dir': str(cycle_dir),
         'duration_minutes': dt / 60,
+        'selector': selector,
+        'composite_weights': weights,
         'checkpoints': sorted(scores.keys()),
-        'scores_pct': scores,
+        'metrics': metrics,
+        # Backward-compat fields
+        'scores_pct': {k: v.get('spot_pct') for k, v in metrics.items()},
         'best_checkpoint': best_name,
-        'best_score_pct': scores[best_name],
+        'best_score_pct': metrics[best_name].get('spot_pct'),
+        'best_composite': metrics[best_name].get('composite'),
         'best_path': str(best_path),
     }
     with open(cycle_dir / 'cycle_results.json', 'w') as f:
@@ -214,7 +402,34 @@ def main():
                    help='Checkpoints for K-Best opponent pool (frozen across cycles)')
     p.add_argument('--workers', type=int, default=54,
                    help='Worker count passed to train_gpu.py')
+    p.add_argument('--selector', choices=['composite', 'spot'], default='composite',
+                   help='Checkpoint selector. composite (default) blends spot '
+                        'logs + HH validation BB/h + self-play GTO compliance. '
+                        '"spot" reverts to legacy spot-log-only selection.')
+    p.add_argument('--hh-hands', type=int, default=10000,
+                   help='Hand count for HH validation per checkpoint (composite '
+                        'mode only). 10k = ~1-2 min per ckpt; 50k for higher '
+                        'fidelity at ~5-10 min.')
+    p.add_argument('--self-play-hands', type=int, default=10000,
+                   help='Hand count for self-play GTO check per checkpoint.')
+    p.add_argument('--weight-hh', type=float, default=DEFAULT_WEIGHTS['hh'],
+                   help=f'Composite weight for HH score (default {DEFAULT_WEIGHTS["hh"]}).')
+    p.add_argument('--weight-spot', type=float, default=DEFAULT_WEIGHTS['spot'],
+                   help=f'Composite weight for spot-log score '
+                        f'(default {DEFAULT_WEIGHTS["spot"]}).')
+    p.add_argument('--weight-gto', type=float, default=DEFAULT_WEIGHTS['gto'],
+                   help=f'Composite weight for GTO compliance '
+                        f'(default {DEFAULT_WEIGHTS["gto"]}).')
     args = p.parse_args()
+    composite_weights = {
+        'hh':   args.weight_hh,
+        'spot': args.weight_spot,
+        'gto':  args.weight_gto,
+    }
+    w_sum = sum(composite_weights.values())
+    if abs(w_sum - 1.0) > 0.001:
+        print(f'WARNING: composite weights sum to {w_sum:.3f}, not 1.0. '
+              f'Using anyway — scores will be off-scale.')
 
     if args.iters_per_cycle % args.checkpoints_per_cycle != 0:
         print(f'WARNING: iters_per_cycle ({args.iters_per_cycle}) is not '
@@ -250,6 +465,12 @@ def main():
     print(f'  Config             : {args.config}')
     if args.kbest_seed:
         print(f'  K-Best pool        : {[Path(p).name for p in args.kbest_seed]}')
+    print(f'  Selector           : {args.selector}')
+    if args.selector == 'composite':
+        print(f'    HH hands         : {args.hh_hands}')
+        print(f'    Self-play hands  : {args.self_play_hands}')
+        print(f'    Weights (hh/spot/gto) : '
+              f'{args.weight_hh} / {args.weight_spot} / {args.weight_gto}')
     print('=' * 70, flush=True)
 
     timeline = []
@@ -271,6 +492,10 @@ def main():
             config_path=args.config,
             kbest_seed=args.kbest_seed,
             workers=args.workers,
+            selector=args.selector,
+            hh_hands=args.hh_hands,
+            self_play_hands=args.self_play_hands,
+            composite_weights=composite_weights,
         )
         timeline.append(cycle_summary)
 

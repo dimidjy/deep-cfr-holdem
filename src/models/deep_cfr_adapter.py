@@ -68,9 +68,20 @@ class DeepCFRAdapter(ModelAdapter):
             action_size = kwargs.get('action_size', 5)
             num_players = 6
 
-        # Get hidden_layers from config (architecture not reliably inferable
-        # from residual block weights)
+        # Infer hidden_layers from the state_dict directly. Layers 0/5/9 of
+        # the AdvantageNetwork are the three Linear layers between residual
+        # blocks; their output dims = hidden[0], hidden[1], hidden[2].
         hidden = kwargs.get('hidden_layers', None)
+        if hidden is None and strat_nets and isinstance(strat_nets[0], dict):
+            sd = strat_nets[0]
+            try:
+                h0 = sd['network.0.weight'].shape[0]
+                h1 = sd['network.5.weight'].shape[0]
+                h2 = sd['network.9.weight'].shape[0]
+                hidden = [h0, h1, h2]
+            except (KeyError, IndexError):
+                hidden = None
+        # Fall back to config-file lookup if inference failed
         if hidden is None:
             config_path = Path(path).parent.parent / 'configs' / 'training_config.json'
             if not config_path.exists():

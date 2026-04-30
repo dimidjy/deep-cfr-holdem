@@ -262,6 +262,13 @@ def load_model():
     model_obs_size = checkpoint.get('obs_size', 38)
     model_action_size = checkpoint.get('action_size', 5)
 
+    if 'advantage_networks' in checkpoint:
+        adv0 = checkpoint['advantage_networks'][0]
+        model_obs_size = adv0['network.0.weight'].shape[1]
+        last_w = max((k for k in adv0.keys() if k.endswith('.weight') and adv0[k].dim() == 2),
+                     key=lambda k: int(k.split('.')[1]) if k.split('.')[1].isdigit() else -1)
+        model_action_size = adv0[last_w].shape[0]
+
     if model_type in ('cql', 'iql'):
         from scripts.train_cql import QNetwork, CQLModelWrapper
         q_net = QNetwork(
@@ -285,13 +292,15 @@ def load_model():
     else:
         from src.training import DeepCFR
         deep_cfr = DeepCFR(
-            observation_size=38, action_size=model_action_size,
+            observation_size=model_obs_size, action_size=model_action_size,
             num_players=NUM_PLAYERS, hidden_layers=[512, 512, 256],
             learning_rate=0.001, buffer_size=100000, device='cpu')
         deep_cfr.load_models(MODEL_PATH)
         model = deep_cfr
-        has_bh = False
-        has_evo = False
+        # Agent obs_builder bundles betting_line with behavioral_stats:
+        # 42=base, 53=base+bh+betting_line, 54=base+bh+betting_line+evo
+        has_bh = model_obs_size >= 50
+        has_evo = model_obs_size >= 54
 
     obs_builder = ObservationBuilder(NUM_PLAYERS, behavioral_stats=has_bh,
                                       equity_vs_odds=has_evo)
@@ -319,22 +328,22 @@ def get_raw_strategy(model, obs, legal, action_size=5):
 def apply_full_pipeline(model, obs_builder, obs, legal, game_state,
                         temperature=1.0):
     """Apply the decision-pipeline overrides after model inference."""
-    from src.agent.policy_core import (
-        _apply_strong_hand_guard, _apply_allin_filter, _apply_call_guard,
-    )
+    try:
+        from src.agent.policy_core import (
+            _apply_strong_hand_guard, _apply_allin_filter, _apply_call_guard,
+        )
+        guards_available = True
+    except ImportError:
+        guards_available = False
 
     action_size = 5
     strategy = get_raw_strategy(model, obs, legal, action_size)
 
-    # Strong hand guard
-    strategy = _apply_strong_hand_guard(strategy, obs, legal)
-
-    # All-in quality filter
-    strategy = _apply_allin_filter(strategy, obs, legal)
-
-    # Call guard
-    strategy = _apply_call_guard(strategy, obs, legal, game_state,
-                                  model, obs_builder)
+    if guards_available:
+        strategy = _apply_strong_hand_guard(strategy, obs, legal)
+        strategy = _apply_allin_filter(strategy, obs, legal)
+        strategy = _apply_call_guard(strategy, obs, legal, game_state,
+                                      model, obs_builder)
 
     # Temperature scaling
     if temperature != 1.0 and temperature > 0:
@@ -382,7 +391,9 @@ def main():
             print(f"{i+1:>2} {spot['name']:<52} │ {'[obs build failed]':^48} │")
             continue
 
-        legal = gs.legal_actions
+        legal = [a for a in gs.legal_actions if a < model_action_size]
+        if not legal:
+            legal = [a for a in gs.legal_actions if a < len(ACTION_NAMES)]
 
         # Raw model output
         raw = get_raw_strategy(model, obs, legal, model_action_size)

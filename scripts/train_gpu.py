@@ -117,6 +117,44 @@ _RANDOM_PREFLOP_FOLDS_DIST = None
 # Engine pool — per-worker reuse to avoid env teardown on every branch
 _ENGINE_POOL = []
 
+# Lazy-built ObservationBuilder for rehydrating annotated spots from older
+# feature schemas. Created on first use to avoid the import cost when
+# imitation learning is disabled.
+_IMITATION_REBUILDER = None
+
+
+def _try_rebuild_obs_vector(spot: dict):
+    """Rebuild a spot's obs_vector from its saved game_state.
+
+    Annotated spot JSONs cache the obs_vector at capture time. If the obs
+    schema has since changed, the cached vector becomes the wrong length —
+    but the underlying `game_state` is preserved verbatim, so we can
+    deserialize it and run today's ObservationBuilder over it.
+
+    Returns a list[float] (agent-shaped, includes equity_vs_odds dim) or
+    None if rebuild fails for any reason.
+    """
+    global _IMITATION_REBUILDER
+    gs_dict = spot.get('game_state')
+    if not isinstance(gs_dict, dict):
+        return None
+    try:
+        if _IMITATION_REBUILDER is None:
+            from src.agent.obs_builder import ObservationBuilder
+            _IMITATION_REBUILDER = ObservationBuilder(
+                num_players=6,
+                behavioral_stats=True,
+                equity_vs_odds=True,
+            )
+        from src.agent.game_state import GameState
+        gs = GameState.from_dict(gs_dict)
+        rebuilt = _IMITATION_REBUILDER.build(gs)
+        if rebuilt is None:
+            return None
+        return rebuilt.tolist()
+    except Exception:
+        return None
+
 
 def _get_engine(num_players):
     """Get engine from pool or create new one."""
@@ -504,6 +542,11 @@ def _traversal_worker(args):
         results = {}
 
         # Detect strong semi-bluff draws (exempt bluff penalty + boost call).
+        # Broadened to include backdoor (3-card) flush draws and pair+draw
+        # combos — these are legitimate semi-bluffs at NL5 but were excluded
+        # by the previous tight thresholds. Equity-based scaling on the
+        # draw_bet_boost (below) downweights the weakest of these so the
+        # broader category doesn't over-incentivize marginal hands.
         has_flush_draw = False
         has_straight_draw_with_overcards = False
         has_overcards_air = False
@@ -513,9 +556,12 @@ def _traversal_worker(args):
             straight_part = float(obs[21])
             made_hand_cat = float(obs[19]) if len(obs) > 19 else 1.0
             high_card = float(obs[13]) if len(obs) > 13 else 0.0
-            has_flush_draw = flush_part >= 0.99
+            # Include backdoor (3-card, ~0.5) and 4-card flush draws.
+            has_flush_draw = flush_part >= 0.5
+            # Include pair+OESD combos — strongest semi-bluff in poker —
+            # by allowing made_hand_cat up through one pair (< 0.20).
             has_straight_draw_with_overcards = (
-                straight_part >= 0.49 and made_hand_cat < 0.01)
+                straight_part >= 0.49 and made_hand_cat < 0.20)
             # Air with J+ high card (draw-like hand that can turn TP)
             has_overcards_air = (made_hand_cat < 0.11 and high_card >= 0.75)
         is_strong_draw = has_flush_draw or has_straight_draw_with_overcards
@@ -537,25 +583,52 @@ def _traversal_worker(args):
             post_call_pot = float(pot_chips) / max(po, 1e-6)
             call_bonus_chips = excess * post_call_pot * _CALL_BONUS
 
-        # Draw call boost: extra reward for CALLING small bets (≤ ⅓ pot) with
-        # a strong draw. pot_odds >= 0.75 ↔ call ≤ ⅓ pot.
+        # Draw call boost: reward CALLING with a strong draw whenever equity
+        # beats the required pot-odds equity. Previously gated at
+        # pot_odds >= 0.75 (only ≤ ⅓-pot bets); now fires for ANY bet size,
+        # scaled by how much equity exceeds the call requirement.
+        #
+        # Compensates for the CFR rollout signal undershooting realized NFD
+        # EV against the real NL5 pool — training opponents don't pay off
+        # flushes the way actual fish do, so without this boost the model
+        # learns "NFD multiway OOP = -EV fold" even when raw equity says
+        # it's an obvious +EV call (see logs/action_debug 075040 NFD-fold leak).
         # Only fires for action==CALL (applied at ba==1 below).
         draw_call_boost_chips = 0.0
         if (_DRAW_CALL_BOOST > 0 and is_strong_draw
                 and pot_chips is not None and pot_odds is not None
-                and float(pot_odds) >= 0.75):
-            draw_call_boost_chips = float(pot_chips) * _DRAW_CALL_BOOST
+                and float(pot_odds) > 0):
+            po = float(pot_odds)
+            required_eq = 1.0 - po
+            if hero_equity is not None:
+                excess = max(0.0, float(hero_equity) - required_eq)
+                # Full boost when excess ≥ 0.15 (clearly +EV draw call);
+                # zero when excess ≤ 0 (don't reward -EV calls).
+                scale = min(1.0, excess / 0.15)
+            else:
+                # Equity unknown: fall back to legacy small-bet-only behavior.
+                scale = 1.0 if po >= 0.75 else 0.0
+            draw_call_boost_chips = float(pot_chips) * _DRAW_CALL_BOOST * scale
 
         # Draw bet boost: extra reward for BETTING/RAISING with draws or
         # overcard-air when CHECKED TO (no bet to face). Encourages semi-bluffing
         # with flush draws, straight draws, and J+ high-card air — fixes the
         # "100% check with nut flush draw" failure mode. Only fires for raise
         # actions (ba >= 2) and only in unopened-flop-like spots (pot_odds==0).
+        # Reward scales linearly with hero equity between 0.10 (no boost) and
+        # 0.40 (full boost), so a 35% nut FD gets full reward while a 12%
+        # backdoor + 1 overcard gets a small fraction. Prevents the broadened
+        # is_strong_draw category from over-rewarding marginal hands.
         draw_bet_boost_chips = 0.0
         if (_DRAW_BET_BOOST > 0 and pot_chips is not None
-                and pot_odds is not None and float(pot_odds) == 0.0
+                and pot_odds is not None and float(pot_odds) < 1e-6
                 and (is_strong_draw or has_overcards_air)):
-            draw_bet_boost_chips = float(pot_chips) * _DRAW_BET_BOOST
+            if hero_equity is not None:
+                eq = float(hero_equity)
+                eq_factor = min(1.0, max(0.0, (eq - 0.10) / 0.30))
+            else:
+                eq_factor = 0.5
+            draw_bet_boost_chips = float(pot_chips) * _DRAW_BET_BOOST * eq_factor
 
         # Value bonus: reward raising with strong equity.
         # Previously only fired when checked-to (pot_odds == 0). Now fires
@@ -1432,13 +1505,32 @@ def main():
         from scripts.validate_spot_logs import load_annotated_spots
         raw_spots = load_annotated_spots(args.imitation_spots_dir)
         # Filter to spots whose obs size matches the model AND whose
-        # right_action is within the model's action space
+        # right_action is within the model's action space.
+        #
+        # Spots with a stale obs_vector (older feature schema) are rebuilt
+        # from the preserved `game_state` so the right_action label isn't
+        # wasted just because the cached vector has the wrong dim count.
+        rebuilder = None  # lazily created — building it imports torch-heavy modules
+        rebuild_count = 0
+        rebuild_fail = 0
         usable = []
         for s in raw_spots:
             ov = s.get('obs_vector') or []
             ra = s.get('right_action')
             if not isinstance(ra, int) or ra >= act_size:
                 continue
+            # If the cached vector doesn't match the model's input size, try
+            # rebuilding it from the saved game_state. The agent emits +1 dim
+            # (equity_vs_odds) vs. the engine, so the existing trim path
+            # handles agent-shaped obs. Only rebuild when neither raw nor
+            # trimmed length would match.
+            if len(ov) != obs_size and len(ov) != obs_size + 1:
+                rebuilt = _try_rebuild_obs_vector(s)
+                if rebuilt is None:
+                    rebuild_fail += 1
+                    continue
+                ov = rebuilt
+                rebuild_count += 1
             # Trim obs if it's larger than the model expects (strip EVO dim)
             if len(ov) > obs_size:
                 ov = ov[:obs_size]
@@ -1456,8 +1548,13 @@ def main():
                 [u[1] for u in usable], dtype=torch.long, device=device)
             imitation_legal = torch.tensor(
                 [u[2] for u in usable], dtype=torch.float32, device=device)
+            extra = ''
+            if rebuild_count or rebuild_fail:
+                extra = (f' (rebuilt {rebuild_count} from stale schema, '
+                         f'failed {rebuild_fail})')
             print(f'Imitation learning: {len(usable)}/{len(raw_spots)} usable '
-                  f'annotated spots loaded  (weight={args.imitation_weight}, '
+                  f'annotated spots loaded{extra}  '
+                  f'(weight={args.imitation_weight}, '
                   f'batch={args.imitation_batch_size}, passes={args.imitation_passes})')
         else:
             print(f'Imitation learning: NO usable spots found in '
