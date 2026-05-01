@@ -1429,6 +1429,14 @@ def main():
                         help='Exploit factor 0.0-1.0 (0=GTO, 1=max exploit vs fish)')
     parser.add_argument('--no-preflop-ranges', action='store_true',
                         help='Disable preflop range override (default: ranges enabled)')
+    parser.add_argument('--use-preflop-lookup', action='store_true',
+                        help='Use data-driven preflop lookup (data/preflop_lookup.sqlite) '
+                             'instead of static PreflopRanges. Falls back to ranges if DB '
+                             'missing. Lets you compare model+lookup vs model+static.')
+    parser.add_argument('--preflop-db-path', type=str,
+                        default='data/preflop_lookup.sqlite',
+                        help='Path to PreflopLookup SQLite DB (only used with '
+                             '--use-preflop-lookup)')
     parser.add_argument('--supervised', action='store_true',
                         help='Load as supervised model (StrategyNetwork) instead of Deep CFR')
     parser.add_argument('--blend', type=str, default=None,
@@ -1649,9 +1657,49 @@ def main():
         print('No decision points extracted. Check parser/obs_builder.')
         sys.exit(1)
 
-    # Load preflop ranges
-    pf_ranges = None if args.no_preflop_ranges else PreflopRanges(num_players=num_players)
-    if pf_ranges:
+    # Load preflop strategy: either static PreflopRanges or the data-driven
+    # PreflopLookup (with PreflopRanges as in-process fallback). The
+    # downstream callers expect get_strategy(...) to return an ndarray, so
+    # we wrap PreflopLookup (which returns a tuple) in a thin adapter.
+    if args.no_preflop_ranges:
+        pf_ranges = None
+    elif args.use_preflop_lookup:
+        try:
+            from src.preflop_lookup import PreflopLookup
+            from pathlib import Path as _Path
+            if not _Path(args.preflop_db_path).exists():
+                print(f'Preflop lookup DB not found at {args.preflop_db_path} — '
+                      f'falling back to static ranges')
+                pf_ranges = PreflopRanges(num_players=num_players)
+                print('Preflop: GTO ranges (locked, --use-preflop-lookup fell through)')
+            else:
+                _fallback = PreflopRanges(num_players=num_players)
+                _lookup = PreflopLookup(args.preflop_db_path, fallback=_fallback)
+
+                class _LookupAdapter:
+                    """Wrap PreflopLookup so get_strategy returns just the
+                    strategy ndarray (drops the custom_size_bb side-channel),
+                    matching the legacy PreflopRanges interface that callers
+                    in this script expect."""
+                    def __init__(self, lookup):
+                        self._lookup = lookup
+                    def get_strategy(self, *args, **kwargs):
+                        result = self._lookup.get_strategy(*args, **kwargs)
+                        if isinstance(result, tuple):
+                            return result[0]
+                        return result
+
+                pf_ranges = _LookupAdapter(_lookup)
+                print(f'Preflop: data-driven LOOKUP from {args.preflop_db_path} '
+                      f'({_lookup.num_spots} exact spots, '
+                      f'{len(_lookup._level_no_nta)} L1 keys, '
+                      f'{len(_lookup._level_no_stack)} L2 keys)')
+        except Exception as e:
+            print(f'PreflopLookup load failed: {e} — falling back to static ranges')
+            pf_ranges = PreflopRanges(num_players=num_players)
+            print('Preflop: GTO ranges (locked, --use-preflop-lookup errored)')
+    else:
+        pf_ranges = PreflopRanges(num_players=num_players)
         print('Preflop: GTO ranges (locked)')
 
     # Run analysis

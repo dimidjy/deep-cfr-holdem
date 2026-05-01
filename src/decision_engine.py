@@ -112,6 +112,17 @@ class SpotContext:
     num_players: int = 6
     pot_bb: float = 0.0
 
+    # Preflop lookup support (data-driven preflop strategy)
+    action_history: Optional[str] = None  # e.g. 'open', 'vs_raise', 'vs_3bet'
+    num_to_act: int = 0     # players still to act behind hero, clamped {0..4}
+    call_amount_bb: float = 0.0  # for nearest-preset sizing fallback
+
+    # OUTPUT side-channel: populated by DecisionEngine when the preflop
+    # lookup chooses an explicit BB raise size to be typed (rather than a
+    # preset button). None for postflop, unused fallback paths, or
+    # non-raise actions. Read by the action executor.
+    custom_size_bb_out: Optional[float] = None
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DecisionConfig — what to enable/disable
@@ -130,7 +141,9 @@ class DecisionConfig:
     style_tuning: bool = True
 
     # Preflop
-    use_preflop_ranges: bool = True
+    use_preflop_ranges: bool = True   # static GTO range fallback
+    use_preflop_lookup: bool = True   # data-driven cohort lookup (preferred)
+    preflop_db_path: str = 'data/preflop_lookup.sqlite'
 
     # Re-raise classifier
     reraise_classifier_path: str = ''
@@ -516,19 +529,54 @@ class DecisionEngine:
                     f"(threshold={self.config.reraise_threshold})")
 
     def load_preflop_ranges(self, num_players_list: List[int] = None) -> None:
-        """Load GTO preflop ranges."""
-        if not self.config.use_preflop_ranges:
+        """Load preflop strategy: data-driven `PreflopLookup` (preferred) wrapping
+        static `PreflopRanges` as fallback. Falls back to ranges-only if the
+        lookup DB is missing or `use_preflop_lookup` is disabled.
+        """
+        if not self.config.use_preflop_ranges and not self.config.use_preflop_lookup:
             return
         try:
             from src.preflop_ranges import PreflopRanges
+            ranges_per_n: Dict[int, 'PreflopRanges'] = {}
             for np_ in (num_players_list or [2, 3, 4, 5, 6]):
                 try:
-                    self._preflop_ranges[np_] = PreflopRanges(num_players=np_)
+                    ranges_per_n[np_] = PreflopRanges(num_players=np_)
                 except Exception:
                     pass
-            logger.info(f"Preflop ranges loaded: {list(self._preflop_ranges.keys())}")
+
+            if self.config.use_preflop_lookup:
+                try:
+                    from pathlib import Path as _Path
+                    from src.preflop_lookup import PreflopLookup
+                    if _Path(self.config.preflop_db_path).exists():
+                        # Wrap each per-N range in a lookup. The lookup loads
+                        # the DB once; we just re-hand it different fallbacks.
+                        # For 6-max (the only num_players the cohort covers)
+                        # we get the data-driven path; other table sizes get
+                        # the lookup with sparse coverage → mostly fallback.
+                        for np_, fb in ranges_per_n.items():
+                            self._preflop_ranges[np_] = PreflopLookup(
+                                self.config.preflop_db_path, fallback=fb)
+                        logger.info(
+                            f"Preflop lookup loaded from "
+                            f"{self.config.preflop_db_path} "
+                            f"(num_players={list(self._preflop_ranges.keys())})")
+                        return
+                    else:
+                        logger.warning(
+                            f"Preflop lookup DB not found at "
+                            f"{self.config.preflop_db_path} — "
+                            f"falling back to static ranges only.")
+                except Exception as e:
+                    logger.warning(f"Could not load preflop lookup: {e} — "
+                                   f"falling back to static ranges.")
+
+            # No lookup → use plain ranges
+            self._preflop_ranges.update(ranges_per_n)
+            logger.info(f"Preflop ranges (static) loaded: "
+                        f"{list(self._preflop_ranges.keys())}")
         except Exception as e:
-            logger.warning(f"Could not load preflop ranges: {e}")
+            logger.warning(f"Could not load preflop strategy: {e}")
 
     # ── Core decision pipeline ───────────────────────────────────────────
 
@@ -651,7 +699,11 @@ class DecisionEngine:
     # ── Preflop ranges ───────────────────────────────────────────────────
 
     def _preflop_strategy(self, ctx: SpotContext) -> Optional[np.ndarray]:
-        """Get preflop strategy from GTO ranges."""
+        """Get preflop strategy from PreflopLookup (data-driven) or
+        PreflopRanges (static fallback). Side-effect: writes
+        `ctx.custom_size_bb_out` when the lookup chose an explicit BB size
+        for a raise; the action executor reads that field to type the size.
+        """
         try:
             pf = self._preflop_ranges.get(ctx.num_players)
             if pf is None:
@@ -663,11 +715,28 @@ class DecisionEngine:
             if pot_bb <= 0 and ctx.facing_bet:
                 pot_bb = 3.5  # reasonable default
 
-            strategy = pf.get_strategy(
-                hole_cards=ctx.hole_cards, rel_pos=ctx.rel_pos,
-                pot_bb=pot_bb, legal_actions=ctx.legal_actions,
-                num_limpers=ctx.num_limpers, num_callers=ctx.num_callers,
-                effective_stack=ctx.effective_stack)
+            # PreflopLookup returns (strategy, custom_size_bb); legacy
+            # PreflopRanges returns just strategy. Support both.
+            from src.preflop_lookup import PreflopLookup as _PreflopLookup
+            if isinstance(pf, _PreflopLookup):
+                strategy, custom_size_bb = pf.get_strategy(
+                    hole_cards=ctx.hole_cards, rel_pos=ctx.rel_pos,
+                    pot_bb=pot_bb, legal_actions=ctx.legal_actions,
+                    num_limpers=ctx.num_limpers, num_callers=ctx.num_callers,
+                    effective_stack=ctx.effective_stack,
+                    num_players=ctx.num_players,
+                    action_history=ctx.action_history,
+                    num_to_act=ctx.num_to_act,
+                    call_amount_bb=ctx.call_amount_bb,
+                )
+                ctx.custom_size_bb_out = custom_size_bb
+            else:
+                strategy = pf.get_strategy(
+                    hole_cards=ctx.hole_cards, rel_pos=ctx.rel_pos,
+                    pot_bb=pot_bb, legal_actions=ctx.legal_actions,
+                    num_limpers=ctx.num_limpers, num_callers=ctx.num_callers,
+                    effective_stack=ctx.effective_stack)
+                ctx.custom_size_bb_out = None
 
             if strategy is not None:
                 result = np.zeros(NUM_ACTIONS, dtype=np.float32)
@@ -675,7 +744,7 @@ class DecisionEngine:
                     result[i] = float(strategy[i])
                 return result
         except Exception as e:
-            logger.warning(f"Preflop range failed: {e}")
+            logger.warning(f"Preflop strategy failed: {e}")
         return None
 
     # ── Re-raise classifier ──────────────────────────────────────────────
