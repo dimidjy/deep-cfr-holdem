@@ -103,7 +103,8 @@ GTO_RANGES = {
 }
 
 # Composite weights — money first, decision quality second, robustness third.
-DEFAULT_WEIGHTS = {'hh': 0.50, 'spot': 0.30, 'gto': 0.20}
+# self-play (gto) weight doubled (0.20 → 0.40); hh/spot scaled to keep sum=1.0.
+DEFAULT_WEIGHTS = {'hh': 0.375, 'spot': 0.225, 'gto': 0.40}
 
 # HH BB/h normalization anchor: 0 = break-even, +2.0 BB/h showdown = score 100.
 # Top current-gen models score ~+1.36 → 68 on this scale.

@@ -2,24 +2,32 @@
 
 For each model in the iter range, runs:
   1. Spot-score validation (fast)
-  2. HH validation (default 40k hands)
+  2. HH validation (default 100k hands)
   3. H2H self-play vs every OTHER model (default 30k hands per match, both directions)
+
+Each phase runs its tests in parallel via a ProcessPoolExecutor. The inner
+scripts (validate_vs_hh.py, self_play.py, validate_spot_logs.py) are
+single-threaded CPU inference; we just run many of them at once. Tune
+`--workers` for your box.
 
 Saves per-test JSON files so runs are RESUMABLE — skip any test whose output
 file already exists. Aggregates everything into a final comparison table at the end.
 
 Usage:
-    # Run the full tournament (slow — hours)
-    python3 scripts/tournament.py --models-dir models/v12 --min-iter 2600 --max-iter 5000
+    # Run the full tournament (parallel — minutes on a 96-core box)
+    python3 scripts/tournament.py --models-dir models/v12 --min-iter 2600 --max-iter 5000 --workers 32
 
     # Just aggregate existing results (fast)
     python3 scripts/tournament.py --aggregate-only
 
-    # Customize hand counts
-    python3 scripts/tournament.py --h2h-hands 30000 --hh-hands 40000
+    # Customize hand counts and parallelism
+    python3 scripts/tournament.py --h2h-hands 50000 --hh-hands 100000 --workers 24
 
     # Only H2H phase (skip spots + HH if already done)
     python3 scripts/tournament.py --skip-spots --skip-hh
+
+    # Sequential / debugging
+    python3 scripts/tournament.py --workers 1
 
     # Dry run — print commands without running
     python3 scripts/tournament.py --dry-run
@@ -31,15 +39,18 @@ Output layout:
         h2h/<a>_vs_<b>.json              # a in seats 0,2,4; b in 1,3,5
         summary.json                     # final aggregated table
         summary.csv                      # human-readable
+        summary.md                       # markdown summary + H2H matrix
 """
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
 RESULTS_DIR = ROOT / 'tournament_results'  # overridden per-run via --output-dir
@@ -57,39 +68,36 @@ _RE_H2H_VPIP   = re.compile(r'VPIP\s+([+-]?\d+\.\d+)%\s+([+-]?\d+\.\d+)%')
 _RE_H2H_PFR    = re.compile(r'PFR\s+([+-]?\d+\.\d+)%\s+([+-]?\d+\.\d+)%')
 
 
+_ITER_PAT = re.compile(r'iter[_-]?(\d+)')
+
+
+def _extract_iter(label: str) -> Optional[int]:
+    """Return the first integer in the label after 'iter', or None if not present."""
+    m = _ITER_PAT.search(label)
+    return int(m.group(1)) if m else None
+
+
 def discover_models(models_dir: Path, min_iter: int, max_iter: int) -> List[Tuple[str, Path]]:
-    """Return sorted list of (label, path) for checkpoints in iter range.
+    """Return sorted list of (label, path) for every .pt file in models_dir.
 
-    Matches BOTH plain and suffixed filenames:
-      checkpoint_iter_3600.pt       -> label 'iter_3600'
-      checkpoint_iter_3600_best.pt  -> label 'iter_3600_best'
-      checkpoint_iter_3600_v2.pt    -> label 'iter_3600_v2'
+    Label is the filename stem (no extension) — whatever the file is called.
+    No naming convention enforced.
 
-    When a directory contains both plain and _best for the same iter (e.g. the
-    user copied 'best' variants into a v-dir that already has training output),
-    BOTH are included as distinct entries — they're treated as different models
-    since they have different weights.
+    If a filename happens to contain `iter_<N>` (e.g. checkpoint_iter_3200.pt,
+    iter_3200_best.pt, my_model_iter_500_alt.pt), <N> is extracted to support
+    --min-iter / --max-iter filtering and to give the listing a sensible
+    iter-number sort order. Files without an iter number are always included
+    (filters don't apply) and sort to the front.
     """
-    pat = re.compile(r'checkpoint_iter_(\d+)(_[A-Za-z0-9]+)?\.pt$')
-    seen_labels = {}  # label -> path, to detect collisions
-    out = []
-    for p in models_dir.glob('checkpoint_iter_*.pt'):
-        m = pat.search(p.name)
-        if not m:
+    out: List[Tuple[str, Path]] = []
+    for p in sorted(models_dir.glob('*.pt')):
+        label = p.stem
+        n = _extract_iter(label)
+        if n is not None and not (min_iter <= n <= max_iter):
             continue
-        n = int(m.group(1))
-        suffix = m.group(2) or ''
-        label = f'iter_{n}{suffix}'
-        if min_iter <= n <= max_iter:
-            if label in seen_labels:
-                continue  # duplicate (same filename twice, shouldn't happen)
-            seen_labels[label] = p
-            out.append((label, p))
-    # Sort by (iter number, suffix) so plain comes before suffixed at same iter
-    out.sort(key=lambda x: (
-        int(re.match(r'iter_(\d+)', x[0]).group(1)),
-        x[0],  # secondary sort: lexicographic (empty suffix sorts first)
-    ))
+        out.append((label, p))
+    out.sort(key=lambda x: (_extract_iter(x[0]) if _extract_iter(x[0]) is not None else -1,
+                            x[0]))
     return out
 
 
@@ -145,6 +153,7 @@ def run_hh(label: str, model_path: Path, hands: int, output: Path,
         '--model', str(model_path),
         '--max-hands', str(hands),
         '--behavioral-stats',
+        '--betting-line',
     ]
     out = _run(cmd, dry_run=dry_run)
     if dry_run or not out:
@@ -275,7 +284,7 @@ def aggregate(models: List[Tuple[str, Path]]) -> Dict:
             'avg_vpip', 'avg_pfr', 'avg_cbet', 'avg_af', 'avg_wtsd']
     lines = [','.join(cols)]
     for label in sorted(summary.keys(),
-                         key=lambda k: (int(k.split('_')[1]), k)):
+                         key=lambda k: (_extract_iter(k) if _extract_iter(k) is not None else -1, k)):
         row = summary[label]
         vals = []
         for c in cols:
@@ -289,7 +298,73 @@ def aggregate(models: List[Tuple[str, Path]]) -> Dict:
         lines.append(','.join(vals))
     out_csv.write_text('\n'.join(lines))
 
+    # Markdown summary
+    write_markdown(summary, RESULTS_DIR / 'summary.md')
+
     return summary
+
+
+def write_markdown(summary: Dict, output: Path) -> None:
+    """Write summary + H2H matrix to a markdown file."""
+    rows = sorted(summary.values(),
+                  key=lambda r: r.get('hh_bb_per_hand') or -99, reverse=True)
+
+    def fmt(v, fmt_str='.2f'):
+        return '-' if v is None else f'{v:{fmt_str}}'
+
+    lines = [
+        '# Tournament Results',
+        '',
+        f'_{len(rows)} models, sorted by HH BB/hand desc_',
+        '',
+        '## Summary',
+        '',
+        '| Model | Spot% | HH BB/h | Agree% | H2H edge | W-T-L | VPIP | PFR | CBet | AF | WTSD |',
+        '|---|---:|---:|---:|---:|:---:|---:|---:|---:|---:|---:|',
+    ]
+    for r in rows:
+        wtl = f"{r.get('h2h_wins', 0)}-{r.get('h2h_ties', 0)}-{r.get('h2h_losses', 0)}"
+        lines.append(
+            f"| {r['model']} | {fmt(r.get('spot_pct'), '.1f')} | "
+            f"{fmt(r.get('hh_bb_per_hand'), '.3f')} | {fmt(r.get('hh_agreement_pct'), '.1f')} | "
+            f"{fmt(r.get('avg_h2h_edge'), '.2f')} | {wtl} | "
+            f"{fmt(r.get('avg_vpip'), '.1f')} | {fmt(r.get('avg_pfr'), '.1f')} | "
+            f"{fmt(r.get('avg_cbet'), '.1f')} | {fmt(r.get('avg_af'), '.2f')} | "
+            f"{fmt(r.get('avg_wtsd'), '.1f')} |"
+        )
+
+    # H2H matrix (BB/100 from row's perspective)
+    h2h_dir = RESULTS_DIR / 'h2h'
+    labels = sorted(summary.keys(),
+                    key=lambda k: (_extract_iter(k) if _extract_iter(k) is not None else -1, k))
+    if any(h2h_dir.glob('*.json')):
+        lines.extend([
+            '',
+            '## H2H Matrix (row = model A, col = model B; cell = A edge in BB/100)',
+            '',
+        ])
+        header = '| A \\ B | ' + ' | '.join(labels) + ' |'
+        lines.append(header)
+        lines.append('|---|' + '|'.join(['---:'] * len(labels)) + '|')
+        for la in labels:
+            cells = [la]
+            for lb in labels:
+                if la == lb:
+                    cells.append('—')
+                    continue
+                ab = h2h_dir / f'{la}_vs_{lb}.json'
+                ba = h2h_dir / f'{lb}_vs_{la}.json'
+                if ab.exists():
+                    d = json.loads(ab.read_text())
+                    cells.append(f"{d.get('edge_a', 0.0):+.2f}")
+                elif ba.exists():
+                    d = json.loads(ba.read_text())
+                    cells.append(f"{-d.get('edge_a', 0.0):+.2f}")
+                else:
+                    cells.append('-')
+            lines.append('| ' + ' | '.join(cells) + ' |')
+
+    output.write_text('\n'.join(lines) + '\n')
 
 
 def print_summary_table(summary: Dict) -> None:
@@ -325,6 +400,46 @@ def print_summary_table(summary: Dict) -> None:
     print('-' * 110)
 
 
+def _run_pool(tasks: List[Tuple[str, tuple, Callable]],
+              workers: int) -> None:
+    """Dispatch a list of tasks to a ProcessPoolExecutor.
+
+    Each task is (display_label, args_tuple, fn). fn(*args_tuple) is invoked
+    in a worker. Progress is printed in completion order. Failures are logged
+    to stderr but do not stop the pool.
+
+    workers <= 1 falls back to sequential execution (useful for debugging).
+    """
+    if not tasks:
+        return
+    n = len(tasks)
+    if workers <= 1:
+        for i, (display, fn_args, fn) in enumerate(tasks, 1):
+            t = time.time()
+            print(f'  [{i}/{n}] {display}: running...', flush=True)
+            try:
+                fn(*fn_args)
+                print(f'  [{i}/{n}] {display}: done in {time.time()-t:.0f}s', flush=True)
+            except Exception as e:
+                print(f'  [{i}/{n}] {display}: FAILED — {e}', file=sys.stderr, flush=True)
+        return
+
+    t0 = time.time()
+    print(f'  Dispatching {n} tasks across {workers} workers...', flush=True)
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(fn, *fn_args): display
+                   for display, fn_args, fn in tasks}
+        for k, fut in enumerate(as_completed(futures), 1):
+            display = futures[fut]
+            try:
+                fut.result()
+                elapsed = time.time() - t0
+                print(f'  [{k}/{n}] {display}: done ({elapsed:.0f}s elapsed)', flush=True)
+            except Exception as e:
+                print(f'  [{k}/{n}] {display}: FAILED — {e}',
+                      file=sys.stderr, flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--models-dir', default='models/v12')
@@ -335,7 +450,11 @@ def main():
     ap.add_argument('--min-iter', type=int, default=2600)
     ap.add_argument('--max-iter', type=int, default=5000)
     ap.add_argument('--h2h-hands', type=int, default=30000)
-    ap.add_argument('--hh-hands', type=int, default=40000)
+    ap.add_argument('--hh-hands', type=int, default=100000)
+    ap.add_argument('--workers', type=int, default=8,
+                    help='Number of parallel test runs per phase. Each worker '
+                         'is one Python subprocess (CPU-only inference). '
+                         '96-core boxes can comfortably go to 32+.')
     ap.add_argument('--skip-spots', action='store_true')
     ap.add_argument('--skip-hh', action='store_true')
     ap.add_argument('--skip-h2h', action='store_true')
@@ -353,6 +472,7 @@ def main():
     for sub in ('spots', 'hh', 'h2h'):
         (RESULTS_DIR / sub).mkdir(parents=True, exist_ok=True)
     print(f'Results dir: {RESULTS_DIR}')
+    print(f'Workers per phase: {args.workers}  (cpu_count={os.cpu_count()})')
 
     models = discover_models(Path(args.models_dir), args.min_iter, args.max_iter)
     print(f'Found {len(models)} models in iter range [{args.min_iter}, {args.max_iter}]')
@@ -372,34 +492,32 @@ def main():
     # Phase 1: Spot scores
     if not args.skip_spots:
         print(f'\n[Phase 1/3] Spot scores ({len(models)} tests)')
-        for i, (label, path) in enumerate(models, 1):
+        tasks: List[Tuple[str, tuple, Callable]] = []
+        for label, path in models:
             output = RESULTS_DIR / 'spots' / f'{label}_spots.json'
-            prefix = f'  [{i}/{len(models)}] {label}'
             if output.exists():
-                print(f'{prefix}: SKIP (exists)')
+                print(f'  {label}: SKIP (exists)')
                 n_tests_skipped += 1
                 continue
-            n_tests_total += 1
-            print(f'{prefix}: running...')
-            t = time.time()
-            run_spot_score(label, path, output, dry_run=args.dry_run)
-            print(f'{prefix}: done in {time.time()-t:.0f}s')
+            tasks.append((label, (label, path, output, args.dry_run), run_spot_score))
+        n_tests_total += len(tasks)
+        _run_pool(tasks, args.workers)
 
     # Phase 2: HH validation
     if not args.skip_hh:
         print(f'\n[Phase 2/3] HH validation ({len(models)} tests, {args.hh_hands} hands each)')
-        for i, (label, path) in enumerate(models, 1):
+        tasks = []
+        for label, path in models:
             output = RESULTS_DIR / 'hh' / f'{label}_hh.json'
-            prefix = f'  [{i}/{len(models)}] {label}'
             if output.exists():
-                print(f'{prefix}: SKIP (exists)')
+                print(f'  {label}: SKIP (exists)')
                 n_tests_skipped += 1
                 continue
-            n_tests_total += 1
-            print(f'{prefix}: running ({args.hh_hands} hands)...')
-            t = time.time()
-            run_hh(label, path, args.hh_hands, output, dry_run=args.dry_run)
-            print(f'{prefix}: done in {time.time()-t:.0f}s')
+            tasks.append((label,
+                          (label, path, args.hh_hands, output, args.dry_run),
+                          run_hh))
+        n_tests_total += len(tasks)
+        _run_pool(tasks, args.workers)
 
     # Phase 3: H2H tournament
     if not args.skip_h2h:
@@ -412,18 +530,18 @@ def main():
                     continue
                 pairs.append((a, b))
         print(f'\n[Phase 3/3] H2H tournament ({len(pairs)} matches, {args.h2h_hands} hands each)')
-        for k, ((la, pa), (lb, pb)) in enumerate(pairs, 1):
+        tasks = []
+        for (la, pa), (lb, pb) in pairs:
             output = RESULTS_DIR / 'h2h' / f'{la}_vs_{lb}.json'
-            prefix = f'  [{k}/{len(pairs)}] {la} vs {lb}'
             if output.exists():
-                print(f'{prefix}: SKIP (exists)')
+                print(f'  {la} vs {lb}: SKIP (exists)')
                 n_tests_skipped += 1
                 continue
-            n_tests_total += 1
-            print(f'{prefix}: running ({args.h2h_hands} hands)...')
-            t = time.time()
-            run_h2h(la, pa, lb, pb, args.h2h_hands, output, dry_run=args.dry_run)
-            print(f'{prefix}: done in {time.time()-t:.0f}s')
+            tasks.append((f'{la} vs {lb}',
+                          (la, pa, lb, pb, args.h2h_hands, output, args.dry_run),
+                          run_h2h))
+        n_tests_total += len(tasks)
+        _run_pool(tasks, args.workers)
 
     elapsed = time.time() - t0
     print(f'\nDone in {elapsed/60:.1f} min. Ran {n_tests_total} tests, skipped {n_tests_skipped}.')
