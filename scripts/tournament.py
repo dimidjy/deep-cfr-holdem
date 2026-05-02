@@ -58,7 +58,10 @@ RESULTS_DIR = ROOT / 'tournament_results'  # overridden per-run via --output-dir
 # Regex patterns to extract key metrics from stdout
 _RE_SPOT_SCORE = re.compile(r'\[spots (\d+)\] score=(\S+)/\S+ \((\d+\.\d+)%\)')
 _RE_SPOT_EXACT = re.compile(r'exact=(\d+)\s+partial=(\d+)')
-_RE_HH_EDGE    = re.compile(r'Model edge:\s+([+-]?\d+\.\d+)\s+BB/hand')
+_RE_HH_EDGE    = re.compile(
+    r'(?:Model edge|Showdown-only edge):\s+([+-]?\d+\.\d+)\s+BB/hand')
+_RE_HH_ALL_EDGE = re.compile(
+    r'All-hands projection:\s+([+-]?\d+\.\d+)\s+BB/hand')
 _RE_HH_AGREE   = re.compile(r'agreement=(\d+\.\d+)%')
 _RE_H2H_BB100  = re.compile(r'BB/100\s+([+-]?\d+\.\d+)\s+([+-]?\d+\.\d+)\s+([+-]?\d+\.\d+)')
 _RE_H2H_AF     = re.compile(r'AF\s+([+-]?\d+\.\d+)\s+([+-]?\d+\.\d+)')
@@ -163,6 +166,10 @@ def run_hh(label: str, model_path: Path, hands: int, output: Path,
     if m:
         result['bb_per_hand'] = float(m.group(1))
         result['bb_per_100'] = float(m.group(1)) * 100
+    m_all = _RE_HH_ALL_EDGE.search(out)
+    if m_all:
+        result['bb_per_hand_all'] = float(m_all.group(1))
+        result['bb_per_100_all'] = float(m_all.group(1)) * 100
     m = _RE_HH_AGREE.search(out)
     if m:
         result['agreement_pct'] = float(m.group(1))

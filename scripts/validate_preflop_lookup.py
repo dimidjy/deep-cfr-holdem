@@ -267,6 +267,96 @@ def _history_from(voluntary):
     return derive_action_history(voluntary)
 
 
+def cmd_postflop_spots(args):
+    """Show postflop sizing for canonical spots: model preset → lookup-adjusted size.
+
+    For each spot, prints what RAISE_HALF / RAISE_POT / ALL_IN would type
+    after the lookup adjusts. Useful for sanity-checking that cohort sizes
+    look right (e.g. set on dry flop ≈ 50% pot, top pair on wet ≈ pot).
+    """
+    import numpy as np
+    from src.postflop_sizing import (
+        PostflopSizingLookup, RAISE_HALF, RAISE_POT, ALL_IN,
+    )
+    from src.postflop_spot_key import (
+        IDX_MADE_HAND, IDX_FLUSH_DRAW, IDX_STRAIGHT_DRAW, IDX_TOP_PAIR,
+        IDX_BOARD_PAIR, IDX_BOARD_FLUSH, IDX_BOARD_STRAIGHT,
+        IDX_RANK_WITHIN_CAT,
+        HAND_ONE_PAIR, HAND_TWO_PAIR, HAND_TRIPS, HAND_FLUSH,
+    )
+
+    lookup = PostflopSizingLookup(args.db_path)
+    print(f'Loaded {lookup.num_spots} spots from {args.db_path}')
+
+    def mk_obs(made_hand=0.0, flush_draw=0.0, straight_draw=0.0,
+               top_pair=0.0, board_pair=0.0, board_flush=0.0,
+               board_straight=0.0, rank_within_cat=0.5):
+        o = np.zeros(53, dtype=np.float32)
+        o[IDX_MADE_HAND] = made_hand
+        o[IDX_FLUSH_DRAW] = flush_draw
+        o[IDX_STRAIGHT_DRAW] = straight_draw
+        o[IDX_TOP_PAIR] = top_pair
+        o[IDX_BOARD_PAIR] = board_pair
+        o[IDX_BOARD_FLUSH] = board_flush
+        o[IDX_BOARD_STRAIGHT] = board_straight
+        o[IDX_RANK_WITHIN_CAT] = rank_within_cat
+        return o
+
+    # Canonical spots — meant to be poker-intuitive sanity checks.
+    # (label, obs_kwargs, hole, board, rel_pos, num_active, eff, pot, was_pf_raiser, facing_pct)
+    cases = [
+        ('TPTK dry flop IP cbet',
+         dict(made_hand=HAND_ONE_PAIR, top_pair=1.0, rank_within_cat=0.85),
+         ['As', 'Kh'], ['Kd', '7c', '2s'],
+         0, 6, 95.0, 5.0, True, None, 'flop'),
+        ('TPlow wet flop OOP cbet',
+         dict(made_hand=HAND_ONE_PAIR, top_pair=1.0, rank_within_cat=0.30,
+              board_flush=0.5, board_straight=0.5),
+         ['Ks', '8h'], ['Kd', 'Th', '9c'],
+         3, 6, 95.0, 5.0, True, None, 'flop'),
+        ('Set on dry flop IP cbet',
+         dict(made_hand=HAND_TRIPS, rank_within_cat=0.5),
+         ['7s', '7h'], ['7d', 'Js', '2c'],
+         0, 6, 95.0, 5.0, True, None, 'flop'),
+        ('Two pair wet turn OOP probe',
+         dict(made_hand=HAND_TWO_PAIR, board_flush=0.5),
+         ['Kd', 'Tc'], ['Ks', 'Th', '7s', '4h'],
+         3, 6, 90.0, 12.0, False, None, 'turn'),
+        ('Flush river OOP donk on flushy board',
+         dict(made_hand=HAND_FLUSH, board_flush=0.67),  # flushy → texture=two_tone
+         ['Ah', '5h'], ['Kh', '8h', '2h', '3c', '7d'],
+         3, 6, 70.0, 24.0, False, None, 'river'),
+        ('Combo draw flop face_bet_med (smaller SPR)',
+         dict(made_hand=0.0, flush_draw=1.0, straight_draw=0.5,
+              board_flush=0.5),
+         ['Kh', 'Qh'], ['Jh', 'Td', '9c'],
+         5, 6, 30.0, 8.0, False, 0.5, 'flop'),  # SPR=3.75 → '2-5' bucket
+    ]
+
+    print()
+    print(f'{"Spot":<35} {"Model":<10} {"Adjusted":>12} {"size_bb":>8} {"override":<14}')
+    print('-' * 88)
+    for (label, obs_kw, hole, board, rel_pos, na, eff, pot, wpr, fpct, street) in cases:
+        obs = mk_obs(**obs_kw)
+        for model_pick in (RAISE_HALF, RAISE_POT, ALL_IN):
+            inputs = dict(
+                street=street, obs=obs, hole_cards=hole,
+                community_cards=board, rel_pos=rel_pos, num_active=na,
+                effective_stack_bb=eff, pot_bb=pot,
+                was_preflop_raiser=wpr, facing_bet_size_pct=fpct,
+                call_amount_bb=(fpct * pot if fpct else 0.0),
+            )
+            new_action, size = lookup.adjust(model_pick, inputs)
+            preset_name = {2: 'RAISE_HALF', 3: 'RAISE_POT', 4: 'ALL_IN'}[model_pick]
+            adj_name = {2: 'RAISE_HALF', 3: 'RAISE_POT', 4: 'ALL_IN'}.get(
+                new_action, str(new_action))
+            sz = f'{size:.1f}bb' if size else '—'
+            override = ('promoted-AI' if new_action != model_pick
+                        else ('sized' if size is not None else 'no_data'))
+            spot_lbl = label if model_pick == RAISE_HALF else ''
+            print(f'{spot_lbl:<35} {preset_name:<10} {adj_name:>12} {sz:>8} {override:<14}')
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__,
@@ -284,6 +374,10 @@ def main():
     sh.add_argument('--good-players', default='data/good_players_winrate10.txt')
     sh.add_argument('--max-files', type=int, default=0)
     sh.set_defaults(func=cmd_holdout)
+
+    pf = sub.add_parser('postflop', help='Postflop sizing canonical spots')
+    pf.add_argument('--db-path', default='data/postflop_sizing.sqlite')
+    pf.set_defaults(func=cmd_postflop_spots)
 
     # Default → spots
     args = ap.parse_args()

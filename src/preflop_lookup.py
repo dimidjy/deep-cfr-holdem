@@ -89,7 +89,8 @@ class PreflopLookup:
     def __init__(self, db_path: str, fallback=None,
                  min_samples_exact: int = 5,
                  min_samples_no_nta: int = 3,
-                 min_samples_no_stack: int = 5):
+                 min_samples_no_stack: int = 5,
+                 min_play_rate: float = 0.25):
         """
         Thresholds tuned for showdown-only HH bias. Rationale:
         - L0 exact: need a few confirmations to trust precise spot strategy.
@@ -110,6 +111,7 @@ class PreflopLookup:
         self._min_samples = min_samples_exact
         self._min_samples_no_nta = min_samples_no_nta
         self._min_samples_no_stack = min_samples_no_stack
+        self._min_play_rate = min_play_rate
         if not Path(db_path).exists():
             raise FileNotFoundError(
                 f'Preflop lookup DB not found at {db_path}. '
@@ -119,6 +121,13 @@ class PreflopLookup:
             self._exact: Dict[Tuple, Dict] = load_lookup_into_memory(conn)
             self._level_no_nta, self._level_no_stack = (
                 self._build_coarser_levels(conn))
+            # Build AA reference index (per-combo count at each
+            # (position, action_history, stack_bucket)). AA is universally
+            # played → its per-combo count ≈ deal frequency. Other hands'
+            # per-combo count divided by AA's gives the empirical play rate
+            # — recovers P(played | dealt) from showdown-only data.
+            self._aa_per_combo: Dict[Tuple[str, str, str], float] = (
+                self._build_aa_reference(conn))
         finally:
             conn.close()
 
@@ -134,8 +143,9 @@ class PreflopLookup:
             f"exact_spots={len(self._exact)}, "
             f"L1_keys={len(self._level_no_nta)}, "
             f"L2_keys={len(self._level_no_stack)}, "
+            f"AA_refs={len(self._aa_per_combo)}, "
             f"thresholds=L0:{min_samples_exact} L1:{min_samples_no_nta} "
-            f"L2:{min_samples_no_stack}")
+            f"L2:{min_samples_no_stack} play_rate>={min_play_rate:.2f}")
 
     def reset_counters(self) -> None:
         for k in self._counters:
@@ -147,7 +157,8 @@ class PreflopLookup:
 
     def _log_decision(self, level: str, spot, n_samples: Optional[int],
                       result: Optional[Tuple[float, float, float]],
-                      custom_size_bb: Optional[float]) -> None:
+                      custom_size_bb: Optional[float],
+                      extra: str = '') -> None:
         """DEBUG: per-decision trace; INFO: periodic summary."""
         self._counters[level] += 1
         if logger.isEnabledFor(logging.DEBUG):
@@ -158,9 +169,11 @@ class PreflopLookup:
                 size_str = f"{custom_size_bb:.2f}bb" if custom_size_bb else "preset"
                 logger.debug(
                     f"PF[{level}] {spot_repr} n={n_samples} "
-                    f"F/C/R={f:.0f}/{c:.0f}/{r:.0f} size={size_str}")
+                    f"F/C/R={f:.0f}/{c:.0f}/{r:.0f} size={size_str}"
+                    f"{(' ' + extra) if extra else ''}")
             else:
-                logger.debug(f"PF[{level}] {spot_repr} → fold default")
+                logger.debug(f"PF[{level}] {spot_repr} → fold default"
+                             f"{(' ' + extra) if extra else ''}")
 
         # Periodic summary at INFO so users see hits without DEBUG noise
         total = sum(self._counters.values())
@@ -205,6 +218,15 @@ class PreflopLookup:
             # L0 — exact spot key
             row = self._exact.get(spot.to_tuple())
             if row and row['n_samples'] >= self._min_samples:
+                play_rate = self._play_rate(
+                    spot.hole_class, spot.position, spot.action_history,
+                    spot.stack_bucket, row['n_samples'], 'L0_exact')
+                if play_rate < self._min_play_rate:
+                    self._log_decision(
+                        'L3_fold_default', spot, row['n_samples'],
+                        None, None,
+                        extra=f"play_rate={play_rate*100:.1f}% < threshold")
+                    return self._fold_default(legal_actions, action_size), None
                 strategy, custom_size = self._row_to_strategy(
                     row, legal_actions, action_size, pot_bb, call_amount_bb,
                     effective_stack)
@@ -219,6 +241,15 @@ class PreflopLookup:
                 (spot.hole_class, spot.position,
                  spot.action_history, spot.stack_bucket))
             if row and row['n_samples'] >= self._min_samples_no_nta:
+                play_rate = self._play_rate(
+                    spot.hole_class, spot.position, spot.action_history,
+                    spot.stack_bucket, row['n_samples'], 'L1_no_nta')
+                if play_rate < self._min_play_rate:
+                    self._log_decision(
+                        'L3_fold_default', spot, row['n_samples'],
+                        None, None,
+                        extra=f"play_rate={play_rate*100:.1f}% < threshold")
+                    return self._fold_default(legal_actions, action_size), None
                 strategy, custom_size = self._row_to_strategy(
                     row, legal_actions, action_size, pot_bb, call_amount_bb,
                     effective_stack, trust_size=True)
@@ -235,6 +266,15 @@ class PreflopLookup:
             row = self._level_no_stack.get(
                 (spot.hole_class, spot.position, spot.action_history))
             if row and row['n_samples'] >= self._min_samples_no_stack:
+                play_rate = self._play_rate(
+                    spot.hole_class, spot.position, spot.action_history,
+                    spot.stack_bucket, row['n_samples'], 'L2_no_stack')
+                if play_rate < self._min_play_rate:
+                    self._log_decision(
+                        'L3_fold_default', spot, row['n_samples'],
+                        None, None,
+                        extra=f"play_rate={play_rate*100:.1f}% < threshold")
+                    return self._fold_default(legal_actions, action_size), None
                 strategy, custom_size = self._row_to_strategy(
                     row, legal_actions, action_size, pot_bb, call_amount_bb,
                     effective_stack, trust_size=False)
@@ -292,6 +332,76 @@ class PreflopLookup:
                     bucket[key]['sizes'].append(float(size))
 
         return self._finalize_level(l1), self._finalize_level(l2)
+
+    @staticmethod
+    def _combos_for_class(hole_class: str) -> int:
+        """Combinatorial multiplicity of a 169-class hand:
+        pair=6 combos, suited=4, offsuit=12. Used to normalize raw
+        decision counts into per-combo deal frequency."""
+        if len(hole_class) == 2:
+            return 6  # pair (e.g., 'AA')
+        if hole_class.endswith('S'):
+            return 4
+        return 12
+
+    def _build_aa_reference(self, conn) -> Dict[Tuple[str, str, str], float]:
+        """For each (position, action_history, stack_bucket), record AA's
+        per-combo decision count. AA is universally played → its per-combo
+        count ≈ deal frequency at that spot. Other hands' per-combo counts
+        divided by AA's give the empirical play rate, recovering
+        P(played | dealt) from showdown-only data.
+
+        Builds three references:
+          self._aa_per_combo[(pos, hist, stack)]   — for L0/L1 rows
+          self._aa_per_combo_no_stack[(pos, hist)] — for L2 rows (sum across stacks)
+          self._aa_per_combo_no_hist[(pos,)]       — last-resort fallback
+        """
+        out: Dict[Tuple[str, str, str], float] = {}
+        for pos, hist, stack, n in conn.execute(
+            """SELECT position, action_history, stack_bucket, n_samples
+               FROM lookup WHERE hole_class='AA'"""):
+            out[(pos, hist, stack)] = n / 6.0
+
+        # L2-aligned: sum AA samples across all stack buckets
+        ns_out: Dict[Tuple[str, str], float] = {}
+        for pos, hist, total_n in conn.execute(
+            """SELECT position, action_history, SUM(n_samples)
+               FROM lookup WHERE hole_class='AA'
+               GROUP BY position, action_history"""):
+            ns_out[(pos, hist)] = total_n / 6.0
+
+        self._aa_per_combo_no_stack = ns_out
+        return out
+
+    def _play_rate(self, hole_class: str, position: str,
+                   action_history: str, stack_bucket: str,
+                   n_samples: int, level: str) -> float:
+        """Estimate P(played | dealt) for this hand at this spot.
+
+        The level determines which AA reference to use, since aggregation
+        across L0/L1/L2 changes both the row's n_samples scope AND the
+        baseline:
+          L0_exact, L1_no_nta → AA at same (pos, hist, stack)
+          L2_no_stack          → AA summed across all stacks (matches row)
+
+        Returns play_rate in [0, ~1.5]. Values >1 are possible when AA
+        was played slightly less than the hand was — treat as full play.
+        Returns 1.0 (trust the lookup) when no AA reference is available.
+        """
+        if level == 'L2_no_stack':
+            aa_pc = self._aa_per_combo_no_stack.get((position, action_history))
+        else:
+            aa_pc = self._aa_per_combo.get(
+                (position, action_history, stack_bucket))
+            if not aa_pc:
+                # Stack-specific AA missing — fall through to no-stack baseline
+                aa_pc = self._aa_per_combo_no_stack.get(
+                    (position, action_history))
+        if not aa_pc:
+            return 1.0
+        combos = self._combos_for_class(hole_class)
+        hand_pc = n_samples / combos
+        return hand_pc / aa_pc if aa_pc > 0 else 1.0
 
     @staticmethod
     def _finalize_level(raw: Dict[Tuple, Dict]) -> Dict[Tuple, Dict]:

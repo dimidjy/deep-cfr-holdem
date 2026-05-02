@@ -144,6 +144,15 @@ class DecisionConfig:
     use_preflop_ranges: bool = True   # static GTO range fallback
     use_preflop_lookup: bool = True   # data-driven cohort lookup (preferred)
     preflop_db_path: str = 'data/preflop_lookup.sqlite'
+    # Minimum cohort play_rate to trust the lookup for a spot.
+    # Below this, the spot is treated as fold (cohort folds it most of the
+    # time → showdown-only data under-counts it).
+    preflop_min_play_rate: float = 0.25
+
+    # Postflop sizing (data-driven cohort sizes for bets/raises)
+    use_postflop_sizing: bool = True
+    postflop_db_path: str = 'data/postflop_sizing.sqlite'
+    postflop_all_in_threshold: float = 0.35
 
     # Re-raise classifier
     reraise_classifier_path: str = ''
@@ -478,6 +487,9 @@ class DecisionEngine:
         self._reraise_obs_size = 0
 
         self._preflop_ranges: Dict[int, object] = {}
+        # Postflop sizing lookup (lazy-loaded by load_preflop_ranges()).
+        # None when DB missing or disabled — postflop sizing becomes a no-op.
+        self._postflop_sizing = None
 
     # ── Model loading ────────────────────────────────────────────────────
 
@@ -544,6 +556,7 @@ class DecisionEngine:
                 except Exception:
                     pass
 
+            preflop_lookup_loaded = False
             if self.config.use_preflop_lookup:
                 try:
                     from pathlib import Path as _Path
@@ -551,17 +564,15 @@ class DecisionEngine:
                     if _Path(self.config.preflop_db_path).exists():
                         # Wrap each per-N range in a lookup. The lookup loads
                         # the DB once; we just re-hand it different fallbacks.
-                        # For 6-max (the only num_players the cohort covers)
-                        # we get the data-driven path; other table sizes get
-                        # the lookup with sparse coverage → mostly fallback.
                         for np_, fb in ranges_per_n.items():
                             self._preflop_ranges[np_] = PreflopLookup(
-                                self.config.preflop_db_path, fallback=fb)
+                                self.config.preflop_db_path, fallback=fb,
+                                min_play_rate=self.config.preflop_min_play_rate)
                         logger.info(
                             f"Preflop lookup loaded from "
                             f"{self.config.preflop_db_path} "
                             f"(num_players={list(self._preflop_ranges.keys())})")
-                        return
+                        preflop_lookup_loaded = True
                     else:
                         logger.warning(
                             f"Preflop lookup DB not found at "
@@ -571,12 +582,37 @@ class DecisionEngine:
                     logger.warning(f"Could not load preflop lookup: {e} — "
                                    f"falling back to static ranges.")
 
-            # No lookup → use plain ranges
-            self._preflop_ranges.update(ranges_per_n)
-            logger.info(f"Preflop ranges (static) loaded: "
-                        f"{list(self._preflop_ranges.keys())}")
+            if not preflop_lookup_loaded:
+                # No lookup installed → use plain ranges
+                self._preflop_ranges.update(ranges_per_n)
+                logger.info(f"Preflop ranges (static) loaded: "
+                            f"{list(self._preflop_ranges.keys())}")
         except Exception as e:
             logger.warning(f"Could not load preflop strategy: {e}")
+
+        # ── Postflop sizing lookup ──────────────────────────────────────
+        if self.config.use_postflop_sizing:
+            try:
+                from pathlib import Path as _Path
+                from src.postflop_sizing import PostflopSizingLookup
+                if _Path(self.config.postflop_db_path).exists():
+                    self._postflop_sizing = PostflopSizingLookup(
+                        self.config.postflop_db_path,
+                        all_in_promotion_threshold=self.config.postflop_all_in_threshold,
+                    )
+                    logger.info(
+                        f"Postflop sizing loaded from "
+                        f"{self.config.postflop_db_path} "
+                        f"(spots={self._postflop_sizing.num_spots})")
+                else:
+                    logger.warning(
+                        f"Postflop sizing DB not found at "
+                        f"{self.config.postflop_db_path} — "
+                        f"postflop sizing disabled (preset sizes only).")
+            except Exception as e:
+                logger.warning(
+                    f"Could not load postflop sizing: {e} — "
+                    f"postflop sizing disabled.")
 
     # ── Core decision pipeline ───────────────────────────────────────────
 
