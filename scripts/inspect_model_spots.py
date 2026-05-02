@@ -328,22 +328,8 @@ def get_raw_strategy(model, obs, legal, action_size=5):
 def apply_full_pipeline(model, obs_builder, obs, legal, game_state,
                         temperature=1.0):
     """Apply the decision-pipeline overrides after model inference."""
-    try:
-        from src.agent.policy_core import (
-            _apply_strong_hand_guard, _apply_allin_filter, _apply_call_guard,
-        )
-        guards_available = True
-    except ImportError:
-        guards_available = False
-
     action_size = 5
     strategy = get_raw_strategy(model, obs, legal, action_size)
-
-    if guards_available:
-        strategy = _apply_strong_hand_guard(strategy, obs, legal)
-        strategy = _apply_allin_filter(strategy, obs, legal)
-        strategy = _apply_call_guard(strategy, obs, legal, game_state,
-                                      model, obs_builder)
 
     # Temperature scaling
     if temperature != 1.0 and temperature > 0:
@@ -412,8 +398,7 @@ def main():
         print(f"{i+1:>2} {spot['name']:<52} │ {raw_str} {raw_name:>8} │ {fin_str} {fin_name:>8}{changed}│")
 
     print()
-    print("◄ = guards changed the action vs raw model")
-    print(f"Pipeline: model → strong_hand_guard → allin_filter → call_guard → temperature({temperature})")
+    print(f"Pipeline: model → temperature({temperature})")
 
 
 if __name__ == '__main__':

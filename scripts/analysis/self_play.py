@@ -11,7 +11,7 @@ action, then computes standard poker statistics:
 
 Usage:
   python3 scripts/analysis/self_play.py --hands 10000
-  python3 scripts/analysis/self_play.py --hands 50000 --no-guards
+  python3 scripts/analysis/self_play.py --hands 50000 --no-raise-randomize
   python3 scripts/analysis/self_play.py --hands 10000 --model-facing-bet models/fb.pt \
       --model-checked-to models/ct.pt
 """
@@ -132,6 +132,13 @@ class PlayerStats:
     # By street
     actions_by_street: Dict[str, Dict[str, int]] = field(
         default_factory=lambda: defaultdict(lambda: defaultdict(int)))
+    # Per-(position, action_history) range tracking — only populated when
+    # --range-analysis is set. Key: (pos_label, hist) → combo → action_label → count
+    # action_history ∈ {'open', 'limped', 'vs_raise', 'vs_3bet', 'vs_4bet+'}
+    # action_label ∈ {'fold', 'call', 'raise'}
+    range_grid: Dict[Tuple[str, str], Dict[str, Dict[str, int]]] = field(
+        default_factory=lambda: defaultdict(
+            lambda: defaultdict(lambda: defaultdict(int))))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -174,7 +181,9 @@ class ArchetypeEngine:
 
 def run_self_play(engine: DecisionEngine, num_hands: int,
                   num_players: int = 6,
-                  engine_b: DecisionEngine = None) -> Dict[int, PlayerStats]:
+                  engine_b: DecisionEngine = None,
+                  track_range_analysis: bool = False
+                  ) -> Dict[int, PlayerStats]:
     """Play num_hands of poker with effective `num_players` seats.
 
     Engine is always 6-max so observation shape matches training (50 dims).
@@ -304,6 +313,48 @@ def run_self_play(engine: DecisionEngine, num_hands: int,
             active_engine = engine if (engine_b is None or seat % 2 == 0) else engine_b
             action, strategy_list = active_engine.decide(ctx)
 
+            # ── Postflop sizing override (mirrors default_core.decide()) ──
+            # The DecisionEngine itself doesn't invoke _postflop_sizing — that
+            # call lives in the runtime agent's wrapper. To make self-play stats
+            # reflect the same action distribution the runtime agent produces,
+            # invoke the override here too. This may promote a raise → ALL_IN.
+            if (track_range_analysis
+                    and stage in ('Flop', 'Turn', 'River')
+                    and action in (RAISE_HALF, RAISE_POT, ALL_IN, RAISE_MIN)
+                    and getattr(active_engine, '_postflop_sizing', None) is not None):
+                try:
+                    community = []
+                    try:
+                        community = [str(c) for c in eng.get_community_cards()]
+                    except Exception:
+                        pass
+                    spot_inputs = {
+                        'street': stage.lower(),
+                        'obs': obs,
+                        'hole_cards': cards,
+                        'community_cards': community,
+                        'rel_pos': rel_pos,
+                        'num_active': ENGINE_PLAYERS,
+                        'effective_stack_bb': eng.get_player_chips(agent) / 2.0,
+                        'pot_bb': max(pot_bb, 0.01),
+                        'was_preflop_raiser': (seat == preflop_raiser),
+                        # facing_bet_size_pct: rough proxy from pot_odds (only
+                        # nonzero when facing a bet; ratio is approximate).
+                        'facing_bet_size_pct': (1.0 if facing_bet else None),
+                        'facing_check_raise': False,
+                        'call_amount_bb': 0.0,
+                    }
+                    new_action, _ = active_engine._postflop_sizing.adjust(
+                        action, spot_inputs)
+                    if new_action != action:
+                        action = new_action
+                        strategy_list = [0.0] * NUM_ACTIONS
+                        if 0 <= action < NUM_ACTIONS:
+                            strategy_list[action] = 1.0
+                except Exception:
+                    # Counter increments to error_fallback on its own
+                    pass
+
             # ── Record preflop stats ──
             if stage == 'Preflop':
                 is_bb = (rel_pos == 2)
@@ -313,6 +364,30 @@ def run_self_play(engine: DecisionEngine, num_hands: int,
                 pf_raises = [a for s, st, a in hand_actions
                              if st == 'Preflop' and a >= RAISE_HALF]
                 has_prior_raise = len(pf_raises) > 0
+
+                # ── Range tracking (only when --range-analysis enabled) ──
+                # Bucket the action_history for the spot being decided NOW.
+                if combo != '??':
+                    if preflop_raise_count == 0:
+                        pf_calls = [a for s, st, a in hand_actions
+                                    if st == 'Preflop' and a == CALL]
+                        # Calls without prior raise = limps. SB posting and
+                        # BB posting are blinds, not voluntary actions, so
+                        # any CALL recorded here is a voluntary limp.
+                        hist = 'limped' if pf_calls else 'open'
+                    elif preflop_raise_count == 1:
+                        hist = 'vs_raise'
+                    elif preflop_raise_count == 2:
+                        hist = 'vs_3bet'
+                    else:
+                        hist = 'vs_4bet+'
+                    if action >= RAISE_HALF:
+                        action_label = 'raise'
+                    elif action == CALL:
+                        action_label = 'call'
+                    else:
+                        action_label = 'fold'
+                    stats[seat].range_grid[(pos_label, hist)][combo][action_label] += 1
 
                 if action >= RAISE_HALF:
                     stats[seat].vpip += 1
@@ -449,8 +524,135 @@ def _pct_f(num, den):
     return 100 * num / den if den > 0 else 0.0
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 13×13 hand-chart renderer for --range-analysis
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Standard chart layout: rows/cols are ranks A-down-to-2, diagonal=pairs,
+# upper triangle (row<col)=suited, lower triangle (row>col)=offsuit.
+_CHART_RANKS = 'AKQJT98765432'
+
+
+def _combos_for_class(combo: str) -> int:
+    """pair=6, suited=4, offsuit=12. Mirrors PreflopLookup._combos_for_class
+    but accepts the lowercase-suffix notation used in self_play (AKs, AKo)."""
+    if len(combo) == 2:
+        return 6
+    if combo.endswith('s'):
+        return 4
+    return 12
+
+
+def _combo_at(row_idx: int, col_idx: int) -> str:
+    """Return the canonical combo string for a 13×13 chart cell.
+    Diagonal = pair (e.g., 'AA'), row<col = suited ('AKs'), row>col = offsuit ('AKo').
+    """
+    if row_idx == col_idx:
+        return _CHART_RANKS[row_idx] * 2
+    if row_idx < col_idx:
+        return _CHART_RANKS[row_idx] + _CHART_RANKS[col_idx] + 's'
+    return _CHART_RANKS[col_idx] + _CHART_RANKS[row_idx] + 'o'
+
+
+def _cell_symbol(actions: Dict[str, int]) -> str:
+    """Pick a single-char symbol summarizing the action distribution.
+      *  always raise (≥80%)
+      ○  mostly raise (50-79%)
+      ~  mixed raise/call (raise 30-50%)
+      c  mostly call (call ≥70%, raise <30%)
+      .  mostly fold (fold ≥70%)
+      ·  small sample / mixed/other (fallback)
+      ' ' never observed
+    """
+    total = actions.get('fold', 0) + actions.get('call', 0) + actions.get('raise', 0)
+    if total == 0:
+        return ' '
+    fp = actions.get('fold', 0) / total
+    cp = actions.get('call', 0) / total
+    rp = actions.get('raise', 0) / total
+    if rp >= 0.80:
+        return '*'
+    if rp >= 0.50:
+        return 'o'   # ○ (use ASCII 'o' to keep alignment in any terminal)
+    if rp >= 0.30:
+        return '~'
+    if cp >= 0.70:
+        return 'c'
+    if fp >= 0.70:
+        return '.'
+    return ':'  # genuinely mixed
+
+
+def _render_hand_chart(grid_data: Dict[str, Dict[str, int]],
+                       title: str) -> List[str]:
+    """Render a 13×13 hand chart for one (position, action_history) spot.
+
+    grid_data: combo (e.g., 'AKs', 'AA', '72o') → {fold/call/raise: count}
+    Returns a list of lines (no trailing newlines).
+    """
+    out: List[str] = []
+    out.append('')
+    out.append(f'  RANGE: {title}')
+    # Header row
+    header = '       ' + ' '.join(f' {r} ' for r in _CHART_RANKS)
+    out.append(header)
+    out.append('     ' + '┌' + '─' * (4 * 13 - 1) + '┐')
+    total_combos_played = 0
+    total_combos_raised = 0
+    total_decisions = 0
+    for ri in range(13):
+        cells = []
+        for ci in range(13):
+            combo = _combo_at(ri, ci)
+            actions = grid_data.get(combo, {})
+            sym = _cell_symbol(actions)
+            cells.append(f' {sym} ')
+            n = sum(actions.values())
+            if n > 0:
+                total_decisions += n
+                # weight by combos for "% of deck" stats
+                if (actions.get('raise', 0) + actions.get('call', 0)) / n >= 0.50:
+                    total_combos_played += _combos_for_class(combo)
+                if actions.get('raise', 0) / n >= 0.50:
+                    total_combos_raised += _combos_for_class(combo)
+        row_label = _CHART_RANKS[ri]
+        out.append(f'  {row_label}  │' + '│'.join(cells) + '│')
+    out.append('     ' + '└' + '─' * (4 * 13 - 1) + '┘')
+    out.append(f'  played: {total_combos_played}/1326 combos '
+               f'({100*total_combos_played/1326:.1f}%)   '
+               f'raised: {total_combos_raised}/1326 combos '
+               f'({100*total_combos_raised/1326:.1f}%)   '
+               f'n={total_decisions}')
+    return out
+
+
+def _render_chart_legend() -> List[str]:
+    return [
+        '  Symbol legend: * always-raise (≥80%)  o mostly-raise (50-79%)  '
+        '~ mixed (raise 30-49%)',
+        '                 c mostly-call (≥70%)   . mostly-fold (≥70%)    '
+        ': genuinely mixed   (blank) never observed',
+    ]
+
+
+def _aggregate_range_grids(
+        all_stats: Dict[int, 'PlayerStats']
+) -> Dict[Tuple[str, str], Dict[str, Dict[str, int]]]:
+    """Sum range_grid across all seats (model plays every seat equally)."""
+    agg: Dict[Tuple[str, str], Dict[str, Dict[str, int]]] = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(int)))
+    for ps in all_stats.values():
+        for spot_key, combos in ps.range_grid.items():
+            for combo, actions in combos.items():
+                for label, n in actions.items():
+                    agg[spot_key][combo][label] += n
+    return agg
+
+
 def generate_report(all_stats: Dict[int, PlayerStats], num_players: int,
-                    num_hands: int) -> str:
+                    num_hands: int,
+                    engine: Optional['DecisionEngine'] = None,
+                    range_analysis: bool = False) -> str:
     """Generate text report from aggregated stats."""
     lines = []
     w = lines.append
@@ -666,6 +868,93 @@ def generate_report(all_stats: Dict[int, PlayerStats], num_players: int,
         r, h = pos_rfi[pos]
         w(f'  {pos:<5} {_pct(r, h):>8}  {gto_rfi.get(pos, "-"):>8}')
     w('')
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Range analysis sections (only when --range-analysis was set)
+    # ─────────────────────────────────────────────────────────────────────
+    if range_analysis:
+        w('')
+        w('═' * 70)
+        w('RANGE ANALYSIS — preflop hand-chart grids')
+        w('═' * 70)
+        for line in _render_chart_legend():
+            w(line)
+
+        agg_grid = _aggregate_range_grids(all_stats)
+        # Print charts in a sensible order: per-position, per-history
+        position_order = ['UTG', 'MP', 'CO', 'BTN', 'SB', 'BB']
+        history_order = ['open', 'limped', 'vs_raise', 'vs_3bet', 'vs_4bet+']
+        MIN_DECISIONS = 50  # skip charts with too few samples to be meaningful
+        printed = 0
+        for hist in history_order:
+            for pos in position_order:
+                grid_data = agg_grid.get((pos, hist), {})
+                total_n = sum(sum(a.values()) for a in grid_data.values())
+                if total_n < MIN_DECISIONS:
+                    continue
+                title = f'{pos} {hist}'
+                for line in _render_hand_chart(grid_data, title):
+                    w(line)
+                printed += 1
+        if printed == 0:
+            w('  (no spots reached the 50-decision minimum — try more hands)')
+        w('')
+
+        # Preflop lookup level distribution
+        if engine is not None and engine._preflop_ranges:
+            w('─' * 70)
+            w('Preflop lookup level distribution')
+            w('─' * 70)
+            # Sum counters across all per-num_players lookup instances
+            level_totals: Dict[str, int] = defaultdict(int)
+            seen_ids: set = set()
+            for pf in engine._preflop_ranges.values():
+                if id(pf) in seen_ids:
+                    continue
+                seen_ids.add(id(pf))
+                if hasattr(pf, 'counters'):
+                    for k, v in pf.counters.items():
+                        level_totals[k] += v
+            total = sum(level_totals.values())
+            if total > 0:
+                for label in ['L0_exact', 'L1_no_nta', 'L2_no_stack',
+                              'L3_fold_default', 'error_fallback']:
+                    cnt = level_totals.get(label, 0)
+                    w(f'  {label:<22s} {cnt:>10,d} ({_pct(cnt, total):>6})')
+            else:
+                w('  (no preflop lookup decisions recorded)')
+            w('')
+
+        # Postflop sizing override stats
+        if engine is not None and getattr(engine, '_postflop_sizing', None) is not None:
+            w('─' * 70)
+            w('Postflop sizing override usage')
+            w('─' * 70)
+            c = engine._postflop_sizing.counters
+            queries = c.get('queries', 0)
+            sized = c.get('sizing_override', 0)
+            promoted = c.get('all_in_promotions', 0)
+            no_data = c.get('no_data', 0)
+            non_pf = c.get('non_postflop', 0)
+            non_raise = c.get('non_raise', 0)
+            errors = c.get('error_fallback', 0)
+            # The lookup is ONLY consulted when the sampled action is a raise
+            # on a postflop street, so 'queries' is the universe for the
+            # override-rate columns.
+            w(f'  Postflop raise queries:        {queries:>10,d}')
+            w(f'    All-in promotions:           {promoted:>10,d} '
+              f'({_pct(promoted, queries):>6})')
+            w(f'    Sizing overrides (typed):    {sized:>10,d} '
+              f'({_pct(sized, queries):>6})')
+            w(f'    No-data fallthroughs:        {no_data:>10,d} '
+              f'({_pct(no_data, queries):>6})')
+            w(f'  Skipped (non-postflop):        {non_pf:>10,d}')
+            w(f'  Skipped (non-raise):           {non_raise:>10,d}')
+            w(f'  Errors:                        {errors:>10,d}')
+            override_rate = (promoted + sized) / queries if queries > 0 else 0.0
+            w(f'  → Effective override rate:     {override_rate*100:.1f}% '
+              f'of postflop raise decisions used cohort sizing')
+            w('')
 
     w('=' * 70)
     w('END OF REPORT')
@@ -912,8 +1201,8 @@ def main():
                         help='Model B checked_to (default: same as A)')
     parser.add_argument('--vs-facing-bet-3bet', type=str, default='',
                         help='Model B 3bet (default: same as A)')
-    parser.add_argument('--no-guards', action='store_true',
-                        help='Disable guards and style tuning (raw model)')
+    parser.add_argument('--no-raise-randomize', action='store_true',
+                        help='Disable 80/20 raise-size randomization (always pick argmax raise).')
     parser.add_argument('--no-preflop-ranges', action='store_true',
                         help='Disable GTO preflop ranges (model plays preflop too)')
     parser.add_argument('--archetype', type=str, default='',
@@ -923,6 +1212,10 @@ def main():
     parser.add_argument('--opponent-model', type=str, default='',
                         help='Separate model for opponent (engine B). '
                              'Use with --archetype to skew a different model.')
+    parser.add_argument('--range-analysis', action='store_true',
+                        help='Track per-(position, action_history) ranges and '
+                             'append 13×13 hand-chart grids + preflop/postflop '
+                             'lookup counter sections to the report.')
     args = parser.parse_args()
 
     vs_mode = bool(args.vs_facing_bet) or bool(args.archetype) or bool(args.opponent_model)
@@ -933,11 +1226,8 @@ def main():
 
     # Setup DecisionEngine A
     dc = DecisionConfig(
-        strong_hand_guard=not args.no_guards,
-        allin_filter=not args.no_guards,
-        style_tuning=not args.no_guards,
         use_preflop_ranges=not args.no_preflop_ranges,
-        raise_randomize=not args.no_guards,
+        raise_randomize=not args.no_raise_randomize,
     )
     engine = DecisionEngine(dc)
     if args.model:
@@ -990,14 +1280,29 @@ def main():
         engine_b.load_preflop_ranges()
         print(f'  Engine B: {engine_b.info()}')
 
-    print(f'  Guards: {"ON" if not args.no_guards else "OFF"}')
+    print(f'  Raise randomization: '
+          f'{"ON" if not args.no_raise_randomize else "OFF"}')
     print(f'  Hands to play: {args.hands:,}')
     print('=' * 70)
+
+    # Reset lookup counters so the post-run report reflects only this run.
+    if args.range_analysis:
+        seen_ids = set()
+        for pf in (engine._preflop_ranges or {}).values():
+            if id(pf) in seen_ids:
+                continue
+            seen_ids.add(id(pf))
+            if hasattr(pf, 'reset_counters'):
+                pf.reset_counters()
+        if getattr(engine, '_postflop_sizing', None) is not None:
+            engine._postflop_sizing.reset_counters()
 
     # Run self-play
     print(f'\nRunning {args.hands:,} hands of {args.players}-max '
           f'{"A vs B" if vs_mode else "self-play"}...')
-    stats = run_self_play(engine, args.hands, args.players, engine_b=engine_b)
+    stats = run_self_play(engine, args.hands, args.players,
+                          engine_b=engine_b,
+                          track_range_analysis=args.range_analysis)
 
     # Generate report
     if vs_mode:
@@ -1005,7 +1310,9 @@ def main():
         label_b = args.archetype if args.archetype else Path(args.vs_facing_bet).stem
         report = _generate_vs_report(stats, args.players, args.hands, label_a, label_b)
     else:
-        report = generate_report(stats, args.players, args.hands)
+        report = generate_report(stats, args.players, args.hands,
+                                 engine=engine,
+                                 range_analysis=args.range_analysis)
     print(f'\n{report}')
 
     # Save results

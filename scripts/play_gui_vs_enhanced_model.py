@@ -155,12 +155,6 @@ class LiveBehavioralTracker:
         return _bh_compute(self.bh, hero_name)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Strong-hand fold guard — use shared implementation from DecisionEngine
-# ──────────────────────────────────────────────────────────────────────────────
-from src.decision_engine import _apply_strong_hand_guard as apply_strong_hand_guard
-
-
 def _make_engine(num_players: int) -> FastEnhancedPokerEngine:
     return FastEnhancedPokerEngine(
         num_players=num_players,
@@ -339,7 +333,6 @@ def main():
     parser.add_argument('--exploit', type=float, default=0.0, help='Exploit factor 0.0-1.0 (0=GTO, 0.7=good vs fish)')
     parser.add_argument('--blend', type=str, default=None, help='Deep CFR model for fold decisions (blended mode: fold from CFR, call/raise from --model)')
     parser.add_argument('--fold-blend', type=float, default=1.0, help='Fold blend factor 0.0-1.0 (default: 1.0)')
-    parser.add_argument('--strong-hand-guard', action='store_true', help='Cap fold probability for strong made hands (two pair+)')
     parser.add_argument('--behavioral-stats', action='store_true',
                         help='Enable behavioral stats (for models trained with 49-dim obs)')
     parser.add_argument('--mc-search', action='store_true',
@@ -450,14 +443,10 @@ def main():
     if preflop_ranges:
         print(f"  Preflop: GTO ranges (locked)")
 
-    post_hook = apply_strong_hand_guard if args.strong_hand_guard else None
-    if args.strong_hand_guard:
-        print(f"  Strong-hand guard: ON (two pair+ fold capped)")
-
     gui = PokerGUI(num_players=trained_players, ai_model=deep_cfr,
                    ai_search=search, ai_strategy_refiner=refiner,
                    preflop_ranges=preflop_ranges,
-                   strategy_post_hook=post_hook)
+                   strategy_post_hook=None)
     gui.engine = engine
 
     # Behavioral stats: wrap process_action to track actions and augment observations

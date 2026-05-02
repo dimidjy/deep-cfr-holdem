@@ -103,6 +103,10 @@ class PostflopSizingLookup:
     def counters(self) -> Dict[str, int]:
         return dict(self._counters)
 
+    def reset_counters(self) -> None:
+        for k in self._counters:
+            self._counters[k] = 0
+
     def _emit_summary_if_due(self) -> None:
         """Emit a periodic INFO line every `_log_every` decisions so the
         user can verify the lookup is firing in production logs."""

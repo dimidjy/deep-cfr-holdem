@@ -58,9 +58,6 @@ def find_checkpoints(model_dir, step, from_iter, to_iter):
 def run_eval(checkpoint_path, hands, players):
     """Run self-play on a single checkpoint, return stats dict."""
     dc = DecisionConfig(
-        strong_hand_guard=False,
-        allin_filter=False,
-        style_tuning=False,
         use_preflop_ranges=True,
         raise_randomize=False,
     )

@@ -483,9 +483,7 @@ def generate_selfplay_data(num_hands, num_players=6, model_fb='', model_ct='',
         add_betting_history_features=True)
 
     # Load model for decision making
-    dc = DecisionConfig(use_preflop_ranges=True, style_tuning=True,
-                        strong_hand_guard=True, allin_filter=True,
-                        raise_randomize=True)
+    dc = DecisionConfig(use_preflop_ranges=True, raise_randomize=True)
     de = DecisionEngine(dc)
     if model_fb:
         de.load_models(facing_bet=model_fb, checked_to=model_ct,

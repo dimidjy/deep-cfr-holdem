@@ -90,7 +90,11 @@ class PreflopLookup:
                  min_samples_exact: int = 5,
                  min_samples_no_nta: int = 3,
                  min_samples_no_stack: int = 5,
-                 min_play_rate: float = 0.25):
+                 min_play_rate: float = 0.25,
+                 min_play_rate_vs_3bet: Optional[float] = None,
+                 min_play_rate_vs_4bet: Optional[float] = None,
+                 l2_large_call_bb: float = 30.0,
+                 l2_large_call_play_rate: float = 0.40):
         """
         Thresholds tuned for showdown-only HH bias. Rationale:
         - L0 exact: need a few confirmations to trust precise spot strategy.
@@ -106,12 +110,44 @@ class PreflopLookup:
         usually win and these thresholds barely matter. With sparse cohort
         data (testing build), L2's threshold of 5 prevents single-sample
         showdown-bias from leaking into runtime strategy.
+
+        Fallback policy:
+        - L0/L1 with play_rate below `min_play_rate` → fold (the cohort
+          *did* see this spot enough times to fold; absence of plays is
+          signal).
+        - L2 with play_rate below `min_play_rate` → static range fallback
+          (L2 pools across stacks, so its distribution is less reliable;
+          static GTO ranges are safer than blind fold).
+        - L2 with call_amount ≥ `l2_large_call_bb` AND play_rate below
+          `l2_large_call_play_rate` → static range fallback (stack-pooled
+          rows are dangerous when the decision commits a lot of chips).
+        - L3 (no data anywhere) → static range fallback if available,
+          else fold default.
         """
         self._fallback = fallback
         self._min_samples = min_samples_exact
         self._min_samples_no_nta = min_samples_no_nta
         self._min_samples_no_stack = min_samples_no_stack
         self._min_play_rate = min_play_rate
+        # Per-action_history thresholds. None means use the global default,
+        # which keeps behaviour unchanged when callers don't specify them.
+        from src.preflop_spot_key import (
+            HIST_OPEN, HIST_LIMPED_POT, HIST_VS_RAISE,
+            HIST_VS_3BET, HIST_VS_4BET,
+        )
+        self._min_play_rate_by_hist: Dict[str, float] = {
+            HIST_OPEN: min_play_rate,
+            HIST_LIMPED_POT: min_play_rate,
+            HIST_VS_RAISE: min_play_rate,
+            HIST_VS_3BET: (min_play_rate_vs_3bet
+                           if min_play_rate_vs_3bet is not None
+                           else min_play_rate),
+            HIST_VS_4BET: (min_play_rate_vs_4bet
+                           if min_play_rate_vs_4bet is not None
+                           else min_play_rate),
+        }
+        self._l2_large_call_bb = l2_large_call_bb
+        self._l2_large_call_play_rate = l2_large_call_play_rate
         if not Path(db_path).exists():
             raise FileNotFoundError(
                 f'Preflop lookup DB not found at {db_path}. '
@@ -135,7 +171,8 @@ class PreflopLookup:
         # confirm the lookup is firing in production. Reset by reset_counters().
         self._counters = {
             'L0_exact': 0, 'L1_no_nta': 0, 'L2_no_stack': 0,
-            'L3_fold_default': 0, 'error_fallback': 0,
+            'L3_fold_default': 0, 'L3_static_fallback': 0,
+            'L2_static_fallback': 0, 'error_fallback': 0,
         }
         self._log_every = 50    # emit usage summary every N decisions
         logger.info(
@@ -145,7 +182,10 @@ class PreflopLookup:
             f"L2_keys={len(self._level_no_stack)}, "
             f"AA_refs={len(self._aa_per_combo)}, "
             f"thresholds=L0:{min_samples_exact} L1:{min_samples_no_nta} "
-            f"L2:{min_samples_no_stack} play_rate>={min_play_rate:.2f}")
+            f"L2:{min_samples_no_stack} "
+            f"play_rate(open/vs_raise)>={min_play_rate:.2f} "
+            f"play_rate(vs_3bet)>={self._min_play_rate_by_hist['vs_3bet']:.2f} "
+            f"play_rate(vs_4bet+)>={self._min_play_rate_by_hist['vs_4bet+']:.2f}")
 
     def reset_counters(self) -> None:
         for k in self._counters:
@@ -221,11 +261,15 @@ class PreflopLookup:
                 play_rate = self._play_rate(
                     spot.hole_class, spot.position, spot.action_history,
                     spot.stack_bucket, row['n_samples'], 'L0_exact')
-                if play_rate < self._min_play_rate:
+                threshold = self._min_play_rate_by_hist.get(
+                    spot.action_history, self._min_play_rate)
+                if play_rate < threshold:
                     self._log_decision(
                         'L3_fold_default', spot, row['n_samples'],
                         None, None,
-                        extra=f"play_rate={play_rate*100:.1f}% < threshold")
+                        extra=(f"play_rate={play_rate*100:.1f}% "
+                               f"< {threshold*100:.0f}% "
+                               f"(hist={spot.action_history})"))
                     return self._fold_default(legal_actions, action_size), None
                 strategy, custom_size = self._row_to_strategy(
                     row, legal_actions, action_size, pot_bb, call_amount_bb,
@@ -244,11 +288,15 @@ class PreflopLookup:
                 play_rate = self._play_rate(
                     spot.hole_class, spot.position, spot.action_history,
                     spot.stack_bucket, row['n_samples'], 'L1_no_nta')
-                if play_rate < self._min_play_rate:
+                threshold = self._min_play_rate_by_hist.get(
+                    spot.action_history, self._min_play_rate)
+                if play_rate < threshold:
                     self._log_decision(
                         'L3_fold_default', spot, row['n_samples'],
                         None, None,
-                        extra=f"play_rate={play_rate*100:.1f}% < threshold")
+                        extra=(f"play_rate={play_rate*100:.1f}% "
+                               f"< {threshold*100:.0f}% "
+                               f"(hist={spot.action_history})"))
                     return self._fold_default(legal_actions, action_size), None
                 strategy, custom_size = self._row_to_strategy(
                     row, legal_actions, action_size, pot_bb, call_amount_bb,
@@ -269,12 +317,34 @@ class PreflopLookup:
                 play_rate = self._play_rate(
                     spot.hole_class, spot.position, spot.action_history,
                     spot.stack_bucket, row['n_samples'], 'L2_no_stack')
-                if play_rate < self._min_play_rate:
-                    self._log_decision(
-                        'L3_fold_default', spot, row['n_samples'],
-                        None, None,
-                        extra=f"play_rate={play_rate*100:.1f}% < threshold")
-                    return self._fold_default(legal_actions, action_size), None
+                # L2 is the noisiest level (pooled across stack depths) —
+                # when the gate fails, prefer the static GTO range over a
+                # blind fold default; the cohort's "play_rate" estimate may
+                # be biased low at coarse keys but the static range still
+                # encodes solid baseline strategy.
+                threshold = self._min_play_rate_by_hist.get(
+                    spot.action_history, self._min_play_rate)
+                if play_rate < threshold:
+                    return self._static_or_fold(
+                        spot, row['n_samples'], hole_cards, rel_pos, pot_bb,
+                        legal_actions, action_size, num_limpers,
+                        effective_stack, num_callers,
+                        reason=(f"L2 play_rate={play_rate*100:.1f}% "
+                                f"< {threshold*100:.0f}% "
+                                f"(hist={spot.action_history})"))
+                # Stack-pooled rows are also dangerous when the decision
+                # commits a lot of chips (jam-call defense). Require a
+                # higher confidence floor for large calls; otherwise defer
+                # to static ranges.
+                if (call_amount_bb >= self._l2_large_call_bb and
+                        play_rate < self._l2_large_call_play_rate):
+                    return self._static_or_fold(
+                        spot, row['n_samples'], hole_cards, rel_pos, pot_bb,
+                        legal_actions, action_size, num_limpers,
+                        effective_stack, num_callers,
+                        reason=(f"L2 large call ({call_amount_bb:.1f}bb) "
+                                f"play_rate={play_rate*100:.1f}% "
+                                f"< {self._l2_large_call_play_rate*100:.0f}%"))
                 strategy, custom_size = self._row_to_strategy(
                     row, legal_actions, action_size, pot_bb, call_amount_bb,
                     effective_stack, trust_size=False)
@@ -284,12 +354,16 @@ class PreflopLookup:
                     custom_size)
                 return strategy, custom_size
 
-            # L3 — no data at any granularity. Default to fold (the
-            # showdown-only DB systematically under-represents folds, so
-            # absence-of-data is a fold signal, not "we don't know").
-            self._log_decision(
-                'L3_fold_default', spot, 0, None, None)
-            return self._fold_default(legal_actions, action_size), None
+            # L3 — no data at any granularity. Prefer the static GTO range
+            # over a blind fold default: a hand with no cohort coverage is
+            # more often "rare spot the cohort hasn't reached at showdown"
+            # than "spot where the cohort always folds." The static range
+            # still encodes a coherent baseline.
+            return self._static_or_fold(
+                spot, 0, hole_cards, rel_pos, pot_bb,
+                legal_actions, action_size, num_limpers,
+                effective_stack, num_callers,
+                reason="L3 no data at any granularity")
 
         except Exception as e:
             # True error path: lookup machinery failed. Fall back to static.
@@ -356,11 +430,17 @@ class PreflopLookup:
           self._aa_per_combo_no_stack[(pos, hist)] — for L2 rows (sum across stacks)
           self._aa_per_combo_no_hist[(pos,)]       — last-resort fallback
         """
+        # Aggregate across num_to_act: AA rows can be split per nta in the
+        # lookup table, and we want the spot-total deal frequency. Without
+        # GROUP BY the dict was overwritten per nta and silently kept whichever
+        # row came last (often the smaller one), which broke the play-rate
+        # gate for any (pos, hist, stack) with multiple AA rows.
         out: Dict[Tuple[str, str, str], float] = {}
-        for pos, hist, stack, n in conn.execute(
-            """SELECT position, action_history, stack_bucket, n_samples
-               FROM lookup WHERE hole_class='AA'"""):
-            out[(pos, hist, stack)] = n / 6.0
+        for pos, hist, stack, total_n in conn.execute(
+            """SELECT position, action_history, stack_bucket, SUM(n_samples)
+               FROM lookup WHERE hole_class='AA'
+               GROUP BY position, action_history, stack_bucket"""):
+            out[(pos, hist, stack)] = total_n / 6.0
 
         # L2-aligned: sum AA samples across all stack buckets
         ns_out: Dict[Tuple[str, str], float] = {}
@@ -560,6 +640,41 @@ class PreflopLookup:
             return None
         return min(candidates.items(),
                    key=lambda kv: abs(kv[1] - target_size_bb))[0]
+
+    def _static_or_fold(self, spot, n_samples, hole_cards, rel_pos, pot_bb,
+                        legal_actions, action_size, num_limpers,
+                        effective_stack, num_callers, reason: str
+                        ) -> Tuple[np.ndarray, Optional[float]]:
+        """Use the static-range fallback if available; else fold default.
+
+        Called from L2 (when the gate fails or the call commits a lot of
+        chips) and L3 (no data anywhere). The static GTO range is a safer
+        default than blind fold for spots where the cohort data is too
+        sparse or noisy to trust.
+        """
+        if self._fallback is not None:
+            try:
+                strategy = self._fallback_strategy(
+                    hole_cards, rel_pos, pot_bb, legal_actions, action_size,
+                    num_limpers, effective_stack, num_callers,
+                )
+                self._counters['L3_static_fallback' if n_samples == 0
+                                else 'L2_static_fallback'] += 1
+                if logger.isEnabledFor(logging.DEBUG):
+                    spot_repr = (f"{spot.hole_class}/{spot.position}/"
+                                 f"{spot.action_history}/{spot.stack_bucket}/"
+                                 f"nta={spot.num_to_act}")
+                    level = 'L3_static' if n_samples == 0 else 'L2_static'
+                    logger.debug(f"PF[{level}] {spot_repr} → static range "
+                                 f"({reason})")
+                return strategy, None
+            except Exception as e:
+                logger.warning(f"Static fallback raised: {e} — "
+                               f"using fold default")
+        # No fallback or fallback raised — preserve old fold-default behavior
+        self._log_decision('L3_fold_default', spot, n_samples, None, None,
+                           extra=reason)
+        return self._fold_default(legal_actions, action_size), None
 
     def _fallback_strategy(self, hole_cards, rel_pos, pot_bb, legal_actions,
                            action_size, num_limpers, effective_stack, num_callers):

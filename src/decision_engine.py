@@ -132,14 +132,11 @@ class SpotContext:
 class DecisionConfig:
     """Configuration for the decision pipeline.
 
-    All consumers use this. The agent uses the defaults (everything on).
-    Validation/analysis can disable guards for raw model comparison.
+    Pipeline = preflop lookup (data-driven cohort) → model inference →
+    postflop sizing override → sampling. The legacy strong_hand_guard /
+    allin_filter / style_tuning heuristics were removed once the cohort
+    lookup + postflop sizing made them redundant.
     """
-    # Guards
-    strong_hand_guard: bool = True
-    allin_filter: bool = True
-    style_tuning: bool = True
-
     # Preflop
     use_preflop_ranges: bool = True   # static GTO range fallback
     use_preflop_lookup: bool = True   # data-driven cohort lookup (preferred)
@@ -148,6 +145,14 @@ class DecisionConfig:
     # Below this, the spot is treated as fold (cohort folds it most of the
     # time → showdown-only data under-counts it).
     preflop_min_play_rate: float = 0.25
+    # Tighter thresholds for facing aggression: NL5 population 3-bets and
+    # 4-bets value-heavy, so defending the cohort's regular range loses to
+    # dominated showdowns. Bumping the gate folds marginal hands like
+    # AQo/AJs/77/JTs vs 3-bets and TT/AQs vs 4-bets, which a winning-reg
+    # cohort defends against balanced 3-bet ranges but NL5 randoms don't
+    # 3-bet wide enough to justify.
+    preflop_min_play_rate_vs_3bet: float = 0.40
+    preflop_min_play_rate_vs_4bet: float = 0.50
 
     # Postflop sizing (data-driven cohort sizes for bets/raises)
     use_postflop_sizing: bool = True
@@ -174,83 +179,8 @@ class DecisionConfig:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Strong-hand fold guard
+# All-in promotion (river-only, optional — separate from removed allin_filter)
 # ─────────────────────────────────────────────────────────────────────────────
-
-# (min_made_hand_cat, max_fold_prob)
-_FOLD_CAPS = [
-    (HAND_FULL_HOUSE, 0.00),  # full house+ → never fold
-    (HAND_FLUSH,      0.01),  # flush → 1% max fold
-    (HAND_STRAIGHT,   0.02),  # straight → 2% max fold
-    (HAND_TRIPS,      0.03),  # set/trips → 3% max fold
-]
-
-
-def _apply_strong_hand_guard(strategy: np.ndarray, obs: np.ndarray,
-                              legal_actions: List[int]) -> np.ndarray:
-    """Cap fold probability for strong made hands."""
-    if FOLD not in legal_actions:
-        return strategy
-    made_hand = obs[IDX_MADE_HAND] if len(obs) > IDX_MADE_HAND else 0.0
-
-    max_fold = 1.0
-    for min_cat, cap in _FOLD_CAPS:
-        if made_hand >= min_cat - 0.01:
-            max_fold = cap
-            break
-
-    if max_fold >= 1.0 or strategy[FOLD] <= max_fold:
-        return strategy
-
-    excess = strategy[FOLD] - max_fold
-    strategy = strategy.copy()
-    strategy[FOLD] = max_fold
-
-    non_fold = [a for a in legal_actions if a != FOLD]
-    non_fold_sum = sum(strategy[a] for a in non_fold)
-    if non_fold_sum > 0:
-        for a in non_fold:
-            strategy[a] += excess * (strategy[a] / non_fold_sum)
-    elif non_fold:
-        for a in non_fold:
-            strategy[a] = excess / len(non_fold)
-    return strategy
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# All-in quality filter
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _apply_allin_filter(strategy: np.ndarray, obs: np.ndarray,
-                         legal_actions: List[int]) -> np.ndarray:
-    """Suppress all-in with weak hands (< two pair and no draw)."""
-    if ALL_IN not in legal_actions or strategy[ALL_IN] < 0.01:
-        return strategy
-    if len(obs) <= IDX_STRAIGHT_DRAW:
-        return strategy
-
-    made_hand = float(obs[IDX_MADE_HAND])
-    if made_hand >= HAND_TWO_PAIR - 0.01:
-        return strategy  # two pair+ — allow
-    has_flush_draw = float(obs[IDX_FLUSH_DRAW]) > 0.0
-    has_straight_draw = float(obs[IDX_STRAIGHT_DRAW]) > 0.0
-    if has_flush_draw or has_straight_draw:
-        return strategy  # semi-bluff — allow
-
-    # Weak hand: redistribute all-in to other actions
-    strategy = strategy.copy()
-    excess = strategy[ALL_IN]
-    strategy[ALL_IN] = 0.0
-    non_allin = [a for a in legal_actions if a != ALL_IN]
-    non_allin_sum = sum(strategy[a] for a in non_allin)
-    if non_allin_sum > 0:
-        for a in non_allin:
-            strategy[a] += excess * (strategy[a] / non_allin_sum)
-    elif non_allin:
-        for a in non_allin:
-            strategy[a] = excess / len(non_allin)
-    return strategy
-
 
 def _promote_to_allin(strategy: np.ndarray, obs: np.ndarray,
                        legal_actions: List[int],
@@ -295,180 +225,15 @@ def _promote_to_allin(strategy: np.ndarray, obs: np.ndarray,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Style tuning
-# ─────────────────────────────────────────────────────────────────────────────
-
-_STYLE = {
-    # Raise sizing: upgrade Raise½ → RaisePot with strong hands
-    'raise_size_upgrade': 0.35,
-    'raise_size_min_hand': HAND_TWO_PAIR,
-
-    # Facing bet: add some raise probability (model never re-raises)
-    # NOTE: skipped when reraise classifier is loaded
-    'facing_bet_raise_boost': 0.20,
-    'facing_bet_raise_min_hand': HAND_TWO_PAIR,
-
-    # Facing bet: fold boost — now handled by _facing_bet_fold_boost()
-    # (old flat 10% boost for air only was too weak — WTSD 37-42%)
-
-    # Checked-to: bet with strong hands (value bet) — scales by street
-    # Flop: full boost (CBet), Turn: moderate, River: thin value only
-    'value_bet_boost_flop': 0.12,
-    'value_bet_boost_turn': 0.04,
-    'value_bet_boost_river': 0.03,
-    'value_bet_min_hand': HAND_ONE_PAIR,
-
-    # Checked-to: add bluff frequency with air
-    'bluff_boost': 0.12,
-    'bluff_max_hand': 0.01,
-
-    # Checked-to: add semi-bluff with draws
-    'semi_bluff_boost': 0.12,
-}
-
-
-def _facing_bet_fold_boost(obs: np.ndarray, made_hand: float,
-                           has_draw: bool, street: str) -> float:
-    """Compute fold probability boost when facing a bet.
-
-    Considers:
-    - Hand strength (air folds most, bottom pair folds a lot, top pair less)
-    - Bet size (bigger bet = fold more)
-    - Street (later streets = fold more, draws lose equity)
-    - Draws (still have equity on flop/turn, not river)
-    """
-    # Street multiplier: fold more on later streets
-    street_mult = {'flop': 0.5, 'Flop': 0.5,
-                   'turn': 0.8, 'Turn': 0.8,
-                   'river': 1.0, 'River': 1.0}.get(street, 0.5)
-
-    # Bet size: obs[35] = bet_to_pot = call / (pot - call), normalized /2
-    # Higher = bigger bet = should fold more
-    bet_size = float(obs[35]) if len(obs) > 35 else 0.3
-    bet_mult = 0.5 + bet_size  # range ~0.5 (min bet) to ~1.5 (overbet)
-
-    # Base fold boost by hand strength
-    if made_hand < 0.01:
-        # Pure air: fold a lot
-        if has_draw and street in ('flop', 'Flop'):
-            return 0.0  # don't fold draws on flop
-        base = 0.25
-    elif made_hand < 0.125:
-        # High card (A-high, K-high): weak, fold most of the time
-        if has_draw and street in ('flop', 'Flop', 'turn', 'Turn'):
-            return 0.0  # draws with overcards have equity
-        base = 0.20
-    elif made_hand < 0.20:
-        # Bottom/middle pair: fold facing big bets on later streets
-        if street in ('flop', 'Flop'):
-            return 0.0  # keep calling on flop (could improve)
-        base = 0.15
-    elif made_hand < 0.25:
-        # Top pair: only fold facing big bets on river
-        if street not in ('river', 'River'):
-            return 0.0
-        base = 0.08
-    else:
-        # Two pair+: don't boost folding (strong hand guard handles this)
-        return 0.0
-
-    return min(base * street_mult * bet_mult, 0.35)
-
-
-def _apply_style_tuning(strategy: np.ndarray, obs: np.ndarray,
-                         legal_actions: List[int], facing_bet: bool,
-                         skip_facing_bet_raise: bool = False,
-                         street: str = '') -> np.ndarray:
-    """Soft post-inference adjustments to fix model tendencies."""
-    if len(obs) <= IDX_MADE_HAND:
-        return strategy
-
-    made_hand = float(obs[IDX_MADE_HAND])
-    has_flush_draw = float(obs[IDX_FLUSH_DRAW]) > 0.0 if len(obs) > IDX_FLUSH_DRAW else False
-    has_straight_draw = float(obs[IDX_STRAIGHT_DRAW]) > 0.0 if len(obs) > IDX_STRAIGHT_DRAW else False
-    has_draw = has_flush_draw or has_straight_draw
-
-    strategy = strategy.copy()
-
-    if facing_bet:
-        # Boost re-raise with strong hands (skipped when reraise classifier is active)
-        if not skip_facing_bet_raise and made_hand >= _STYLE['facing_bet_raise_min_hand']:
-            boost = _STYLE['facing_bet_raise_boost']
-            if RAISE_HALF in legal_actions and strategy[CALL] > boost * 2:
-                strategy[RAISE_HALF] += boost * 0.6
-                strategy[RAISE_POT] += boost * 0.3
-                strategy[ALL_IN] += boost * 0.1
-                strategy[CALL] -= boost
-
-        # Fold boost: scale by hand strength, bet size, and street.
-        # The model under-folds everything (trained on showdown-only data).
-        if FOLD in legal_actions and strategy[CALL] > 0.05:
-            boost = _facing_bet_fold_boost(obs, made_hand, has_draw, street)
-            if boost > 0 and strategy[CALL] > boost:
-                strategy[FOLD] += boost
-                strategy[CALL] -= boost
-    else:
-        # Value bet boost: bet with one pair+ when checked to — scales by street
-        # Flop: bet often (CBet), Turn: moderate, River: selective
-        if street in ('flop', 'Flop'):
-            vb_boost = _STYLE['value_bet_boost_flop']
-        elif street in ('turn', 'Turn'):
-            vb_boost = _STYLE['value_bet_boost_turn']
-        else:
-            vb_boost = _STYLE['value_bet_boost_river']
-
-        if (made_hand >= _STYLE['value_bet_min_hand']
-                and RAISE_HALF in legal_actions
-                and strategy[CALL] > vb_boost * 1.5):
-            strategy[RAISE_HALF] += vb_boost * 0.7
-            strategy[RAISE_POT] += vb_boost * 0.3 if RAISE_POT in legal_actions else 0
-            strategy[CALL] -= vb_boost
-
-        # Raise sizing upgrade: Raise½ → RaisePot with strong hands
-        if (made_hand >= _STYLE['raise_size_min_hand']
-                and RAISE_POT in legal_actions and strategy[RAISE_HALF] > 0.1):
-            upgrade = strategy[RAISE_HALF] * _STYLE['raise_size_upgrade']
-            strategy[RAISE_HALF] -= upgrade
-            strategy[RAISE_POT] += upgrade
-
-        # Bluff boost: bet with air when checked to (flop only — model
-        # already bluffs 40-50% on turn/river, boosting makes it too high)
-        if (street in ('flop', 'Flop')
-                and made_hand < _STYLE['bluff_max_hand']
-                and not has_draw and RAISE_HALF in legal_actions
-                and strategy[CALL] > _STYLE['bluff_boost'] * 2):
-            strategy[RAISE_HALF] += _STYLE['bluff_boost']
-            strategy[CALL] -= _STYLE['bluff_boost']
-
-        # Semi-bluff boost: bet with draws when checked to
-        if (has_draw and made_hand < HAND_ONE_PAIR
-                and RAISE_HALF in legal_actions
-                and strategy[CALL] > _STYLE['semi_bluff_boost'] * 2):
-            boost = _STYLE['semi_bluff_boost']
-            strategy[RAISE_HALF] += boost
-            strategy[CALL] -= boost
-
-    # Renormalize
-    total = sum(strategy[a] for a in legal_actions)
-    if total > 0:
-        for a in range(len(strategy)):
-            if a in legal_actions:
-                strategy[a] /= total
-            else:
-                strategy[a] = 0.0
-
-    return strategy
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # DecisionEngine
 # ─────────────────────────────────────────────────────────────────────────────
 
 class DecisionEngine:
     """Single source of truth for all poker decisions.
 
-    Handles model routing, guards, style tuning, preflop ranges, and sampling.
-    Every consumer (agent, validation, analysis, GUI) uses this class.
+    Handles model routing, preflop lookup/ranges, postflop sizing override,
+    and sampling. Every consumer (agent, validation, analysis, GUI) uses
+    this class.
     """
 
     def __init__(self, config: DecisionConfig = None):
@@ -567,7 +332,11 @@ class DecisionEngine:
                         for np_, fb in ranges_per_n.items():
                             self._preflop_ranges[np_] = PreflopLookup(
                                 self.config.preflop_db_path, fallback=fb,
-                                min_play_rate=self.config.preflop_min_play_rate)
+                                min_play_rate=self.config.preflop_min_play_rate,
+                                min_play_rate_vs_3bet=(
+                                    self.config.preflop_min_play_rate_vs_3bet),
+                                min_play_rate_vs_4bet=(
+                                    self.config.preflop_min_play_rate_vs_4bet))
                         logger.info(
                             f"Preflop lookup loaded from "
                             f"{self.config.preflop_db_path} "
@@ -662,25 +431,9 @@ class DecisionEngine:
                 if i < NUM_ACTIONS:
                     strategy[i] = float(p)
 
-        # 3. Strong hand guard
-        if self.config.strong_hand_guard:
-            strategy = _apply_strong_hand_guard(strategy, ctx.obs, legal)
-
-        # 4. All-in quality filter
-        if self.config.allin_filter:
-            strategy = _apply_allin_filter(strategy, ctx.obs, legal)
-
-        # 5. Re-raise classifier
-        skip_fb_raise = False
+        # 3. Re-raise classifier (optional)
         if ctx.facing_bet and self._reraise_clf is not None:
             strategy = self._apply_reraise(strategy, ctx.obs, legal)
-            skip_fb_raise = True
-
-        # 6. Style tuning
-        if self.config.style_tuning:
-            strategy = _apply_style_tuning(strategy, ctx.obs, legal,
-                                            ctx.facing_bet, skip_fb_raise,
-                                            street=ctx.street)
 
         return strategy
 

@@ -67,9 +67,8 @@ _DEFAULT_CONTINUATION_EQUITY = 0.50
 # ──────────────────────────────────────────────────────────────────────────────
 # Observation layout for 6p: Position(8) + PotOdds(3) + HandStrength(5) + Stack(2) + Equity(8)
 # Equity block: [hand_strength, made_hand_cat, flush_draw, straight_draw, ...]
-# ── Shared constants and guards from DecisionEngine ──────────────────────────
+# ── Shared constants from DecisionEngine ─────────────────────────────────────
 from src.decision_engine import (
-    _apply_strong_hand_guard as apply_strong_hand_guard,
     IDX_MADE_HAND as _MADE_HAND_IDX,
     IDX_EQUITY as _HAND_STRENGTH_IDX,
 )
@@ -331,7 +330,7 @@ def _load_model(model_path: Path, config: dict, num_players: int,
 
 def analyze_decision_points(deep_cfr, decision_points: list,
                             strategy_fn, num_players: int,
-                            preflop_ranges=None, strong_hand_guard=False,
+                            preflop_ranges=None,
                             good_players=None, bad_players=None):
     """Analyze model strategy at each decision point from hand histories.
 
@@ -395,9 +394,6 @@ def analyze_decision_points(deep_cfr, decision_points: list,
                 dp.hole_cards, pf_rel, pot_bb, legal, deep_cfr.action_size)
         else:
             model_strategy = strategy_fn(dp.observation, rel_pos, legal)
-
-        if strong_hand_guard and dp.street != 'preflop':
-            model_strategy = apply_strong_hand_guard(model_strategy, dp.observation, legal)
 
         actual = dp.actual_action
         street = dp.street
@@ -623,7 +619,7 @@ def compute_nl5_population_stats(all_6p_hands: list, num_players: int = 6):
 
 def compute_showdown_ev(showdown_hands: list, all_decision_points: list,
                         strategy_fn, deep_cfr, num_players: int,
-                        preflop_ranges=None, strong_hand_guard=False,
+                        preflop_ranges=None,
                         good_players=None, bad_players=None,
                         p_fold_to_raise: float = _DEFAULT_P_FOLD,
                         continuation_equity: float = _DEFAULT_CONTINUATION_EQUITY):
@@ -740,10 +736,6 @@ def compute_showdown_ev(showdown_hands: list, all_decision_points: list,
                         deep_cfr.action_size)
                 else:
                     model_strategy = strategy_fn(dp.observation, rel_pos, legal)
-
-                if strong_hand_guard and dp.street != 'preflop':
-                    model_strategy = apply_strong_hand_guard(
-                        model_strategy, dp.observation, legal)
 
                 model_top = int(np.argmax(model_strategy))
                 actual = dp.actual_action
@@ -1413,8 +1405,8 @@ def main():
                         help='Re-raise binary classifier model (.pt)')
     parser.add_argument('--reraise-threshold', type=float, default=0.25,
                         help='Min P(raise) to upgrade call→raise (default 0.25)')
-    parser.add_argument('--no-style', action='store_true',
-                        help='Disable style tuning (raw model output only)')
+    parser.add_argument('--no-raise-randomize', action='store_true',
+                        help='Disable 80/20 raise-size randomization (always pick argmax raise).')
     parser.add_argument('--hh-dir', type=str,
                         default='data/poker_archive/',
                         help='Directory with PokerStars HH files')
@@ -1447,8 +1439,6 @@ def main():
                         help='Minimum CFR fold influence 0.0-1.0 (use 0.3 for ratio_0.00)')
     parser.add_argument('--legacy', action='store_true',
                         help='Force legacy obs format (3-dim game_state, for old models)')
-    parser.add_argument('--strong-hand-guard', action='store_true',
-                        help='Cap fold probability for strong made hands (two pair+)')
     parser.add_argument('--game-players', type=int, default=0,
                         help='Override game player count (e.g. use 6p model on 4p hands)')
     parser.add_argument('--behavioral-stats', action='store_true',
@@ -1482,11 +1472,9 @@ def main():
         from src.decision_engine import DecisionEngine, DecisionConfig, SpotContext
 
         dc = DecisionConfig(
-            strong_hand_guard=args.strong_hand_guard,
-            style_tuning=not args.no_style,
             reraise_classifier_path=getattr(args, 'reraise_classifier', ''),
             reraise_threshold=getattr(args, 'reraise_threshold', 0.25),
-            raise_randomize=not args.no_style,
+            raise_randomize=not args.no_raise_randomize,
             use_preflop_ranges=False,  # validation doesn't use preflop ranges
         )
         _de = DecisionEngine(dc)
@@ -1721,7 +1709,6 @@ def main():
     metrics = analyze_decision_points(
         deep_cfr, all_decision_points, sfn, num_players,
         preflop_ranges=pf_ranges,
-        strong_hand_guard=args.strong_hand_guard,
         good_players=good_players,
         bad_players=bad_players)
 
@@ -1733,7 +1720,6 @@ def main():
     ev_data = compute_showdown_ev(
         showdown, all_decision_points, sfn, deep_cfr, num_players,
         preflop_ranges=pf_ranges,
-        strong_hand_guard=args.strong_hand_guard,
         good_players=good_players,
         bad_players=bad_players,
         p_fold_to_raise=args.fold_equity,
