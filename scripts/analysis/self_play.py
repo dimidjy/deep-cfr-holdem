@@ -652,7 +652,8 @@ def _aggregate_range_grids(
 def generate_report(all_stats: Dict[int, PlayerStats], num_players: int,
                     num_hands: int,
                     engine: Optional['DecisionEngine'] = None,
-                    range_analysis: bool = False) -> str:
+                    range_analysis: bool = False,
+                    history_filter: Optional[List[str]] = None) -> str:
     """Generate text report from aggregated stats."""
     lines = []
     w = lines.append
@@ -884,6 +885,8 @@ def generate_report(all_stats: Dict[int, PlayerStats], num_players: int,
         # Print charts in a sensible order: per-position, per-history
         position_order = ['UTG', 'MP', 'CO', 'BTN', 'SB', 'BB']
         history_order = ['open', 'limped', 'vs_raise', 'vs_3bet', 'vs_4bet+']
+        if history_filter is not None:
+            history_order = [h for h in history_order if h in history_filter]
         MIN_DECISIONS = 50  # skip charts with too few samples to be meaningful
         printed = 0
         for hist in history_order:
@@ -1216,6 +1219,26 @@ def main():
                         help='Track per-(position, action_history) ranges and '
                              'append 13×13 hand-chart grids + preflop/postflop '
                              'lookup counter sections to the report.')
+    parser.add_argument('--history-filter', nargs='+', default=None,
+                        choices=['open', 'limped', 'vs_raise',
+                                  'vs_3bet', 'vs_4bet+'],
+                        help='Restrict --range-analysis grid output to these '
+                             'action_history buckets (default: all). Useful '
+                             'for inspecting just RFI vs 3bet defense vs etc.')
+    # ── Preflop lookup knobs (override DecisionConfig defaults) ──
+    parser.add_argument('--preflop-min-play-rate', type=float, default=None,
+                        help='Override DecisionConfig.preflop_min_play_rate '
+                             '(default 0.25). Higher values fold marginal hands '
+                             'where the cohort plays them less often than AA.')
+    parser.add_argument('--preflop-min-samples-exact', type=int, default=None,
+                        help='Override min_samples for L0 exact-key lookup '
+                             '(default 5). Higher = more spots fall to L1/L2.')
+    parser.add_argument('--preflop-min-samples-no-nta', type=int, default=None,
+                        help='Override min_samples for L1 (drop num_to_act) '
+                             '(default 3).')
+    parser.add_argument('--preflop-min-samples-no-stack', type=int, default=None,
+                        help='Override min_samples for L2 (drop stack_bucket) '
+                             '(default 5). Higher = sparser L2 → more static.')
     args = parser.parse_args()
 
     vs_mode = bool(args.vs_facing_bet) or bool(args.archetype) or bool(args.opponent_model)
@@ -1225,10 +1248,19 @@ def main():
     print('=' * 70)
 
     # Setup DecisionEngine A
-    dc = DecisionConfig(
+    _dc_kwargs = dict(
         use_preflop_ranges=not args.no_preflop_ranges,
         raise_randomize=not args.no_raise_randomize,
     )
+    if args.preflop_min_play_rate is not None:
+        _dc_kwargs['preflop_min_play_rate'] = args.preflop_min_play_rate
+    if args.preflop_min_samples_exact is not None:
+        _dc_kwargs['preflop_min_samples_exact'] = args.preflop_min_samples_exact
+    if args.preflop_min_samples_no_nta is not None:
+        _dc_kwargs['preflop_min_samples_no_nta'] = args.preflop_min_samples_no_nta
+    if args.preflop_min_samples_no_stack is not None:
+        _dc_kwargs['preflop_min_samples_no_stack'] = args.preflop_min_samples_no_stack
+    dc = DecisionConfig(**_dc_kwargs)
     engine = DecisionEngine(dc)
     if args.model:
         # Single Deep CFR checkpoint — use for all spots
@@ -1312,7 +1344,8 @@ def main():
     else:
         report = generate_report(stats, args.players, args.hands,
                                  engine=engine,
-                                 range_analysis=args.range_analysis)
+                                 range_analysis=args.range_analysis,
+                                 history_filter=args.history_filter)
     print(f'\n{report}')
 
     # Save results

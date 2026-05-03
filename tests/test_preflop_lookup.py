@@ -126,12 +126,13 @@ def test_l2_coarse_match_used_when_exact_missing(seeded_db):
     assert fb.called == 0
 
 
-# ─── L3: empty spot → fold default (NOT static) ──────────────────────────
+# ─── L3: empty spot → static range (NOT fold default) ───────────────────
 
-def test_l3_empty_spot_uses_fold_default(seeded_db):
-    """Spots with zero data at any granularity default to 100% fold —
-    not static ranges. Showdown-only DB systematically misses folds, so
-    absence-of-data is itself a fold signal."""
+def test_l3_empty_spot_uses_static_fallback(seeded_db):
+    """Spots with zero cohort data at any granularity defer to the static
+    GTO range (not blind fold). The static range encodes coherent baseline
+    strategy and is safer than fold for spots the cohort hasn't reached at
+    showdown. See preflop_lookup.py:357-361 design note."""
     fb = _MockFallback()
     lookup = PreflopLookup(seeded_db, fallback=fb)
     legal = [FOLD, CALL, RAISE_HALF, RAISE_POT]
@@ -141,28 +142,31 @@ def test_l3_empty_spot_uses_fold_default(seeded_db):
         num_players=6, action_history=HIST_OPEN, num_to_act=2,
         effective_stack=100.0, call_amount_bb=1.0,
     )
+    # Mock fallback returns 100% RAISE_POT — confirms it was used.
     assert size is None
-    # Default to fold, NOT static (which would say RAISE_POT for AA-like cohort)
-    assert strategy[FOLD] == 1.0
-    # Critical: static fallback not invoked even though spot is empty
-    assert fb.called == 0
+    assert strategy[RAISE_POT] == 1.0
+    assert fb.called == 1
 
 
-def test_l3_empty_with_no_fold_legal_falls_to_call(seeded_db):
-    """When fold isn't legal (e.g. BB facing limped pot), fold default
-    rolls to call instead."""
-    fb = _MockFallback()
-    lookup = PreflopLookup(seeded_db, fallback=fb)
-    legal = [CALL, RAISE_HALF, RAISE_POT]  # no fold
+def test_l3_no_fallback_falls_to_fold_default():
+    """When no fallback exists AND no cohort data, fold-default fires."""
+    fd, path = tempfile.mkstemp(suffix='.sqlite')
+    os.close(fd)
+    conn = connect(path)
+    rebuild_lookup(conn)
+    conn.close()
+
+    lookup = PreflopLookup(path, fallback=None)
+    legal = [FOLD, CALL, RAISE_HALF, RAISE_POT]
     strategy, size = lookup.get_strategy(
-        hole_cards=['7s', '2d'], rel_pos=2, pot_bb=2.5,
+        hole_cards=['7s', '2d'], rel_pos=0, pot_bb=1.5,
         legal_actions=legal, action_size=6,
-        num_players=6, action_history='limped_pot', num_to_act=0,
-        effective_stack=100.0, call_amount_bb=0.0,
+        num_players=6, action_history=HIST_OPEN, num_to_act=2,
+        effective_stack=100.0, call_amount_bb=1.0,
     )
+    assert strategy[FOLD] == 1.0
     assert size is None
-    assert strategy[CALL] == 1.0
-    assert fb.called == 0
+    os.unlink(path)
 
 
 # ─── Static fallback: ONLY on actual exception ───────────────────────────
@@ -249,6 +253,190 @@ def test_production_action_size_6_uses_side_channel(seeded_db):
     assert size == 3.0
     assert len(strategy) == 6
     assert strategy[RAISE_POT] > 0.9
+
+
+# ─── 3bet+ early branch: static action, cohort size ──────────────────────
+
+@pytest.fixture
+def db_with_3bet_data():
+    """SQLite DB with 3bet/4bet+ cohort data so we can verify size lookup
+    works while action selection comes from the static fallback."""
+    fd, path = tempfile.mkstemp(suffix='.sqlite')
+    os.close(fd)
+    conn = connect(path)
+
+    rows = []
+    # vs_3bet spot with cohort suggesting 4bet to 22bb. The COHORT calls 80%
+    # of the time (NL5 calling-station tendency); the static range should
+    # raise the action to 4bet/fold instead, but pick up the 22bb size.
+    for _ in range(8):  # 80% call
+        rows.append(('AKS', 'BTN', 'vs_3bet', '70-150', 0,
+                     'p_x', 'call', None, 9.0, 'h1', 'f.txt'))
+    for _ in range(2):  # 20% raise to 22bb
+        rows.append(('AKS', 'BTN', 'vs_3bet', '70-150', 0,
+                     'p_x', 'raise', 22.0, 9.0, 'h1', 'f.txt'))
+
+    # vs_4bet+ spot: cohort 5bets to 55bb (small sample on purpose to
+    # ensure we still get the size from L0 if dense enough).
+    for _ in range(5):
+        rows.append(('QQ', 'CO', 'vs_4bet+', '70-150', 0,
+                     'p_y', 'raise', 55.0, 22.0, 'h2', 'f.txt'))
+
+    insert_decisions_bulk(conn, rows)
+    rebuild_lookup(conn)
+    conn.close()
+    yield path
+    os.unlink(path)
+
+
+class _StaticFold4bet:
+    """Mock static range that always picks RAISE_HALF (4bet) for vs_3bet
+    AKS BTN — the hand-tuned strong-hand decision the user wants."""
+    def __init__(self):
+        self.called = 0
+        self.last_call = None
+
+    def get_strategy(self, hole_cards, rel_pos, pot_bb, legal_actions,
+                     action_size=6, num_limpers=0, effective_stack=100.0,
+                     num_callers=0):
+        self.called += 1
+        self.last_call = {'hole_cards': hole_cards, 'rel_pos': rel_pos,
+                           'pot_bb': pot_bb, 'action_size': action_size}
+        s = np.zeros(action_size, dtype=np.float32)
+        # Always raise — this is the "static says raise" scenario
+        if RAISE_HALF in legal_actions:
+            s[RAISE_HALF] = 1.0
+        return s
+
+
+class _StaticFoldOnly:
+    """Mock static range that always folds — verifies cohort size lookup
+    is skipped when static doesn't pick a raise."""
+    def __init__(self):
+        self.called = 0
+
+    def get_strategy(self, hole_cards, rel_pos, pot_bb, legal_actions,
+                     action_size=6, num_limpers=0, effective_stack=100.0,
+                     num_callers=0):
+        self.called += 1
+        s = np.zeros(action_size, dtype=np.float32)
+        if FOLD in legal_actions:
+            s[FOLD] = 1.0
+        return s
+
+
+def test_vs_3bet_uses_static_action_not_cohort(db_with_3bet_data):
+    """For vs_3bet, the cohort says 80% call but the static range says
+    100% raise. The result MUST come from static, not cohort."""
+    fb = _StaticFold4bet()
+    lookup = PreflopLookup(db_with_3bet_data, fallback=fb)
+    legal = [FOLD, CALL, RAISE_HALF, RAISE_POT, ALL_IN, RAISE_MIN]
+    strategy, size = lookup.get_strategy(
+        hole_cards=['As', 'Ks'], rel_pos=0, pot_bb=12.0,
+        legal_actions=legal, action_size=6,
+        num_players=6, action_history='vs_3bet', num_to_act=0,
+        effective_stack=100.0, call_amount_bb=8.0,
+    )
+    # Static fallback was invoked exactly once — drove the action.
+    assert fb.called == 1
+    # Action came from static (100% RAISE_HALF), NOT cohort's 80% call.
+    assert strategy[RAISE_HALF] == 1.0
+    assert strategy[CALL] == 0.0
+    # Cohort size for the raise was picked up via side-channel.
+    assert size == 22.0
+
+
+def test_vs_3bet_static_fold_skips_cohort_size_lookup(db_with_3bet_data):
+    """When static says 100% fold, no raise mass exists, so cohort size
+    lookup is skipped (custom_size_bb=None)."""
+    fb = _StaticFoldOnly()
+    lookup = PreflopLookup(db_with_3bet_data, fallback=fb)
+    legal = [FOLD, CALL, RAISE_HALF, RAISE_POT, ALL_IN, RAISE_MIN]
+    strategy, size = lookup.get_strategy(
+        hole_cards=['7s', '2d'], rel_pos=0, pot_bb=12.0,  # garbage hand
+        legal_actions=legal, action_size=6,
+        num_players=6, action_history='vs_3bet', num_to_act=0,
+        effective_stack=100.0, call_amount_bb=8.0,
+    )
+    assert fb.called == 1
+    assert strategy[FOLD] == 1.0
+    # No raise → no size emitted
+    assert size is None
+
+
+def test_vs_4bet_plus_uses_static_action_with_cohort_size(db_with_3bet_data):
+    """4bet+ branch: same static-action / cohort-size split applies."""
+    fb = _StaticFold4bet()
+    lookup = PreflopLookup(db_with_3bet_data, fallback=fb)
+    legal = [FOLD, CALL, RAISE_HALF, RAISE_POT, ALL_IN, RAISE_MIN]
+    strategy, size = lookup.get_strategy(
+        hole_cards=['Qc', 'Qd'], rel_pos=5, pot_bb=33.0,
+        legal_actions=legal, action_size=6,
+        num_players=6, action_history='vs_4bet+', num_to_act=0,
+        effective_stack=100.0, call_amount_bb=22.0,
+    )
+    assert fb.called == 1
+    assert strategy[RAISE_HALF] == 1.0
+    # Cohort 5bet size picked up
+    assert size == 55.0
+
+
+def test_vs_3bet_no_cohort_size_data_returns_none(db_with_3bet_data):
+    """When the cohort has no data for the exact spot AND no L1/L2 either,
+    custom_size is None — action layer falls back to nearest preset."""
+    fb = _StaticFold4bet()
+    lookup = PreflopLookup(db_with_3bet_data, fallback=fb)
+    legal = [FOLD, CALL, RAISE_HALF, RAISE_POT, ALL_IN, RAISE_MIN]
+    # Position not in DB (LJ) → no cohort row anywhere.
+    strategy, size = lookup.get_strategy(
+        hole_cards=['As', 'Ks'], rel_pos=3, pot_bb=12.0,
+        legal_actions=legal, action_size=6,
+        num_players=6, action_history='vs_3bet', num_to_act=0,
+        effective_stack=100.0, call_amount_bb=8.0,
+    )
+    assert fb.called == 1
+    assert strategy[RAISE_HALF] == 1.0
+    # No cohort coverage → no size hint
+    assert size is None
+
+
+def test_vs_3bet_counter_increments(db_with_3bet_data):
+    """Verify the new static_action_cohort_size counter is incremented
+    for vs_3bet/vs_4bet+ branch (not the L0/L1/L2 counters)."""
+    fb = _StaticFold4bet()
+    lookup = PreflopLookup(db_with_3bet_data, fallback=fb)
+    legal = [FOLD, CALL, RAISE_HALF, RAISE_POT, ALL_IN, RAISE_MIN]
+    lookup.get_strategy(
+        hole_cards=['As', 'Ks'], rel_pos=0, pot_bb=12.0,
+        legal_actions=legal, action_size=6,
+        num_players=6, action_history='vs_3bet', num_to_act=0,
+        effective_stack=100.0, call_amount_bb=8.0,
+    )
+    counters = lookup.counters
+    assert counters['static_action_cohort_size'] == 1
+    # Should NOT have hit the L0/L1/L2 paths
+    assert counters['L0_exact'] == 0
+    assert counters['L1_no_nta'] == 0
+    assert counters['L2_no_stack'] == 0
+
+
+def test_open_and_vs_raise_NOT_affected_by_3bet_branch(seeded_db):
+    """Sanity: HIST_OPEN and HIST_VS_RAISE still use cohort data directly
+    (Phase 1 explicitly limited to vs_3bet/vs_4bet+)."""
+    fb = _MockFallback()
+    lookup = PreflopLookup(seeded_db, fallback=fb)
+    legal = [FOLD, CALL, RAISE_HALF, RAISE_POT, ALL_IN, RAISE_MIN, RAISE_CUSTOM]
+    # HIST_OPEN with cohort data (AA BTN open)
+    strategy, size = lookup.get_strategy(
+        hole_cards=['As', 'Ah'], rel_pos=0, pot_bb=1.5,
+        legal_actions=legal, action_size=6,
+        num_players=6, action_history=HIST_OPEN, num_to_act=0,
+        effective_stack=100.0, call_amount_bb=1.0,
+    )
+    # Should have hit L0_exact, NOT static_action_cohort_size
+    assert lookup.counters['L0_exact'] == 1
+    assert lookup.counters['static_action_cohort_size'] == 0
+    assert fb.called == 0
 
 
 if __name__ == '__main__':

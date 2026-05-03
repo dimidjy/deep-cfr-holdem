@@ -91,8 +91,8 @@ class PreflopLookup:
                  min_samples_no_nta: int = 3,
                  min_samples_no_stack: int = 5,
                  min_play_rate: float = 0.25,
-                 min_play_rate_vs_3bet: Optional[float] = None,
-                 min_play_rate_vs_4bet: Optional[float] = None,
+                 min_play_rate_vs_3bet: Optional[float] = None,  # DEPRECATED
+                 min_play_rate_vs_4bet: Optional[float] = None,  # DEPRECATED
                  l2_large_call_bb: float = 30.0,
                  l2_large_call_play_rate: float = 0.40):
         """
@@ -129,23 +129,16 @@ class PreflopLookup:
         self._min_samples_no_nta = min_samples_no_nta
         self._min_samples_no_stack = min_samples_no_stack
         self._min_play_rate = min_play_rate
-        # Per-action_history thresholds. None means use the global default,
-        # which keeps behaviour unchanged when callers don't specify them.
-        from src.preflop_spot_key import (
-            HIST_OPEN, HIST_LIMPED_POT, HIST_VS_RAISE,
-            HIST_VS_3BET, HIST_VS_4BET,
-        )
-        self._min_play_rate_by_hist: Dict[str, float] = {
-            HIST_OPEN: min_play_rate,
-            HIST_LIMPED_POT: min_play_rate,
-            HIST_VS_RAISE: min_play_rate,
-            HIST_VS_3BET: (min_play_rate_vs_3bet
-                           if min_play_rate_vs_3bet is not None
-                           else min_play_rate),
-            HIST_VS_4BET: (min_play_rate_vs_4bet
-                           if min_play_rate_vs_4bet is not None
-                           else min_play_rate),
-        }
+        # `min_play_rate_vs_3bet` and `min_play_rate_vs_4bet` are accepted for
+        # backwards compatibility with existing configs but no longer have
+        # any effect — vs_3bet / vs_4bet+ spots now bypass cohort lookup
+        # entirely (see `_static_action_cohort_size`). Warn if a non-default
+        # value was passed so users know it's now a no-op.
+        if min_play_rate_vs_3bet is not None or min_play_rate_vs_4bet is not None:
+            logger.warning(
+                "min_play_rate_vs_3bet/vs_4bet are deprecated and ignored; "
+                "vs_3bet/vs_4bet+ spots use static ranges for action choice "
+                "and cohort data only for raise sizing.")
         self._l2_large_call_bb = l2_large_call_bb
         self._l2_large_call_play_rate = l2_large_call_play_rate
         if not Path(db_path).exists():
@@ -169,10 +162,13 @@ class PreflopLookup:
 
         # Per-level decision counters. Logged periodically so the user can
         # confirm the lookup is firing in production. Reset by reset_counters().
+        # `static_action_cohort_size` counts the 3bet+ early-branch path
+        # where the static range drives the action and cohort drives the size.
         self._counters = {
             'L0_exact': 0, 'L1_no_nta': 0, 'L2_no_stack': 0,
             'L3_fold_default': 0, 'L3_static_fallback': 0,
             'L2_static_fallback': 0, 'error_fallback': 0,
+            'static_action_cohort_size': 0,
         }
         self._log_every = 50    # emit usage summary every N decisions
         logger.info(
@@ -184,8 +180,7 @@ class PreflopLookup:
             f"thresholds=L0:{min_samples_exact} L1:{min_samples_no_nta} "
             f"L2:{min_samples_no_stack} "
             f"play_rate(open/vs_raise)>={min_play_rate:.2f} "
-            f"play_rate(vs_3bet)>={self._min_play_rate_by_hist['vs_3bet']:.2f} "
-            f"play_rate(vs_4bet+)>={self._min_play_rate_by_hist['vs_4bet+']:.2f}")
+            f"vs_3bet/vs_4bet+: static-action + cohort-size")
 
     def reset_counters(self) -> None:
         for k in self._counters:
@@ -255,21 +250,34 @@ class PreflopLookup:
                 num_to_act=num_to_act,
             )
 
+            # ── 3bet+ early branch: static action, cohort size ───────────
+            # For 3bet / 3bet-call / 4bet+ spots, the cohort DB is too
+            # noisy/exploitable for action selection (NL5 cohort calls 3bets
+            # too wide; gives back the cohort EV edge). Hand-tuned static
+            # ranges drive the action; the cohort is consulted ONLY for the
+            # raise size (median BB) when a raise is chosen.
+            from src.preflop_spot_key import HIST_VS_3BET, HIST_VS_4BET
+            if spot.action_history in (HIST_VS_3BET, HIST_VS_4BET):
+                return self._static_action_cohort_size(
+                    spot, hole_cards, rel_pos, pot_bb, legal_actions,
+                    action_size, num_limpers, effective_stack, num_callers,
+                )
+
+            # All paths below handle HIST_OPEN, HIST_LIMPED_POT, HIST_VS_RAISE
+            # only — vs_3bet / vs_4bet+ took the early branch above.
+
             # L0 — exact spot key
             row = self._exact.get(spot.to_tuple())
             if row and row['n_samples'] >= self._min_samples:
                 play_rate = self._play_rate(
                     spot.hole_class, spot.position, spot.action_history,
                     spot.stack_bucket, row['n_samples'], 'L0_exact')
-                threshold = self._min_play_rate_by_hist.get(
-                    spot.action_history, self._min_play_rate)
-                if play_rate < threshold:
+                if play_rate < self._min_play_rate:
                     self._log_decision(
                         'L3_fold_default', spot, row['n_samples'],
                         None, None,
                         extra=(f"play_rate={play_rate*100:.1f}% "
-                               f"< {threshold*100:.0f}% "
-                               f"(hist={spot.action_history})"))
+                               f"< {self._min_play_rate*100:.0f}%"))
                     return self._fold_default(legal_actions, action_size), None
                 strategy, custom_size = self._row_to_strategy(
                     row, legal_actions, action_size, pot_bb, call_amount_bb,
@@ -288,15 +296,12 @@ class PreflopLookup:
                 play_rate = self._play_rate(
                     spot.hole_class, spot.position, spot.action_history,
                     spot.stack_bucket, row['n_samples'], 'L1_no_nta')
-                threshold = self._min_play_rate_by_hist.get(
-                    spot.action_history, self._min_play_rate)
-                if play_rate < threshold:
+                if play_rate < self._min_play_rate:
                     self._log_decision(
                         'L3_fold_default', spot, row['n_samples'],
                         None, None,
                         extra=(f"play_rate={play_rate*100:.1f}% "
-                               f"< {threshold*100:.0f}% "
-                               f"(hist={spot.action_history})"))
+                               f"< {self._min_play_rate*100:.0f}%"))
                     return self._fold_default(legal_actions, action_size), None
                 strategy, custom_size = self._row_to_strategy(
                     row, legal_actions, action_size, pot_bb, call_amount_bb,
@@ -322,20 +327,20 @@ class PreflopLookup:
                 # blind fold default; the cohort's "play_rate" estimate may
                 # be biased low at coarse keys but the static range still
                 # encodes solid baseline strategy.
-                threshold = self._min_play_rate_by_hist.get(
-                    spot.action_history, self._min_play_rate)
-                if play_rate < threshold:
+                if play_rate < self._min_play_rate:
                     return self._static_or_fold(
                         spot, row['n_samples'], hole_cards, rel_pos, pot_bb,
                         legal_actions, action_size, num_limpers,
                         effective_stack, num_callers,
                         reason=(f"L2 play_rate={play_rate*100:.1f}% "
-                                f"< {threshold*100:.0f}% "
-                                f"(hist={spot.action_history})"))
+                                f"< {self._min_play_rate*100:.0f}%"))
                 # Stack-pooled rows are also dangerous when the decision
                 # commits a lot of chips (jam-call defense). Require a
                 # higher confidence floor for large calls; otherwise defer
-                # to static ranges.
+                # to static ranges. Note: vs_3bet/vs_4bet+ never reach this
+                # gate (they take the static-action early branch); the gate
+                # remains here for very-deep vs_raise spots where the open
+                # was unusually large.
                 if (call_amount_bb >= self._l2_large_call_bb and
                         play_rate < self._l2_large_call_play_rate):
                     return self._static_or_fold(
@@ -640,6 +645,68 @@ class PreflopLookup:
             return None
         return min(candidates.items(),
                    key=lambda kv: abs(kv[1] - target_size_bb))[0]
+
+    def _cohort_raise_size_bb(self, spot) -> Optional[float]:
+        """Walk L0 → L1 → L2 for a raise-size hint (median BB), or None.
+
+        Used by the 3bet+ early branch: action choice comes from the static
+        range, but if a raise is chosen we still want a data-driven size
+        rather than a fixed preset. Falls back through the same hierarchy
+        as the main lookup, but skips the play-rate gate (we already
+        decided to raise; the gate is only relevant for action selection).
+        """
+        # L0 exact
+        row = self._exact.get(spot.to_tuple())
+        if row and row['n_samples'] >= self._min_samples:
+            sz = row.get('raise_size_bb_p50')
+            if sz is not None:
+                return _round_to_half_bb(float(sz))
+        # L1 no_nta (same stack, sizing still trusted)
+        row = self._level_no_nta.get(
+            (spot.hole_class, spot.position,
+             spot.action_history, spot.stack_bucket))
+        if row and row['n_samples'] >= self._min_samples_no_nta:
+            sz = row.get('raise_size_bb_p50')
+            if sz is not None:
+                return _round_to_half_bb(float(sz))
+        # L2 no_stack — sizing across stack depths is noisy for 3bet+
+        # (jam vs small-3bet pooled together). Don't use L2 sizing here.
+        return None
+
+    def _static_action_cohort_size(self, spot, hole_cards, rel_pos, pot_bb,
+                                   legal_actions, action_size, num_limpers,
+                                   effective_stack, num_callers
+                                   ) -> Tuple[np.ndarray, Optional[float]]:
+        """3bet+ branch: static range drives action, cohort drives size.
+
+        If the static range picks a raise (raise_p > 0), look up the cohort's
+        median raise size for this exact spot and emit it via the side-channel.
+        If no cohort data exists for sizing, return None — the action layer
+        will fall back to the nearest preset.
+        """
+        strategy = self._fallback_strategy(
+            hole_cards, rel_pos, pot_bb, legal_actions, action_size,
+            num_limpers, effective_stack, num_callers,
+        )
+        # Check if any raise mass exists in the static strategy. If so,
+        # consult cohort for size; otherwise the action is fold/call and
+        # no size is needed.
+        custom_size: Optional[float] = None
+        raise_indices = [a for a in (RAISE_HALF, RAISE_POT, ALL_IN, RAISE_MIN)
+                         if a < action_size]
+        raise_mass = float(sum(strategy[a] for a in raise_indices
+                                if a < len(strategy)))
+        if raise_mass > 0:
+            custom_size = self._cohort_raise_size_bb(spot)
+        self._counters['static_action_cohort_size'] += 1
+        if logger.isEnabledFor(logging.DEBUG):
+            spot_repr = (f"{spot.hole_class}/{spot.position}/"
+                         f"{spot.action_history}/{spot.stack_bucket}/"
+                         f"nta={spot.num_to_act}")
+            size_str = f"{custom_size:.2f}bb" if custom_size else "preset"
+            logger.debug(f"PF[static_action_cohort_size] {spot_repr} "
+                         f"raise_mass={raise_mass:.2f} size={size_str}")
+        return strategy, custom_size
 
     def _static_or_fold(self, spot, n_samples, hole_cards, rel_pos, pot_bb,
                         legal_actions, action_size, num_limpers,

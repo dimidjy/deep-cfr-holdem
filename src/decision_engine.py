@@ -153,6 +153,12 @@ class DecisionConfig:
     # 3-bet wide enough to justify.
     preflop_min_play_rate_vs_3bet: float = 0.40
     preflop_min_play_rate_vs_4bet: float = 0.50
+    # Cohort sample minimums for each lookup level. Higher values push more
+    # spots to the next level (or static fallback) — useful for tightening
+    # ranges when the cohort's calling-station bias is leaking through.
+    preflop_min_samples_exact: int = 5      # L0 (hole, pos, hist, stack, nta)
+    preflop_min_samples_no_nta: int = 3     # L1 (drop num_to_act)
+    preflop_min_samples_no_stack: int = 5   # L2 (drop stack_bucket)
 
     # Postflop sizing (data-driven cohort sizes for bets/raises)
     use_postflop_sizing: bool = True
@@ -342,6 +348,12 @@ class DecisionEngine:
                         for np_, fb in ranges_per_n.items():
                             self._preflop_ranges[np_] = PreflopLookup(
                                 self.config.preflop_db_path, fallback=fb,
+                                min_samples_exact=(
+                                    self.config.preflop_min_samples_exact),
+                                min_samples_no_nta=(
+                                    self.config.preflop_min_samples_no_nta),
+                                min_samples_no_stack=(
+                                    self.config.preflop_min_samples_no_stack),
                                 min_play_rate=self.config.preflop_min_play_rate,
                                 min_play_rate_vs_3bet=(
                                     self.config.preflop_min_play_rate_vs_3bet),
