@@ -227,21 +227,40 @@ def main():
         add_game_state_features=True, add_betting_history_features=True,
         behavioral_stats=True,
     )
-    obs_size = eng.get_observation_space_size()
-    act_size = eng.get_action_space_size()
+    engine_obs_size = eng.get_observation_space_size()
+    engine_act_size = eng.get_action_space_size()
 
-    # Auto-detect hidden layers from checkpoint
+    # ── Derive arch from the saved checkpoint (not from current engine) ──
+    # The engine's defaults drift over time, so trusting them when loading
+    # an older checkpoint produces shape mismatches. Walk the actual
+    # state_dict tensors instead: the "main" Linear layers (excluding the
+    # `block.*` sub-Linears inside ResidualBlocks) give us
+    # [input → h0, h0 → h1, ..., hN → output] in order.
     import torch
-    ckpt = torch.load(args.model, map_location='cpu')
-    # Infer from first advantage network's first layer
-    first_w = ckpt['advantage_networks'][0]
-    first_key = [k for k in first_w if 'network.0.weight' in k][0]
-    first_hidden = first_w[first_key].shape[0]
-    # Try common configs
-    if first_hidden == 512:
-        hidden = [512, 512, 256, 256, 128]
-    else:
-        hidden = [256, 256, 128]
+    import re
+    ckpt = torch.load(args.model, map_location='cpu', weights_only=False)
+    sd = ckpt['advantage_networks'][0]
+    main_idx_re = re.compile(r'^network\.(\d+)\.weight$')
+    main_layers = []
+    for k, v in sd.items():
+        m = main_idx_re.match(k)
+        if m and v.dim() == 2:
+            main_layers.append((int(m.group(1)), tuple(v.shape)))
+    main_layers.sort()
+    if not main_layers:
+        raise RuntimeError(f'No main Linear layers found in {args.model}')
+
+    obs_size = main_layers[0][1][1]               # in_features of layer 0
+    act_size = main_layers[-1][1][0]              # out_features of final layer
+    hidden = [shape[0] for _, shape in main_layers[:-1]]
+
+    if obs_size != engine_obs_size:
+        print(f'  [warn] checkpoint obs_size={obs_size} differs from engine '
+              f'obs_size={engine_obs_size}; using checkpoint value')
+    if act_size != engine_act_size:
+        print(f'  [warn] checkpoint act_size={act_size} differs from engine '
+              f'act_size={engine_act_size}; using checkpoint value')
+    print(f'  Detected arch: input={obs_size} hidden={hidden} output={act_size}')
 
     deep_cfr = DeepCFR(
         observation_size=obs_size, action_size=act_size,

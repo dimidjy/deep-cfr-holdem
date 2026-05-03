@@ -230,6 +230,30 @@ def main():
                 return False
         return True
 
+    # Features the obs builder DELIBERATELY zeros out on preflop. The 9
+    # equity-block features depend on community cards (returns zeros via
+    # `if not community_cards: return np.zeros(9)`). hero_has_initiative
+    # is structurally 0 preflop because hero hasn't acted on first
+    # decision and `call_amount > 0` resets it on subsequent decisions
+    # (re-raise spots). All by design — being constant 0 on preflop is
+    # NOT a bug for these.
+    EXPECTED_ZERO_PREFLOP = {
+        'hand_strength', 'made_hand_cat',
+        'hero_flush_participation', 'hero_straight_participation',
+        'top_pair', 'board_pairing_level',
+        'board_flush_texture', 'board_straight_texture',
+        'hand_rank_within_cat',
+        'hero_has_initiative',
+    }
+
+    def is_expected_zero_preflop(name: str, const_vals: dict) -> bool:
+        """True if the only constant-street is preflop with value 0 and
+        this feature is in the known by-design-zero list."""
+        if name not in EXPECTED_ZERO_PREFLOP:
+            return False
+        return (list(const_vals.keys()) == ['preflop']
+                and const_vals.get('preflop') == 0.0)
+
     # Street-degenerate features
     print("=" * 78)
     print("STREET-DEGENERATE FEATURES (constant on some streets, varies on others)")
@@ -254,8 +278,19 @@ def main():
                 s: next(iter(by_street[s])) for s in const_streets}
             var_counts = {
                 s: len(by_street[s]) for s in var_streets}
-            explained = position_explained(name, const_streets)
-            tag = '   (explained by lobby mix)' if explained else ''
+            # Suppress two known-by-design patterns:
+            #  - position one-hots constant postflop because lobby mix
+            #    rarely played 6-handed (UTG/MP/CO never reached flop)
+            #  - equity-block + initiative features that the obs builder
+            #    intentionally zeros on preflop
+            explained = (position_explained(name, const_streets)
+                         or is_expected_zero_preflop(name, const_vals))
+            if position_explained(name, const_streets):
+                tag = '   (explained by lobby mix)'
+            elif is_expected_zero_preflop(name, const_vals):
+                tag = '   (zero preflop by design)'
+            else:
+                tag = ''
             print(f"  obs[{i:2d}] {name:<32}{tag}")
             print(f"           constant on: {const_vals}")
             print(f"           varies on:   {var_counts}")
