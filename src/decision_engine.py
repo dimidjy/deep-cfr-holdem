@@ -174,6 +174,16 @@ class DecisionConfig:
                                   # that betting is correct when combined
                                   # raise probability beats check"
 
+    # Low-stakes postflop sampling: in small short-handed pots (≤3 active,
+    # pot ≤8 BB), sample the action stochastically from the model's full
+    # probability distribution instead of taking argmax. The variance is
+    # cheap (small pot), and it preserves CFR's mixed-strategy intent —
+    # prevents the agent from being readable in spots that are common but
+    # not high-stakes.
+    postflop_sample_low_pot: bool = True
+    postflop_sample_max_players: int = 3
+    postflop_sample_max_pot_bb: float = 5.0
+
     # Model temperature (used when loading, not at inference)
     temperature: float = 1.0
 
@@ -444,8 +454,45 @@ class DecisionEngine:
         """
         strategy = self.get_strategy(ctx)
         strategy_list = [float(strategy[i]) for i in range(NUM_ACTIONS)]
-        action = self._sample_action(strategy_list, ctx.legal_actions, ctx.obs)
+        # Stochastic sampling for low-stakes postflop spots: small short-
+        # handed pots use the model's full probability distribution instead
+        # of argmax. Keeps the agent unreadable in cheap spots where
+        # variance is fine; preserves CFR's mixed-strategy intent.
+        if (self.config.postflop_sample_low_pot
+                and ctx.street != 'preflop'
+                and ctx.num_players <= self.config.postflop_sample_max_players
+                and ctx.pot_bb <= self.config.postflop_sample_max_pot_bb):
+            action = self._sample_from_distribution(
+                strategy_list, ctx.legal_actions)
+        else:
+            action = self._sample_action(strategy_list, ctx.legal_actions, ctx.obs)
         return action, strategy_list
+
+    @staticmethod
+    def _sample_from_distribution(strategy: List[float],
+                                  legal_actions: List[int]) -> int:
+        """Sample an action proportional to model probabilities, restricted to
+        legal actions. Falls back to argmax if all legal probabilities are 0.
+        """
+        # Restrict to legal actions and renormalize.
+        probs = []
+        actions = []
+        for a in legal_actions:
+            p = strategy[a] if 0 <= a < len(strategy) else 0.0
+            if p > 0:
+                actions.append(a)
+                probs.append(p)
+        if not actions:
+            # All-zero strategy on legal slots — fall back to argmax over legal.
+            best, best_p = legal_actions[0], -1.0
+            for a in legal_actions:
+                p = strategy[a] if 0 <= a < len(strategy) else 0.0
+                if p > best_p:
+                    best, best_p = a, p
+            return best
+        total = sum(probs)
+        norm = [p / total for p in probs]
+        return int(np.random.choice(actions, p=norm))
 
     # ── Model routing ────────────────────────────────────────────────────
 

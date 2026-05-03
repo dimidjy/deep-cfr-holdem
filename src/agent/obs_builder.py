@@ -167,13 +167,31 @@ class ObservationBuilder:
         self.equity_vs_odds = equity_vs_odds
 
     def build(self, game_state: GameState,
-              opponent_profile: np.ndarray = None) -> Optional[np.ndarray]:
+              opponent_profile: np.ndarray = None,
+              hero_has_initiative_override: Optional[bool] = None,
+              hand_raise_count_override: Optional[int] = None,
+              opp_bet_sizings_override: Optional[List[float]] = None,
+              opp_action_counts_override: Optional[dict] = None,
+              street_action_counts_override: Optional[dict] = None
+              ) -> Optional[np.ndarray]:
         """Build observation vector from GameState.
 
         Args:
             game_state: Current game state from parser.
             opponent_profile: Optional 5-dim cross-hand opponent stats
                 (VPIP, PFR, AF_norm, Fold2CBet, WTSD). If None, skipped.
+            hero_has_initiative_override: Cross-hand boolean (hero is the
+                last aggressor in the hand). The caller tracks this per
+                hand and passes it in. Without it, a degenerate snapshot
+                proxy is used.
+            hand_raise_count_override: Total raises across the hand (hero
+                + opps, all streets). Drives `num_raises_norm`. Without it
+                a current-street-only snapshot proxy is used (which
+                collapses to 0 on every checked-to flop).
+            opp_bet_sizings_override: List of opp bet/raise sizings as a
+                ratio (bet / pot-before-bet) accumulated across the hand.
+                Drives `avg_bet_sizing` and `max_bet_sizing`. Without it
+                only the current snapshot's opp bets are used.
 
         Returns None if hole cards missing.
         """
@@ -222,9 +240,14 @@ class ObservationBuilder:
 
         if self.behavioral_stats:
             features.append(self._behavioral_stats_features(
-                game_state, players, player_idx))
+                game_state, players, player_idx,
+                hand_raise_count_override=hand_raise_count_override,
+                opp_bet_sizings_override=opp_bet_sizings_override,
+                opp_action_counts_override=opp_action_counts_override,
+                street_action_counts_override=street_action_counts_override))
             features.append(self._betting_line_features(
-                game_state, players, player_idx))
+                game_state, players, player_idx,
+                hero_has_initiative_override=hero_has_initiative_override))
 
         if opponent_profile is not None:
             features.append(opponent_profile.astype(np.float32))
@@ -598,8 +621,14 @@ class ObservationBuilder:
              pot_was_raised, min_opp_stack_norm],
             dtype=np.float32)
 
-    def _behavioral_stats_features(self, gs: GameState, players: List[PlayerInfo],
-                                   player_idx: int) -> np.ndarray:
+    def _behavioral_stats_features(
+            self, gs: GameState, players: List[PlayerInfo],
+            player_idx: int,
+            hand_raise_count_override: Optional[int] = None,
+            opp_bet_sizings_override: Optional[List[float]] = None,
+            opp_action_counts_override: Optional[dict] = None,
+            street_action_counts_override: Optional[dict] = None
+            ) -> np.ndarray:
         """Compute 8-dim behavioral stats from current GameState snapshot.
 
         Mirrors src/hand_history/obs_builder._bh_compute() features:
@@ -611,6 +640,11 @@ class ObservationBuilder:
           5. street_aggression     — current street aggression level
           6. opp_check_ratio       — opponents checking on current street
           7. pot_escalation        — pot size / avg starting stack
+
+        Overrides 2/3/4 are hand-level accumulators tracked by the caller
+        across decisions — without them these slots collapse to 0 on every
+        checked-to flop, mismatching how training computed the same dims
+        from the full hand history.
         """
         feats = np.zeros(BEHAVIORAL_STATS_DIM, dtype=np.float32)
 
@@ -627,45 +661,79 @@ class ObservationBuilder:
 
         pot = max(gs.pot_total, 1.0)
 
-        # 0: opp_aggression_ratio — opponents who bet/raised (have current bets > BB)
-        opp_with_bets = sum(1 for p in active_opps if p.bet_current_round > 1.0 or p.is_all_in)
-        opp_actions_est = max(len(active_opps), 1)
-        feats[0] = opp_with_bets / opp_actions_est
+        # 0 + 1: opp_aggression_ratio + opp_fold_ratio — prefer the hand-
+        # level action counts tracked across decisions; snapshot fallback
+        # collapses to a per-snapshot proxy that mismatches training (which
+        # divides by total opp actions across the full hand).
+        if opp_action_counts_override is not None:
+            opp_total = max(int(opp_action_counts_override.get('total', 0)), 1)
+            opp_agg = int(opp_action_counts_override.get('agg', 0))
+            opp_fold = int(opp_action_counts_override.get('fold', 0))
+            feats[0] = min(opp_agg / opp_total, 1.0)
+            feats[1] = min(opp_fold / opp_total, 1.0)
+        else:
+            opp_with_bets = sum(1 for p in active_opps
+                                if p.bet_current_round > 1.0 or p.is_all_in)
+            opp_actions_est = max(len(active_opps), 1)
+            feats[0] = opp_with_bets / opp_actions_est
+            total_opps_in_hand = len(active_opps) + len(folded_opps)
+            feats[1] = len(folded_opps) / max(total_opps_in_hand, 1)
 
-        # 1: opp_fold_ratio — fraction of opponents who folded this hand
-        total_opps_in_hand = len(active_opps) + len(folded_opps)
-        feats[1] = len(folded_opps) / max(total_opps_in_hand, 1)
+        # 2 + 3: avg/max bet sizing — prefer the hand-level accumulator
+        # (each entry already a bet/pot ratio captured at the time of the
+        # bet), fall back to current snapshot if no accumulator supplied.
+        if opp_bet_sizings_override:
+            ratios = list(opp_bet_sizings_override)
+            feats[2] = min(sum(ratios) / len(ratios) / 3.0, 1.0)
+            feats[3] = min(max(ratios) / 3.0, 1.0)
+        else:
+            opp_bets = [p.bet_current_round for p in active_opps
+                        if p.bet_current_round > 0]
+            if opp_bets:
+                pot_for_sizing = max(pot - sum(opp_bets), 1.0)
+                avg_ratio = sum(b / pot_for_sizing
+                                for b in opp_bets) / len(opp_bets)
+                feats[2] = min(avg_ratio / 3.0, 1.0)
+                max_bet = max(opp_bets)
+                pot_for_max = max(pot - max_bet, 1.0)
+                feats[3] = min((max_bet / pot_for_max) / 3.0, 1.0)
 
-        # 2: avg_bet_sizing — average opp bet / pot (normalized by /3)
-        opp_bets = [p.bet_current_round for p in active_opps if p.bet_current_round > 0]
-        if opp_bets:
-            pot_for_sizing = max(pot - sum(opp_bets), 1.0)
-            avg_ratio = sum(b / pot_for_sizing for b in opp_bets) / len(opp_bets)
-            feats[2] = min(avg_ratio / 3.0, 1.0)
+        # 4: num_raises_norm — prefer the hand-level counter tracked across
+        # decisions; the snapshot fallback collapses to 0 on every
+        # checked-to flop and mismatches training's hand-history derivation.
+        if hand_raise_count_override is not None:
+            feats[4] = min(max(0, int(hand_raise_count_override)) / 6.0, 1.0)
+        else:
+            max_bet_all = max(
+                (p.bet_current_round for p in players), default=0)
+            if max_bet_all > 1.0:
+                est_raises = math.log2(max(max_bet_all, 1))
+                feats[4] = min(est_raises / 6.0, 1.0)
 
-        # 3: max_bet_sizing — max opp bet / pot (normalized by /3)
-        if opp_bets:
-            max_bet = max(opp_bets)
-            pot_for_sizing = max(pot - max_bet, 1.0)
-            feats[3] = min((max_bet / pot_for_sizing) / 3.0, 1.0)
-
-        # 4: num_raises_norm — estimate from max bet level / 6
-        max_bet_all = max((p.bet_current_round for p in players), default=0)
-        if max_bet_all > 1.0:
-            est_raises = math.log2(max(max_bet_all, 1))
-            feats[4] = min(est_raises / 6.0, 1.0)
-
-        # 5: street_aggression — are opponents betting on this street?
-        if active_opps:
-            agg_count = sum(1 for p in active_opps
-                           if p.bet_current_round > 0 or p.is_all_in)
-            feats[5] = agg_count / len(active_opps)
-
-        # 6: opp_check_ratio — opponents with zero current bet (checked)
-        if active_opps:
-            check_count = sum(1 for p in active_opps
-                             if p.bet_current_round == 0 and not p.is_all_in)
-            feats[6] = check_count / len(active_opps)
+        # 5 + 6: street_aggression + opp_check_ratio — prefer per-street
+        # action counts. Training: agg_actions / all_actions on this street
+        # (slot 5), opp_checks / opp_actions on this street (slot 6). The
+        # snapshot fallback uses an opp-centric proxy that's directionally
+        # similar but uses different denominators.
+        street = gs.street or 'preflop'
+        if street_action_counts_override is not None:
+            sc = street_action_counts_override.get(street, {})
+            total_st = int(sc.get('total', 0))
+            agg_st = int(sc.get('agg', 0))
+            opp_total_st = int(sc.get('opp_total', 0))
+            opp_check_st = int(sc.get('opp_check', 0))
+            feats[5] = min(agg_st / total_st, 1.0) if total_st > 0 else 0.0
+            feats[6] = (min(opp_check_st / opp_total_st, 1.0)
+                        if opp_total_st > 0 else 0.0)
+        else:
+            if active_opps:
+                agg_count = sum(1 for p in active_opps
+                                if p.bet_current_round > 0 or p.is_all_in)
+                feats[5] = agg_count / len(active_opps)
+                check_count = sum(1 for p in active_opps
+                                  if p.bet_current_round == 0
+                                  and not p.is_all_in)
+                feats[6] = check_count / len(active_opps)
 
         # 7: pot_escalation — pot / avg starting stack
         # Approximate starting stack: current stack + pot share (since total_invested may be 0)
@@ -675,17 +743,20 @@ class ObservationBuilder:
         return feats
 
     def _betting_line_features(self, gs: GameState, players: List[PlayerInfo],
-                               player_idx: int) -> np.ndarray:
-        """Compute 3-dim betting-line features as snapshot proxies.
+                               player_idx: int,
+                               hero_has_initiative_override: Optional[bool] = None
+                               ) -> np.ndarray:
+        """Compute 3-dim betting-line features.
 
         Mirrors src/engine/fast_enhanced_engine._get_betting_line_features
-        and src/hand_history/obs_builder._bl_compute, but reconstructs
-        from a single GameState frame (no action history is available
-        at runtime).
+        and src/hand_history/obs_builder._bl_compute. Most fields are derived
+        from the snapshot, but `hero_has_initiative` requires cross-street
+        state — callers pass `hero_has_initiative_override`
+        from a per-hand tracker. Without an override we fall back to a
+        snapshot proxy that's only valid AFTER hero has bet this street.
 
         0. pot_at_street_start_norm — (pot - sum bet_current_round) / avg_stack
-        1. hero_has_initiative — 1 if hero has the strict-max bet_current_round
-           on this street (proxy for "hero is the most recent aggressor")
+        1. hero_has_initiative — 1 if hero is the last aggressor in the hand
         2. agg_count_this_street_norm — log2(max_bet/BB) / 4 (proxy for raise
            count this street)
         """
@@ -705,11 +776,18 @@ class ObservationBuilder:
             1.0)
         feats[0] = float(np.clip(prior_streets_pot / avg_stack, 0.0, 1.0))
 
-        # Hero has initiative ≈ hero has the strict max bet this round and
-        # has actually bet (else nobody is "last aggressor" yet on this street)
-        my_bet = players[player_idx].bet_current_round
-        max_bet = max((p.bet_current_round for p in all_players), default=0)
-        feats[1] = 1.0 if my_bet > 0 and my_bet >= max_bet else 0.0
+        if hero_has_initiative_override is not None:
+            feats[1] = 1.0 if hero_has_initiative_override else 0.0
+            max_bet = max(
+                (p.bet_current_round for p in all_players), default=0)
+        else:
+            # Fallback snapshot proxy: degenerate before hero bets this
+            # street (always 0 on a freshly-dealt flop) — known limitation,
+            # caller should supply the override whenever possible.
+            my_bet = players[player_idx].bet_current_round
+            max_bet = max(
+                (p.bet_current_round for p in all_players), default=0)
+            feats[1] = 1.0 if my_bet > 0 and my_bet >= max_bet else 0.0
 
         # Aggression count this street ≈ log2 of how many BB the max bet is
         # at, normalized by /4 so 16BB ≈ 1.0.
