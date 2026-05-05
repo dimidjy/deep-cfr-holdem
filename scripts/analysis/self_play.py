@@ -937,6 +937,7 @@ def generate_report(all_stats: Dict[int, PlayerStats], num_players: int,
             queries = c.get('queries', 0)
             sized = c.get('sizing_override', 0)
             promoted = c.get('all_in_promotions', 0)
+            promo_blocked = c.get('promo_below_sample_floor', 0)
             no_data = c.get('no_data', 0)
             non_pf = c.get('non_postflop', 0)
             non_raise = c.get('non_raise', 0)
@@ -947,6 +948,8 @@ def generate_report(all_stats: Dict[int, PlayerStats], num_players: int,
             w(f'  Postflop raise queries:        {queries:>10,d}')
             w(f'    All-in promotions:           {promoted:>10,d} '
               f'({_pct(promoted, queries):>6})')
+            w(f'    Promo blocked (low samples): {promo_blocked:>10,d} '
+              f'({_pct(promo_blocked, queries):>6})')
             w(f'    Sizing overrides (typed):    {sized:>10,d} '
               f'({_pct(sized, queries):>6})')
             w(f'    No-data fallthroughs:        {no_data:>10,d} '
@@ -957,6 +960,10 @@ def generate_report(all_stats: Dict[int, PlayerStats], num_players: int,
             override_rate = (promoted + sized) / queries if queries > 0 else 0.0
             w(f'  → Effective override rate:     {override_rate*100:.1f}% '
               f'of postflop raise decisions used cohort sizing')
+            if engine._postflop_sizing._all_in_threshold is not None:
+                thr = engine._postflop_sizing._all_in_threshold
+                floor = engine._postflop_sizing._min_samples_for_promotion
+                w(f'  Config: threshold={thr} promo_sample_floor={floor}')
             w('')
 
     w('=' * 70)
@@ -1239,6 +1246,17 @@ def main():
     parser.add_argument('--preflop-min-samples-no-stack', type=int, default=None,
                         help='Override min_samples for L2 (drop stack_bucket) '
                              '(default 5). Higher = sparser L2 → more static.')
+    # ── Postflop sizing knobs (override DecisionConfig defaults) ──
+    parser.add_argument('--postflop-all-in-threshold', type=float, default=None,
+                        help='Override DecisionConfig.postflop_all_in_threshold '
+                             'with a SCALAR (e.g. 0.35 = old default). When unset, '
+                             'uses the per-SPR dict default ({"<2":0.25, "2-5":0.30, '
+                             '"5-15":0.45, "15+":0.55}). Useful for back-to-back '
+                             'comparisons against the old behavior.')
+    parser.add_argument('--postflop-min-samples-for-promotion', type=int, default=None,
+                        help='Override DecisionConfig.postflop_min_samples_for_promotion '
+                             '(default 20). Set to 5 to mimic old behavior where '
+                             'the general min_samples floor doubled as promotion floor.')
     args = parser.parse_args()
 
     vs_mode = bool(args.vs_facing_bet) or bool(args.archetype) or bool(args.opponent_model)
@@ -1260,6 +1278,10 @@ def main():
         _dc_kwargs['preflop_min_samples_no_nta'] = args.preflop_min_samples_no_nta
     if args.preflop_min_samples_no_stack is not None:
         _dc_kwargs['preflop_min_samples_no_stack'] = args.preflop_min_samples_no_stack
+    if args.postflop_all_in_threshold is not None:
+        _dc_kwargs['postflop_all_in_threshold'] = args.postflop_all_in_threshold
+    if args.postflop_min_samples_for_promotion is not None:
+        _dc_kwargs['postflop_min_samples_for_promotion'] = args.postflop_min_samples_for_promotion
     dc = DecisionConfig(**_dc_kwargs)
     engine = DecisionEngine(dc)
     if args.model:

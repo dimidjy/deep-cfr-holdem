@@ -1310,12 +1310,19 @@ def _parse_incremental(hh_dir: Path, num_players: int,
 
     if cache_file.exists() and not no_cache:
         print(f'  Loading cached data from {cache_file.name}...')
-        with open(cache_file, 'rb') as cf:
-            data = pickle.load(cf)
-        print(f'  Loaded: {len(data["all_6p"])} 6p hands, '
-              f'{len(data["showdown"])} showdown, '
-              f'{data["total_hands"]} total parsed')
-        return data['all_6p'], data['showdown'], data['total_hands'], file_count
+        try:
+            with open(cache_file, 'rb') as cf:
+                data = pickle.load(cf)
+            print(f'  Loaded: {len(data["all_6p"])} 6p hands, '
+                  f'{len(data["showdown"])} showdown, '
+                  f'{data["total_hands"]} total parsed')
+            return data['all_6p'], data['showdown'], data['total_hands'], file_count
+        except (pickle.UnpicklingError, EOFError, KeyError) as e:
+            print(f'  Cache corrupt ({e}); deleting and re-parsing.')
+            try:
+                cache_file.unlink()
+            except OSError:
+                pass
 
     # Parse incrementally
     all_6p = []
@@ -1379,8 +1386,10 @@ def _parse_incremental(hh_dir: Path, num_players: int,
         'total_hands': total_hands,
     }
     try:
-        with open(cache_file, 'wb') as cf:
+        tmp_file = cache_file.with_suffix(f'.pkl.tmp.{os.getpid()}')
+        with open(tmp_file, 'wb') as cf:
             pickle.dump(data, cf, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp_file, cache_file)
         cache_mb = cache_file.stat().st_size / 1e6
         print(f'  Cached to {cache_file.name} ({cache_mb:.0f} MB)')
     except Exception as e:

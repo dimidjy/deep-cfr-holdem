@@ -108,7 +108,8 @@ class PreflopRanges:
     def get_action(self, hole_cards: List[str], rel_pos: int,
                    pot_bb: float, legal_actions: List[int],
                    num_limpers: int = 0, effective_stack: float = 100.0,
-                   num_callers: int = 0) -> Optional[int]:
+                   num_callers: int = 0,
+                   action_history: Optional[str] = None) -> Optional[int]:
         """Determine preflop action from range charts.
 
         Args:
@@ -121,6 +122,10 @@ class PreflopRanges:
                 logic now relies entirely on range charts regardless of
                 stack depth
             num_callers: number of cold-callers of the open (excludes opener)
+            action_history: explicit scenario string ('open', 'limped_pot',
+                'vs_raise', 'vs_3bet', 'vs_4bet+'). When supplied, overrides
+                the pot_bb-based bucketing — pot_bb thresholds break down at
+                short-stack depths where 4bet pots can be < 50bb.
 
         Returns:
             Action index (0-4), or None if ranges don't cover this situation.
@@ -137,6 +142,24 @@ class PreflopRanges:
         # push/fold) fired here, but it caused edge-case bugs when an opponent
         # was already all-in (effective_stack collapsed to that opponent's
         # committed amount, triggering shove-mode for non-shove spots).
+
+        # Route by explicit action_history when supplied (action-sequence
+        # truth), else fall back to pot_bb thresholds (legacy heuristic).
+        if action_history == 'vs_4bet+':
+            return self._facing_4bet_decision(combo, pos_key, legal_actions)
+        if action_history == 'vs_3bet':
+            return self._facing_3bet_decision(combo, pos_key, legal_actions)
+        if action_history == 'vs_raise':
+            if num_callers > 0:
+                return self._facing_squeeze_decision(combo, pos_key,
+                                                      legal_actions, num_callers)
+            return self._facing_raise_decision(combo, pos_key, legal_actions)
+        if action_history == 'limped_pot':
+            return self._facing_limpers_decision(combo, pos_key,
+                                                  legal_actions,
+                                                  max(num_limpers, 1))
+        if action_history == 'open':
+            return self._rfi_decision(combo, pos_key, legal_actions)
 
         # Determine scenario based on pot size (in BB)
         if pot_bb < 4:
@@ -161,13 +184,15 @@ class PreflopRanges:
                      action_size: int = 6,
                      num_limpers: int = 0,
                      effective_stack: float = 100.0,
-                     num_callers: int = 0) -> np.ndarray:
+                     num_callers: int = 0,
+                     action_history: Optional[str] = None) -> np.ndarray:
         """Get a strategy vector (probability distribution over actions)."""
         strategy = np.zeros(action_size, dtype=np.float32)
         action = self.get_action(hole_cards, rel_pos, pot_bb, legal_actions,
                                  num_limpers=num_limpers,
                                  effective_stack=effective_stack,
-                                 num_callers=num_callers)
+                                 num_callers=num_callers,
+                                 action_history=action_history)
 
         if action is None or action not in legal_actions:
             # Fallback: uniform over legal actions

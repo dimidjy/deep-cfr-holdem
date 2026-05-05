@@ -29,7 +29,7 @@ import logging
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -163,7 +163,22 @@ class DecisionConfig:
     # Postflop sizing (data-driven cohort sizes for bets/raises)
     use_postflop_sizing: bool = True
     postflop_db_path: str = 'data/postflop_sizing.sqlite'
-    postflop_all_in_threshold: float = 0.35
+    # Per-SPR-bucket threshold: cohort shove% at/above which a model raise is
+    # promoted to ALL_IN. Keys MUST match SPR_BUCKETS labels in
+    # src/postflop_spot_key.py. Stratified by SPR because deep-stack avg
+    # all_in_pct is 0.4-2.5% (no spot ever crosses any threshold) while
+    # SPR<2 averages 71.9% — a scalar threshold can't capture both regimes.
+    # Scalar float still accepted for back-compat.
+    postflop_all_in_threshold: Union[float, Dict[str, float]] = field(
+        default_factory=lambda: {
+            '<2': 0.25, '2-5': 0.30, '5-15': 0.45, '15+': 0.55,
+        })
+    # Sample floor specifically for ALL_IN promotion. Decoupled from the
+    # general postflop-lookup min_samples (5) used for sizing-percentile
+    # overrides, because the binary all_in_pct metric is high-variance — at
+    # n=5 a single decision swings the rate by 20pp. Sizing percentiles are
+    # robust at smaller n; promotion needs a tighter floor.
+    postflop_min_samples_for_promotion: int = 20
 
     # Re-raise classifier
     reraise_classifier_path: str = ''
@@ -390,6 +405,7 @@ class DecisionEngine:
                     self._postflop_sizing = PostflopSizingLookup(
                         self.config.postflop_db_path,
                         all_in_promotion_threshold=self.config.postflop_all_in_threshold,
+                        min_samples_for_promotion=self.config.postflop_min_samples_for_promotion,
                     )
                     logger.info(
                         f"Postflop sizing loaded from "

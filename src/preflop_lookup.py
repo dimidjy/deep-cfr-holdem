@@ -350,13 +350,35 @@ class PreflopLookup:
                         reason=(f"L2 large call ({call_amount_bb:.1f}bb) "
                                 f"play_rate={play_rate*100:.1f}% "
                                 f"< {self._l2_large_call_play_rate*100:.0f}%"))
+                # L2 normally suppresses custom sizing because raise sizes
+                # aggregated across stack depths are unreliable (3bet vs
+                # short-stacker = shove; vs deep = small raise). EXCEPTION:
+                # when cohort consensus is overwhelming (≥80% raise) AND the
+                # pooled median sits in a sane preflop range (2.0-15.0 BB),
+                # the median is far better than letting the UI compute a
+                # half/pot preset bet — short-stacked tables otherwise lose
+                # custom sizing entirely (effective stack lands in <40bb
+                # bucket where cohort coverage is thin → L0/L1 miss → L2
+                # fires → preset size). Bounded range keeps us safe: 2bb
+                # floor avoids min-raise corner cases, 15bb ceiling keeps
+                # 3bet sizings from leaking through (vs_3bet/vs_4bet take
+                # the static-action branch above and never reach here).
+                raise_p_l2 = float(row['raise_pct']) / 100.0
+                median_bb_l2 = row.get('raise_size_bb_p50')
+                trust_l2_size = (
+                    raise_p_l2 >= 0.80
+                    and median_bb_l2 is not None
+                    and 2.0 <= float(median_bb_l2) <= 15.0
+                )
                 strategy, custom_size = self._row_to_strategy(
                     row, legal_actions, action_size, pot_bb, call_amount_bb,
-                    effective_stack, trust_size=False)
+                    effective_stack, trust_size=trust_l2_size)
                 self._log_decision(
                     'L2_no_stack', spot, row['n_samples'],
                     (row['fold_pct'], row['call_pct'], row['raise_pct']),
-                    custom_size)
+                    custom_size,
+                    extra=(f"size_pooled={median_bb_l2}" if trust_l2_size
+                           else "size_suppressed (low consensus or out-of-range)"))
                 return strategy, custom_size
 
             # L3 — no data at any granularity. Prefer the static GTO range
@@ -684,9 +706,14 @@ class PreflopLookup:
         If no cohort data exists for sizing, return None — the action layer
         will fall back to the nearest preset.
         """
+        # Pass spot.action_history through so the static range routes by the
+        # action-sequence (vs_3bet / vs_4bet+) rather than the pot_bb
+        # heuristic — at short stacks a 4bet pot can be smaller than the
+        # 50bb threshold and silently fall into the vs_3bet bucket.
         strategy = self._fallback_strategy(
             hole_cards, rel_pos, pot_bb, legal_actions, action_size,
             num_limpers, effective_stack, num_callers,
+            action_history=spot.action_history,
         )
         # Check if any raise mass exists in the static strategy. If so,
         # consult cohort for size; otherwise the action is fold/call and
@@ -724,6 +751,7 @@ class PreflopLookup:
                 strategy = self._fallback_strategy(
                     hole_cards, rel_pos, pot_bb, legal_actions, action_size,
                     num_limpers, effective_stack, num_callers,
+                    action_history=spot.action_history,
                 )
                 self._counters['L3_static_fallback' if n_samples == 0
                                 else 'L2_static_fallback'] += 1
@@ -744,7 +772,8 @@ class PreflopLookup:
         return self._fold_default(legal_actions, action_size), None
 
     def _fallback_strategy(self, hole_cards, rel_pos, pot_bb, legal_actions,
-                           action_size, num_limpers, effective_stack, num_callers):
+                           action_size, num_limpers, effective_stack,
+                           num_callers, action_history: Optional[str] = None):
         """ERROR-RECOVERY ONLY. Called when the lookup path raised."""
         if self._fallback is not None:
             try:
@@ -752,9 +781,10 @@ class PreflopLookup:
                     hole_cards=hole_cards, rel_pos=rel_pos, pot_bb=pot_bb,
                     legal_actions=legal_actions, action_size=action_size,
                     num_limpers=num_limpers, effective_stack=effective_stack,
-                    num_callers=num_callers,
+                    num_callers=num_callers, action_history=action_history,
                 )
             except TypeError:
+                # Older PreflopRanges without action_history kwarg
                 return self._fallback.get_strategy(
                     hole_cards, rel_pos, pot_bb, legal_actions, action_size,
                     num_limpers, effective_stack, num_callers,

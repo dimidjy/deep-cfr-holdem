@@ -16,7 +16,7 @@ raise (and optionally promotes a smaller raise to all-in).
 """
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 from src.postflop_db import connect, load_lookup_into_memory
 from src.postflop_spot_key import (
@@ -56,25 +56,33 @@ class PostflopSizingLookup:
         Path to the SQLite postflop sizing DB built by
         `scripts/build_postflop_lookup.py`.
     min_samples : int
-        Minimum cohort sample count to trust the lookup. Spots below
-        this leave the model's preset choice unchanged.
-    all_in_promotion_threshold : float
+        Minimum cohort sample count to trust the sizing percentiles.
+        Spots below this leave the model's preset choice unchanged.
+    all_in_promotion_threshold : float | Dict[str, float]
         Cohort shove% (0.0-1.0) at or above which we promote the model's
-        raise choice to ALL_IN. Default 0.35 — captures legit "commitment"
-        spots at SPR 2-5 where cohort jams a meaningful fraction of the
-        time, while still avoiding noise at deep SPR where 30% shove rate
-        could be statistical artifact.
+        raise choice to ALL_IN. Either a scalar (applied to all spots) or
+        a dict keyed by SPR bucket (`'<2'`, `'2-5'`, `'5-15'`, `'15+'`).
+        Per-SPR is preferred because the cohort all_in_pct distribution is
+        bimodal (SPR<2 averages ~72%, SPR≥5 averages <3%) — a single scalar
+        either over-fires deep or under-fires short.
+    min_samples_for_promotion : int
+        Sample floor for the binary promotion check, decoupled from
+        `min_samples` (which gates sizing percentiles). Higher because
+        all_in_pct is high-variance — at n=5 a single decision swings the
+        rate by 20pp. Default 20.
     """
 
     def __init__(self, db_path: str,
                  min_samples: int = MIN_SAMPLES_PER_SPOT,
-                 all_in_promotion_threshold: float = 0.35):
+                 all_in_promotion_threshold: Union[float, Dict[str, float]] = 0.35,
+                 min_samples_for_promotion: int = 20):
         if not Path(db_path).exists():
             raise FileNotFoundError(
                 f'Postflop sizing DB not found at {db_path}. '
                 f'Run scripts/build_postflop_lookup.py to create it.')
         self._min_samples = min_samples
         self._all_in_threshold = all_in_promotion_threshold
+        self._min_samples_for_promotion = min_samples_for_promotion
         conn = connect(db_path)
         try:
             self._cache: Dict[Tuple, Dict] = load_lookup_into_memory(conn)
@@ -83,6 +91,7 @@ class PostflopSizingLookup:
         self._counters = {
             'queries': 0, 'no_data': 0,
             'sizing_override': 0, 'all_in_promotions': 0,
+            'promo_below_sample_floor': 0,
             'non_postflop': 0, 'non_raise': 0, 'error_fallback': 0,
         }
         # Periodic-summary cadence — emit one INFO line every N decisions so
@@ -93,7 +102,17 @@ class PostflopSizingLookup:
         logger.info(
             f"PostflopSizingLookup initialized: db={db_path}, "
             f"spots={len(self._cache)}, min_samples={min_samples}, "
+            f"min_samples_for_promotion={min_samples_for_promotion}, "
             f"all_in_threshold={all_in_promotion_threshold}")
+
+    def _threshold_for_spr(self, spr_bucket: str) -> float:
+        """Resolve promotion threshold for the given SPR bucket."""
+        thr = self._all_in_threshold
+        if isinstance(thr, dict):
+            # Fall back to a strict 1.01 (unreachable) if bucket missing —
+            # safer than defaulting low and accidentally promoting unknown SPRs.
+            return float(thr.get(spr_bucket, 1.01))
+        return float(thr)
 
     @property
     def num_spots(self) -> int:
@@ -188,15 +207,30 @@ class PostflopSizingLookup:
         effective_stack_bb = spot_inputs['effective_stack_bb']
 
         # ── All-in promotion ─────────────────────────────────────────────
+        # Two gates: (1) per-SPR threshold (cohort shove rate at/above which
+        # we copy them) and (2) a separate sample floor — the binary
+        # all_in_pct is high-variance, so we require more data than the
+        # sizing-percentile path uses.
         all_in_pct_frac = float(row['all_in_pct']) / 100.0
-        if all_in_pct_frac >= self._all_in_threshold:
-            self._counters['all_in_promotions'] += 1
-            logger.info(
-                f"Postflop ALL-IN promotion: {spot.to_tuple()} "
-                f"(cohort shove% = {row['all_in_pct']:.0f}%, n={row['n_samples']})")
-            self._emit_summary_if_due()
-            return ALL_IN, _round_to_half_bb(effective_stack_bb,
-                                             min_bb=pot_bb * 0.10)
+        spr_threshold = self._threshold_for_spr(spot.spr_bucket)
+        if all_in_pct_frac >= spr_threshold:
+            if row['n_samples'] < self._min_samples_for_promotion:
+                self._counters['promo_below_sample_floor'] += 1
+                logger.info(
+                    f"Postflop ALL-IN promotion SUPPRESSED (low samples): "
+                    f"{spot.to_tuple()} cohort_shove={row['all_in_pct']:.0f}% "
+                    f"n={row['n_samples']} < floor={self._min_samples_for_promotion}")
+                # Fall through to sizing-override path below.
+            else:
+                self._counters['all_in_promotions'] += 1
+                logger.info(
+                    f"Postflop ALL-IN promotion: {spot.to_tuple()} "
+                    f"(cohort shove%={row['all_in_pct']:.0f}% "
+                    f">= SPR{spot.spr_bucket} threshold {spr_threshold*100:.0f}%, "
+                    f"n={row['n_samples']})")
+                self._emit_summary_if_due()
+                return ALL_IN, _round_to_half_bb(effective_stack_bb,
+                                                 min_bb=pot_bb * 0.10)
 
         # ── Sizing override ─────────────────────────────────────────────
         # Special case: model picked ALL_IN but cohort didn't promote here.
@@ -209,7 +243,7 @@ class PostflopSizingLookup:
             logger.info(
                 f"Postflop ALL-IN typed: {spot.to_tuple()} "
                 f"→ {target_bb:.1f}bb (cohort shove% = {row['all_in_pct']:.0f}% "
-                f"below {self._all_in_threshold*100:.0f}% threshold, "
+                f"below SPR{spot.spr_bucket} threshold {spr_threshold*100:.0f}%, "
                 f"n={row['n_samples']})")
             self._emit_summary_if_due()
             return action_idx, target_bb
