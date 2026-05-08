@@ -13,12 +13,19 @@ already-ingested HH files when run incrementally.
 Mirrors `src/preflop_db.py` patterns. All public functions take or return
 a `sqlite3.Connection` so callers manage transactions explicitly.
 """
+import json as _json
 import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from src.postflop_spot_key import PostflopSpotKey
+
+# Bucket edges for the per-spot bet-size histogram (% of pot).
+# Buckets are [edges[i], edges[i+1]) with the last open-ended at +inf.
+# 7 buckets: 0-33 / 33-50 / 50-75 / 75-100 / 100-150 / 150-200 / 200+.
+BET_SIZE_BUCKET_EDGES: Tuple[float, ...] = (0.0, 0.33, 0.50, 0.75, 1.00, 1.50, 2.00)
+NUM_BET_SIZE_BUCKETS: int = len(BET_SIZE_BUCKET_EDGES)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS postflop_decisions (
@@ -61,6 +68,7 @@ CREATE TABLE IF NOT EXISTS postflop_lookup (
     bet_size_bb_p25  REAL,
     bet_size_bb_p50  REAL,
     bet_size_bb_p75  REAL,
+    size_hist_json   TEXT,
     last_built_at   TEXT,
     PRIMARY KEY (street, hand_bucket, draw_type, board_texture,
                  position, spr_bucket, action_context)
@@ -80,6 +88,13 @@ def connect(db_path: str) -> sqlite3.Connection:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.executescript(_SCHEMA)
+    # Forward-compat: add columns added after initial schema. CREATE TABLE
+    # IF NOT EXISTS won't add columns to existing tables.
+    cols = {row[1] for row in conn.execute(
+        "PRAGMA table_info(postflop_lookup)").fetchall()}
+    if 'size_hist_json' not in cols:
+        conn.execute(
+            "ALTER TABLE postflop_lookup ADD COLUMN size_hist_json TEXT")
     conn.commit()
     conn.execute('PRAGMA journal_mode=WAL')
     conn.execute('PRAGMA synchronous=NORMAL')
@@ -124,6 +139,51 @@ def _percentiles(sizes: List[float]) -> Tuple[Optional[float], ...]:
     return (p25, p50, p75)
 
 
+def _bucket_index(pct: float) -> int:
+    """Return the bucket index for a bet-size pct using BET_SIZE_BUCKET_EDGES."""
+    idx = 0
+    for i, edge in enumerate(BET_SIZE_BUCKET_EDGES):
+        if pct >= edge:
+            idx = i
+        else:
+            break
+    return idx
+
+
+def _compute_size_histogram(pcts: List[float]) -> Optional[str]:
+    """Bucket bet-size pcts and return JSON-encoded histogram.
+
+    Output format:
+        {"counts": [c0..c6], "medians": [m0..m6 or null]}
+
+    `counts[i]` is the number of cohort decisions whose size_pct fell in
+    bucket i (defined by `BET_SIZE_BUCKET_EDGES`).
+    `medians[i]` is the median size_pct among decisions in bucket i, or
+    None if the bucket is empty (used at runtime to pick a representative
+    size in the chosen bucket).
+
+    Returns None when `pcts` is empty so the column stays NULL — the
+    runtime falls back to the existing percentile path in that case.
+    """
+    if not pcts:
+        return None
+    counts = [0] * NUM_BET_SIZE_BUCKETS
+    bucket_vals: List[List[float]] = [[] for _ in range(NUM_BET_SIZE_BUCKETS)]
+    for p in pcts:
+        b = _bucket_index(float(p))
+        counts[b] += 1
+        bucket_vals[b].append(float(p))
+    medians: List[Optional[float]] = []
+    for vals in bucket_vals:
+        if not vals:
+            medians.append(None)
+        else:
+            vals.sort()
+            medians.append(vals[len(vals) // 2])
+    return _json.dumps({'counts': counts, 'medians': medians},
+                       separators=(',', ':'))
+
+
 def rebuild_lookup(conn: sqlite3.Connection) -> int:
     """Recompute the `postflop_lookup` table from `postflop_decisions`.
 
@@ -162,6 +222,7 @@ def rebuild_lookup(conn: sqlite3.Connection) -> int:
         bbs = [r[1] for r in size_rows if r[1] is not None]
         pct_p25, pct_p50, pct_p75 = _percentiles(pcts)
         bb_p25, bb_p50, bb_p75 = _percentiles(bbs)
+        size_hist_json = _compute_size_histogram(pcts)
 
         all_in_pct = 100.0 * n_all_in / n
 
@@ -170,6 +231,7 @@ def rebuild_lookup(conn: sqlite3.Connection) -> int:
             n, n_all_in, all_in_pct,
             pct_p25, pct_p50, pct_p75,
             bb_p25, bb_p50, bb_p75,
+            size_hist_json,
             now_iso,
         ))
 
@@ -179,12 +241,31 @@ def rebuild_lookup(conn: sqlite3.Connection) -> int:
             spr_bucket, action_context, n_samples, n_all_in, all_in_pct,
             bet_size_pct_p25, bet_size_pct_p50, bet_size_pct_p75,
             bet_size_bb_p25, bet_size_bb_p50, bet_size_bb_p75,
+            size_hist_json,
             last_built_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         inserts,
     )
     conn.commit()
     return len(inserts)
+
+
+def _decode_size_hist(blob: Optional[str]) -> Optional[Dict]:
+    """Parse size_hist_json into a dict, or None when absent/malformed."""
+    if not blob:
+        return None
+    try:
+        d = _json.loads(blob)
+    except Exception:
+        return None
+    counts = d.get('counts')
+    medians = d.get('medians')
+    if (not isinstance(counts, list)
+            or not isinstance(medians, list)
+            or len(counts) != NUM_BET_SIZE_BUCKETS
+            or len(medians) != NUM_BET_SIZE_BUCKETS):
+        return None
+    return {'counts': counts, 'medians': medians}
 
 
 def query_spot(conn: sqlite3.Connection, key: PostflopSpotKey) -> Optional[Dict]:
@@ -192,7 +273,8 @@ def query_spot(conn: sqlite3.Connection, key: PostflopSpotKey) -> Optional[Dict]
     row = conn.execute(
         """SELECT n_samples, n_all_in, all_in_pct,
                   bet_size_pct_p25, bet_size_pct_p50, bet_size_pct_p75,
-                  bet_size_bb_p25, bet_size_bb_p50, bet_size_bb_p75
+                  bet_size_bb_p25, bet_size_bb_p50, bet_size_bb_p75,
+                  size_hist_json
            FROM postflop_lookup
            WHERE street=? AND hand_bucket=? AND draw_type=? AND
                  board_texture=? AND position=? AND spr_bucket=? AND
@@ -201,11 +283,12 @@ def query_spot(conn: sqlite3.Connection, key: PostflopSpotKey) -> Optional[Dict]
     ).fetchone()
     if row is None:
         return None
-    n, n_ai, ai_pct, p25, p50, p75, bb25, bb50, bb75 = row
+    n, n_ai, ai_pct, p25, p50, p75, bb25, bb50, bb75, hist_blob = row
     return {
         'n_samples': n, 'n_all_in': n_ai, 'all_in_pct': ai_pct,
         'bet_size_pct_p25': p25, 'bet_size_pct_p50': p50, 'bet_size_pct_p75': p75,
         'bet_size_bb_p25': bb25, 'bet_size_bb_p50': bb50, 'bet_size_bb_p75': bb75,
+        'size_hist': _decode_size_hist(hist_blob),
     }
 
 
@@ -219,7 +302,8 @@ def load_lookup_into_memory(conn: sqlite3.Connection) -> Dict[Tuple, Dict]:
         """SELECT street, hand_bucket, draw_type, board_texture, position,
                   spr_bucket, action_context, n_samples, n_all_in, all_in_pct,
                   bet_size_pct_p25, bet_size_pct_p50, bet_size_pct_p75,
-                  bet_size_bb_p25, bet_size_bb_p50, bet_size_bb_p75
+                  bet_size_bb_p25, bet_size_bb_p50, bet_size_bb_p75,
+                  size_hist_json
            FROM postflop_lookup"""
     ):
         key = tuple(row[:7])
@@ -229,6 +313,7 @@ def load_lookup_into_memory(conn: sqlite3.Connection) -> Dict[Tuple, Dict]:
             'bet_size_pct_p75': row[12],
             'bet_size_bb_p25': row[13], 'bet_size_bb_p50': row[14],
             'bet_size_bb_p75': row[15],
+            'size_hist': _decode_size_hist(row[16]),
         }
     return out
 

@@ -15,6 +15,7 @@ strategic decision (FOLD vs CALL vs raise) — only the size of the chosen
 raise (and optionally promotes a smaller raise to all-in).
 """
 import logging
+import random
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -22,6 +23,14 @@ from src.postflop_db import connect, load_lookup_into_memory
 from src.postflop_spot_key import (
     PostflopSpotKey, MIN_SAMPLES_PER_SPOT, build_spot_key,
 )
+
+# Boundary between "small bet" (RAISE_HALF) and "big bet" (RAISE_POT) when
+# filtering the cohort bet-size histogram. Buckets whose median pct is
+# below this go to RAISE_HALF; at-or-above go to RAISE_POT.
+# 0.75 pot matches the bucket edge in src.postflop_db.BET_SIZE_BUCKET_EDGES
+# and aligns with the model's mental split between the half-pot and pot-bet
+# preset choices.
+_HALF_VS_POT_PCT_BOUNDARY = 0.75
 
 logger = logging.getLogger('postflop_sizing')
 
@@ -75,7 +84,9 @@ class PostflopSizingLookup:
     def __init__(self, db_path: str,
                  min_samples: int = MIN_SAMPLES_PER_SPOT,
                  all_in_promotion_threshold: Union[float, Dict[str, float]] = 0.35,
-                 min_samples_for_promotion: int = 20):
+                 min_samples_for_promotion: int = 20,
+                 use_histogram_sampling: bool = True,
+                 min_samples_for_histogram: int = 20):
         if not Path(db_path).exists():
             raise FileNotFoundError(
                 f'Postflop sizing DB not found at {db_path}. '
@@ -83,6 +94,8 @@ class PostflopSizingLookup:
         self._min_samples = min_samples
         self._all_in_threshold = all_in_promotion_threshold
         self._min_samples_for_promotion = min_samples_for_promotion
+        self._use_histogram_sampling = use_histogram_sampling
+        self._min_samples_for_histogram = min_samples_for_histogram
         conn = connect(db_path)
         try:
             self._cache: Dict[Tuple, Dict] = load_lookup_into_memory(conn)
@@ -92,6 +105,7 @@ class PostflopSizingLookup:
             'queries': 0, 'no_data': 0,
             'sizing_override': 0, 'all_in_promotions': 0,
             'promo_below_sample_floor': 0,
+            'histogram_sampled': 0, 'histogram_fallback': 0,
             'non_postflop': 0, 'non_raise': 0, 'error_fallback': 0,
         }
         # Periodic-summary cadence — emit one INFO line every N decisions so
@@ -99,10 +113,16 @@ class PostflopSizingLookup:
         # production. Mirrors the preflop_lookup pattern.
         self._log_every = 50
 
+        # Diagnostic: how many cached spots actually carry a histogram?
+        n_with_hist = sum(1 for r in self._cache.values()
+                          if r.get('size_hist') is not None)
         logger.info(
             f"PostflopSizingLookup initialized: db={db_path}, "
-            f"spots={len(self._cache)}, min_samples={min_samples}, "
+            f"spots={len(self._cache)} (with_histogram={n_with_hist}), "
+            f"min_samples={min_samples}, "
             f"min_samples_for_promotion={min_samples_for_promotion}, "
+            f"min_samples_for_histogram={min_samples_for_histogram}, "
+            f"use_histogram_sampling={use_histogram_sampling}, "
             f"all_in_threshold={all_in_promotion_threshold}")
 
     def _threshold_for_spr(self, spr_bucket: str) -> float:
@@ -136,6 +156,8 @@ class PostflopSizingLookup:
             logger.info(
                 f"PostflopSizing usage (last {total_decisions} decisions): "
                 f"queries={c['queries']} sized={c['sizing_override']} "
+                f"hist_sampled={c['histogram_sampled']} "
+                f"hist_fallback={c['histogram_fallback']} "
                 f"all_in_promo={c['all_in_promotions']} "
                 f"no_data={c['no_data']} non_postflop={c['non_postflop']} "
                 f"non_raise={c['non_raise']}")
@@ -248,7 +270,27 @@ class PostflopSizingLookup:
             self._emit_summary_if_due()
             return action_idx, target_bb
 
-        target_pct = _pick_target_pct(action_idx, row)
+        # Try histogram sampling first — if the spot has enough samples and
+        # a histogram with eligible buckets for the model's chosen action
+        # category, we draw a size from the cohort's actual distribution.
+        # Otherwise we fall back to the deterministic p25/p75 path so old
+        # rows (no histogram) and sparse spots keep working unchanged.
+        target_pct: Optional[float] = None
+        size_source = 'percentile'
+        hist = row.get('size_hist') if isinstance(row, dict) else None
+        if (self._use_histogram_sampling
+                and hist is not None
+                and row['n_samples'] >= self._min_samples_for_histogram):
+            target_pct = _sample_from_histogram(action_idx, hist)
+            if target_pct is not None:
+                self._counters['histogram_sampled'] += 1
+                size_source = 'histogram'
+            else:
+                self._counters['histogram_fallback'] += 1
+
+        if target_pct is None:
+            target_pct = _pick_target_pct(action_idx, row)
+
         if target_pct is None:
             self._counters['no_data'] += 1
             self._emit_summary_if_due()
@@ -266,12 +308,58 @@ class PostflopSizingLookup:
 
         self._counters['sizing_override'] += 1
         logger.info(
-            f"Postflop sizing OVERRIDE: {spot.to_tuple()} "
+            f"Postflop sizing OVERRIDE [{size_source}]: {spot.to_tuple()} "
             f"action={action_idx} target_pct={target_pct:.2f} → {target_bb:.1f}bb "
             f"(pot={pot_bb:.1f}bb, call={call_amount_bb:.1f}bb, "
             f"n={row['n_samples']})")
         self._emit_summary_if_due()
         return action_idx, target_bb
+
+
+def _sample_from_histogram(action_idx: int,
+                           hist: Dict,
+                           rng: Optional[random.Random] = None
+                           ) -> Optional[float]:
+    """Sample a bet-size pct from the cohort histogram, filtered by action.
+
+    Bucket eligibility:
+      RAISE_HALF / RAISE_MIN → buckets with median <  _HALF_VS_POT_PCT_BOUNDARY
+      RAISE_POT              → buckets with median >= _HALF_VS_POT_PCT_BOUNDARY
+      ALL_IN                 → unused (handled upstream as effective stack)
+
+    A bucket is sampled with probability proportional to its count, then
+    the bucket's empirical median is returned as the representative size.
+    Returns None when no eligible bucket has data — caller falls back to
+    the deterministic p25/p75 path.
+    """
+    counts = hist.get('counts')
+    medians = hist.get('medians')
+    if not isinstance(counts, list) or not isinstance(medians, list):
+        return None
+
+    if action_idx in (RAISE_HALF, RAISE_MIN):
+        eligible = [(c, m) for c, m in zip(counts, medians)
+                    if c > 0 and m is not None and m < _HALF_VS_POT_PCT_BOUNDARY]
+    elif action_idx == RAISE_POT:
+        eligible = [(c, m) for c, m in zip(counts, medians)
+                    if c > 0 and m is not None and m >= _HALF_VS_POT_PCT_BOUNDARY]
+    else:
+        return None
+
+    if not eligible:
+        return None
+
+    total = float(sum(c for c, _ in eligible))
+    if total <= 0:
+        return None
+
+    r = (rng or random).random() * total
+    cum = 0.0
+    for c, m in eligible:
+        cum += c
+        if r < cum:
+            return float(m)
+    return float(eligible[-1][1])  # numerical-edge safety net
 
 
 def _pick_target_pct(action_idx: int, row: Dict) -> Optional[float]:

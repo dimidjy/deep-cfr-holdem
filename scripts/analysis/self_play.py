@@ -39,6 +39,104 @@ from src.decision_engine import (
 )
 from src.engine import FastEnhancedPokerEngine
 from src.archetypes import get_archetype_skew, ARCHETYPE_NAMES
+from src.preflop_spot_key import (
+    HIST_OPEN, HIST_LIMPED_POT, HIST_VS_RAISE, HIST_VS_3BET, HIST_VS_4BET,
+)
+
+
+def _preflop_pot_context(eng, hero_seat: int, num_players: int) -> dict:
+    """Compute (action_history, num_to_act, num_limpers, num_callers) for
+    a preflop decision in self-play. Mirrors `default_core._build_context`
+    but reads directly from the pkrs engine state.
+
+    Returns dict with action_history, num_to_act, num_limpers, num_callers.
+    Used to populate SpotContext so the live PreflopLookup hierarchy
+    (L0/L1/L2) keys correctly — without this, every spot keys with
+    action_history=None and num_to_act=0, causing self-play to hit
+    different lookup rows than the runtime agent.
+    """
+    state = eng._state  # noqa: SLF001 — internal state intentional
+    # pkrs engine uses BB=2, SB=1 chip units (constant). Match the proxy
+    # value exposed to outside code (FastPokerEngine._proxy.big_blind == 2).
+    bb_chips = 2.0
+    sb_chips = 1.0
+
+    button = state.button
+    # BB seat = 2 spots after button (3+ players); HU has BB at button+1
+    if num_players >= 3:
+        bb_seat = (button + 2) % num_players
+        sb_seat = (button + 1) % num_players
+    else:
+        bb_seat = (button + 1) % num_players
+        sb_seat = button  # HU: BTN posts SB
+
+    # Distinct opp bet levels strictly above BB → number of opponent raises
+    opp_levels = set()
+    num_limpers = 0
+    num_callers = 0
+    max_opp_bet = 0.0
+    for i, ps in enumerate(state.players_state):
+        if i == hero_seat:
+            continue
+        if not ps.active:
+            continue
+        bet = float(ps.bet_chips)
+        if bet > bb_chips + 1e-6:
+            opp_levels.add(round(bet, 1))
+        if bet > max_opp_bet:
+            max_opp_bet = bet
+
+    if max_opp_bet > bb_chips + 1e-6:
+        # Raise on the table → callers = opps at max_opp_bet minus the raiser
+        at_max = sum(1 for i, ps in enumerate(state.players_state)
+                     if i != hero_seat and ps.active
+                     and abs(float(ps.bet_chips) - max_opp_bet) < 1e-6)
+        num_callers = max(0, at_max - 1)
+    else:
+        # No raise — count voluntary limpers (BB poster excluded)
+        for i, ps in enumerate(state.players_state):
+            if i == hero_seat or i == bb_seat:
+                continue
+            if not ps.active:
+                continue
+            bet = float(ps.bet_chips)
+            if abs(bet - bb_chips) < 1e-6:
+                num_limpers += 1
+
+    raise_count = len(opp_levels)
+    if raise_count >= 3:
+        action_history = HIST_VS_4BET
+    elif raise_count == 2:
+        action_history = HIST_VS_3BET
+    elif raise_count == 1:
+        action_history = HIST_VS_RAISE
+    elif num_limpers > 0:
+        action_history = HIST_LIMPED_POT
+    else:
+        action_history = HIST_OPEN
+
+    # num_to_act: opp seats whose bet ≤ blind-only commitment
+    num_to_act = 0
+    for i, ps in enumerate(state.players_state):
+        if i == hero_seat or not ps.active:
+            continue
+        bet = float(ps.bet_chips)
+        if i == bb_seat:
+            if action_history in (HIST_OPEN, HIST_LIMPED_POT) and abs(bet - bb_chips) < 1e-6:
+                num_to_act += 1
+        elif i == sb_seat:
+            if abs(bet - sb_chips) < 1e-6:
+                num_to_act += 1
+        else:
+            if bet <= 1e-6:
+                num_to_act += 1
+
+    return {
+        'action_history': action_history,
+        'num_to_act': num_to_act,
+        'num_limpers': num_limpers,
+        'num_callers': num_callers,
+    }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Hand notation
@@ -139,6 +237,14 @@ class PlayerStats:
     range_grid: Dict[Tuple[str, str], Dict[str, Dict[str, int]]] = field(
         default_factory=lambda: defaultdict(
             lambda: defaultdict(lambda: defaultdict(int))))
+
+    # Hand-strength buckets at no-bet-yet postflop spots (bet vs check)
+    # Keyed by (street, hs_bucket) → {'bet': N, 'check': N}.
+    # Use obs[IDX_EQUITY] (hand_strength: equity vs random) for bucketing.
+    # Buckets: monster ≥0.85, strong 0.65-0.85, medium 0.45-0.65,
+    #   weak 0.25-0.45, air <0.25. Mirrors investigate_wtsd.py.
+    hs_action_grid: Dict[Tuple[str, str], Dict[str, int]] = field(
+        default_factory=lambda: defaultdict(lambda: defaultdict(int)))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -294,6 +400,22 @@ def run_self_play(engine: DecisionEngine, num_hands: int,
             if stage == 'Preflop' and cards:
                 hole_cards = cards
 
+            # Compute action_history / num_to_act / num_limpers for preflop
+            # spots so the live PreflopLookup hierarchy keys correctly.
+            # Without these, every spot would key as action_history=None
+            # (synth-prior heuristic) and num_to_act=0 — causing self-play
+            # to hit different lookup rows than the runtime agent.
+            pf_extras = {}
+            call_amount_bb = 0.0
+            if stage == 'Preflop':
+                pf_extras = _preflop_pot_context(eng, seat, ENGINE_PLAYERS)
+                bb_chips = 2.0  # pkrs constant
+                ps_state = eng._state.players_state  # noqa: SLF001
+                hero_bet = float(ps_state[seat].bet_chips)
+                max_opp = max((float(p.bet_chips) for i, p in enumerate(ps_state)
+                               if i != seat and p.active), default=0.0)
+                call_amount_bb = max(0.0, (max_opp - hero_bet) / bb_chips)
+
             ctx = SpotContext(
                 obs=obs,
                 legal_actions=legal,
@@ -306,6 +428,11 @@ def run_self_play(engine: DecisionEngine, num_hands: int,
                 # (training always uses 6-max ranges even with forced folds).
                 num_players=ENGINE_PLAYERS,
                 effective_stack=eng.get_player_chips(agent) / 2.0,
+                action_history=pf_extras.get('action_history'),
+                num_to_act=pf_extras.get('num_to_act', 0),
+                num_limpers=pf_extras.get('num_limpers', 0),
+                num_callers=pf_extras.get('num_callers', 0),
+                call_amount_bb=call_amount_bb,
             )
 
             # Get action from DecisionEngine (same pipeline as runtime agent)
@@ -458,6 +585,25 @@ def run_self_play(engine: DecisionEngine, num_hands: int,
                     else:
                         stats[seat].postflop_calls += 1
                         stats[seat].actions_by_street[street_key]['call'] += 1
+
+                # Hand-strength bucket tracking at no-bet-yet spots only
+                # (mirrors investigate_wtsd.py: bet/check by HS bucket).
+                if not facing_bet and len(obs) > 18:
+                    hs = float(obs[18])
+                    if hs >= 0.85:
+                        bucket = 'monster'
+                    elif hs >= 0.65:
+                        bucket = 'strong'
+                    elif hs >= 0.45:
+                        bucket = 'medium'
+                    elif hs >= 0.25:
+                        bucket = 'weak'
+                    else:
+                        bucket = 'air'
+                    if action >= RAISE_HALF:
+                        stats[seat].hs_action_grid[(street_key, bucket)]['bet'] += 1
+                    elif action == CALL:
+                        stats[seat].hs_action_grid[(street_key, bucket)]['check'] += 1
 
                 # CBet tracking (preflop raiser betting on flop)
                 if stage == 'Flop' and seat == preflop_raiser:
@@ -694,6 +840,9 @@ def generate_report(all_stats: Dict[int, PlayerStats], num_players: int,
         for street, acts in s.actions_by_street.items():
             for act_type, cnt in acts.items():
                 agg.actions_by_street[street][act_type] += cnt
+        for key, counts in s.hs_action_grid.items():
+            for k, v in counts.items():
+                agg.hs_action_grid[key][k] += v
 
     w('SELF-PLAY ANALYSIS REPORT')
     w('=' * 70)
@@ -849,6 +998,25 @@ def generate_report(all_stats: Dict[int, PlayerStats], num_players: int,
           f'{_pct(all_acts["all_in"], tot_all):>8}')
     w('')
 
+    # ── Hand-strength × bet/check at no-bet-yet postflop spots ──
+    w('─' * 70)
+    w('NO-BET-YET POSTFLOP: BET% BY HAND-STRENGTH BUCKET')
+    w('─' * 70)
+    w('  Spots where hero is first-to-act or checked-to (call_amount=0).')
+    w('  Bucketed by obs hand_strength (equity vs random).')
+    w(f'  {"STREET":<8} {"BUCKET":<9} {"CHK":>5} {"BET":>5} {"BET%":>7}')
+    bucket_order = ['monster', 'strong', 'medium', 'weak', 'air']
+    for street in ('flop', 'turn', 'river'):
+        for bucket in bucket_order:
+            counts = agg.hs_action_grid.get((street, bucket), {})
+            chk = counts.get('check', 0)
+            bet = counts.get('bet', 0)
+            if chk + bet == 0:
+                continue
+            pct = 100 * bet / (chk + bet)
+            w(f'  {street:<8} {bucket:<9} {chk:>5} {bet:>5} {pct:>6.1f}%')
+    w('')
+
     # ── Preflop ranges summary ──
     w('─' * 70)
     w('PREFLOP RFI BY POSITION (raise first in)')
@@ -939,6 +1107,8 @@ def generate_report(all_stats: Dict[int, PlayerStats], num_players: int,
             promoted = c.get('all_in_promotions', 0)
             promo_blocked = c.get('promo_below_sample_floor', 0)
             no_data = c.get('no_data', 0)
+            hist_sampled = c.get('histogram_sampled', 0)
+            hist_fallback = c.get('histogram_fallback', 0)
             non_pf = c.get('non_postflop', 0)
             non_raise = c.get('non_raise', 0)
             errors = c.get('error_fallback', 0)
@@ -952,6 +1122,10 @@ def generate_report(all_stats: Dict[int, PlayerStats], num_players: int,
               f'({_pct(promo_blocked, queries):>6})')
             w(f'    Sizing overrides (typed):    {sized:>10,d} '
               f'({_pct(sized, queries):>6})')
+            w(f'      Histogram sampled:         {hist_sampled:>10,d} '
+              f'({_pct(hist_sampled, sized):>6} of sized)')
+            w(f'      Percentile fallback:       {hist_fallback:>10,d} '
+              f'({_pct(hist_fallback, sized):>6} of sized)')
             w(f'    No-data fallthroughs:        {no_data:>10,d} '
               f'({_pct(no_data, queries):>6})')
             w(f'  Skipped (non-postflop):        {non_pf:>10,d}')
@@ -1257,6 +1431,10 @@ def main():
                         help='Override DecisionConfig.postflop_min_samples_for_promotion '
                              '(default 20). Set to 5 to mimic old behavior where '
                              'the general min_samples floor doubled as promotion floor.')
+    parser.add_argument('--no-postflop-histogram', action='store_true',
+                        help='Disable histogram-based bet-size sampling and use the '
+                             'deterministic p25/p75 percentile path instead. Useful '
+                             'for A/B comparisons with the new randomized sizing.')
     args = parser.parse_args()
 
     vs_mode = bool(args.vs_facing_bet) or bool(args.archetype) or bool(args.opponent_model)
@@ -1282,6 +1460,8 @@ def main():
         _dc_kwargs['postflop_all_in_threshold'] = args.postflop_all_in_threshold
     if args.postflop_min_samples_for_promotion is not None:
         _dc_kwargs['postflop_min_samples_for_promotion'] = args.postflop_min_samples_for_promotion
+    if args.no_postflop_histogram:
+        _dc_kwargs['postflop_use_histogram_sampling'] = False
     dc = DecisionConfig(**_dc_kwargs)
     engine = DecisionEngine(dc)
     if args.model:

@@ -179,6 +179,13 @@ class DecisionConfig:
     # n=5 a single decision swings the rate by 20pp. Sizing percentiles are
     # robust at smaller n; promotion needs a tighter floor.
     postflop_min_samples_for_promotion: int = 20
+    # Histogram-based bet-size sampling: when True, draw the bet size from
+    # the cohort's empirical bucketed distribution (per spot) instead of
+    # the deterministic p25/p75 percentile. Adds variance and reproduces
+    # bimodal cohorts (e.g. spots that split between half- and pot-sized
+    # bets). Falls back to percentile path on sparse spots.
+    postflop_use_histogram_sampling: bool = True
+    postflop_min_samples_for_histogram: int = 20
 
     # Re-raise classifier
     reraise_classifier_path: str = ''
@@ -406,6 +413,8 @@ class DecisionEngine:
                         self.config.postflop_db_path,
                         all_in_promotion_threshold=self.config.postflop_all_in_threshold,
                         min_samples_for_promotion=self.config.postflop_min_samples_for_promotion,
+                        use_histogram_sampling=self.config.postflop_use_histogram_sampling,
+                        min_samples_for_histogram=self.config.postflop_min_samples_for_histogram,
                     )
                     logger.info(
                         f"Postflop sizing loaded from "
