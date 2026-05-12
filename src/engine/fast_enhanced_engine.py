@@ -7,6 +7,7 @@ are interchangeable between engines.
 
 import math
 import sys
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -117,25 +118,37 @@ _EQUITY_BATCH_KEYS = []     # list of cache_key for pending predictions
 _EQUITY_BATCH_FEATS = []    # list of feature arrays for pending predictions
 _EQUITY_TORCH = None        # lazy torch import
 
+# When multiple threads hit the equity model concurrently, the global
+# model + cache + batch lists race on CUDA + Python state, producing cuDNN
+# INTERNAL_ERROR and heap corruption. Holding `_EQUITY_LOCK` here protects
+# every caller (web UI workers, offline tools, ad-hoc scripts) from that
+# race without them having to know about it.
+_EQUITY_LOCK = threading.Lock()
+
 
 def _equity_batch_flush():
-    """Run all pending equity predictions in one batched forward() call."""
+    """Run all pending equity predictions in one batched forward() call.
+
+    Holds `_EQUITY_LOCK` across the whole CUDA forward + cache update so
+    concurrent threads cannot race on the model or the batch lists.
+    """
     global _EQUITY_BATCH_KEYS, _EQUITY_BATCH_FEATS, _EQUITY_TORCH
-    if not _EQUITY_BATCH_FEATS or _EQUITY_MODEL is None:
-        return
-    if _EQUITY_TORCH is None:
-        import torch
-        _EQUITY_TORCH = torch
-    batch = np.stack(_EQUITY_BATCH_FEATS)
-    with _EQUITY_TORCH.no_grad():
-        inp = _EQUITY_TORCH.from_numpy(batch)
-        if _EQUITY_DEVICE and _EQUITY_DEVICE != 'cpu':
-            inp = inp.to(_EQUITY_DEVICE)
-        preds = _EQUITY_MODEL(inp).cpu().numpy()
-    for i, key in enumerate(_EQUITY_BATCH_KEYS):
-        _EQUITY_CACHE[key] = preds[i].copy()
-    _EQUITY_BATCH_KEYS.clear()
-    _EQUITY_BATCH_FEATS.clear()
+    with _EQUITY_LOCK:
+        if not _EQUITY_BATCH_FEATS or _EQUITY_MODEL is None:
+            return
+        if _EQUITY_TORCH is None:
+            import torch
+            _EQUITY_TORCH = torch
+        batch = np.stack(_EQUITY_BATCH_FEATS)
+        with _EQUITY_TORCH.no_grad():
+            inp = _EQUITY_TORCH.from_numpy(batch)
+            if _EQUITY_DEVICE and _EQUITY_DEVICE != 'cpu':
+                inp = inp.to(_EQUITY_DEVICE)
+            preds = _EQUITY_MODEL(inp).cpu().numpy()
+        for i, key in enumerate(_EQUITY_BATCH_KEYS):
+            _EQUITY_CACHE[key] = preds[i].copy()
+        _EQUITY_BATCH_KEYS.clear()
+        _EQUITY_BATCH_FEATS.clear()
 
 
 def _encode_card_for_equity(rank_char, suit_char):
@@ -345,33 +358,59 @@ def _equity_model_predict(hole_ranks, hole_suits, board_ranks, board_suits,
 
     Flow: cache hit → return instantly.  Cache miss → encode features, add
     to batch queue, flush batch (single forward() call), return from cache.
+
+    Holds `_EQUITY_LOCK` across the read-modify-flush sequence so two
+    threads can't enqueue and flush concurrently.
     """
     if _EQUITY_MODEL is None:
         return None
 
     cache_key = (tuple(hole_ranks[:2]), tuple(hole_suits[:2]),
                  tuple(board_ranks[:5]), tuple(board_suits[:5]), n_opponents)
+    # Fast path: lock-free cache hit. dict.get is atomic under GIL.
     cached = _EQUITY_CACHE.get(cache_key)
     if cached is not None:
         return cached.copy()
 
-    # Cache miss — encode and queue for batched inference
+    # Cache miss — encode and queue for batched inference. The whole
+    # enqueue+flush happens under _EQUITY_LOCK to prevent two threads from
+    # interleaving append() / flush() / clear() on the batch lists.
     global _EQUITY_INPUT_SIZE
-    if _EQUITY_INPUT_SIZE is None:
-        first_param = next(_EQUITY_MODEL.parameters())
-        _EQUITY_INPUT_SIZE = first_param.shape[1] if first_param.dim() == 2 else 82
+    with _EQUITY_LOCK:
+        if _EQUITY_INPUT_SIZE is None:
+            first_param = next(_EQUITY_MODEL.parameters())
+            _EQUITY_INPUT_SIZE = first_param.shape[1] if first_param.dim() == 2 else 82
 
-    features = _equity_build_features(hole_ranks, hole_suits,
-                                       board_ranks, board_suits,
-                                       _EQUITY_INPUT_SIZE, n_opponents)
-    _EQUITY_BATCH_KEYS.append(cache_key)
-    _EQUITY_BATCH_FEATS.append(features)
+        # Re-check the cache: another thread may have just computed this
+        # exact key while we were waiting for the lock.
+        cached = _EQUITY_CACHE.get(cache_key)
+        if cached is not None:
+            return cached.copy()
 
-    # Flush immediately — the caller needs the result now.
-    # Batching still helps because multiple calls between cache clears
-    # accumulate; and the cache prevents re-computation on repeats.
-    # For true deferred batching, call _equity_batch_flush() explicitly.
-    _equity_batch_flush()
+        features = _equity_build_features(hole_ranks, hole_suits,
+                                           board_ranks, board_suits,
+                                           _EQUITY_INPUT_SIZE, n_opponents)
+        _EQUITY_BATCH_KEYS.append(cache_key)
+        _EQUITY_BATCH_FEATS.append(features)
+
+        # Inline the flush logic here (rather than calling
+        # _equity_batch_flush, which would deadlock on the same lock —
+        # threading.Lock is non-reentrant).
+        if _EQUITY_BATCH_FEATS and _EQUITY_MODEL is not None:
+            global _EQUITY_TORCH
+            if _EQUITY_TORCH is None:
+                import torch as _torch
+                _EQUITY_TORCH = _torch
+            batch = np.stack(_EQUITY_BATCH_FEATS)
+            with _EQUITY_TORCH.no_grad():
+                inp = _EQUITY_TORCH.from_numpy(batch)
+                if _EQUITY_DEVICE and _EQUITY_DEVICE != 'cpu':
+                    inp = inp.to(_EQUITY_DEVICE)
+                preds = _EQUITY_MODEL(inp).cpu().numpy()
+            for i, k in enumerate(_EQUITY_BATCH_KEYS):
+                _EQUITY_CACHE[k] = preds[i].copy()
+            _EQUITY_BATCH_KEYS.clear()
+            _EQUITY_BATCH_FEATS.clear()
 
     cached = _EQUITY_CACHE.get(cache_key)
     if cached is not None:
@@ -393,38 +432,41 @@ def _equity_model_predict_batch(requests):
     if _EQUITY_MODEL is None:
         return [None] * len(requests)
 
-    if _EQUITY_INPUT_SIZE is None:
-        first_param = next(_EQUITY_MODEL.parameters())
-        _EQUITY_INPUT_SIZE = first_param.shape[1] if first_param.dim() == 2 else 82
-    if _EQUITY_TORCH is None:
-        import torch
-        _EQUITY_TORCH = torch
+    # Whole call holds _EQUITY_LOCK so concurrent threads can't race on
+    # the model forward pass or the cache.
+    with _EQUITY_LOCK:
+        if _EQUITY_INPUT_SIZE is None:
+            first_param = next(_EQUITY_MODEL.parameters())
+            _EQUITY_INPUT_SIZE = first_param.shape[1] if first_param.dim() == 2 else 82
+        if _EQUITY_TORCH is None:
+            import torch
+            _EQUITY_TORCH = torch
 
-    results = [None] * len(requests)
-    to_compute = []  # (index, cache_key, features)
+        results = [None] * len(requests)
+        to_compute = []  # (index, cache_key, features)
 
-    for i, (hr, hs, br, bs) in enumerate(requests):
-        key = (tuple(hr[:2]), tuple(hs[:2]), tuple(br[:5]), tuple(bs[:5]))
-        cached = _EQUITY_CACHE.get(key)
-        if cached is not None:
-            results[i] = cached.copy()
-        else:
-            feats = _equity_build_features(hr, hs, br, bs, _EQUITY_INPUT_SIZE)
-            to_compute.append((i, key, feats))
+        for i, (hr, hs, br, bs) in enumerate(requests):
+            key = (tuple(hr[:2]), tuple(hs[:2]), tuple(br[:5]), tuple(bs[:5]))
+            cached = _EQUITY_CACHE.get(key)
+            if cached is not None:
+                results[i] = cached.copy()
+            else:
+                feats = _equity_build_features(hr, hs, br, bs, _EQUITY_INPUT_SIZE)
+                to_compute.append((i, key, feats))
 
-    if to_compute:
-        batch = np.stack([f for _, _, f in to_compute])
-        with _EQUITY_TORCH.no_grad():
-            inp = _EQUITY_TORCH.from_numpy(batch)
-            if _EQUITY_DEVICE and _EQUITY_DEVICE != 'cpu':
-                inp = inp.to(_EQUITY_DEVICE)
-            preds = _EQUITY_MODEL(inp).cpu().numpy()
-        for j, (i, key, _) in enumerate(to_compute):
-            pred = preds[j].copy()
-            if len(_EQUITY_CACHE) >= _EQUITY_CACHE_MAX:
-                _EQUITY_CACHE.clear()
-            _EQUITY_CACHE[key] = pred
-            results[i] = pred
+        if to_compute:
+            batch = np.stack([f for _, _, f in to_compute])
+            with _EQUITY_TORCH.no_grad():
+                inp = _EQUITY_TORCH.from_numpy(batch)
+                if _EQUITY_DEVICE and _EQUITY_DEVICE != 'cpu':
+                    inp = inp.to(_EQUITY_DEVICE)
+                preds = _EQUITY_MODEL(inp).cpu().numpy()
+            for j, (i, key, _) in enumerate(to_compute):
+                pred = preds[j].copy()
+                if len(_EQUITY_CACHE) >= _EQUITY_CACHE_MAX:
+                    _EQUITY_CACHE.clear()
+                _EQUITY_CACHE[key] = pred
+                results[i] = pred
 
     return results
 

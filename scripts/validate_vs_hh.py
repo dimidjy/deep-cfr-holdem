@@ -73,6 +73,13 @@ from src.decision_engine import (
     IDX_EQUITY as _HAND_STRENGTH_IDX,
 )
 
+# Optional callback to perturb model_strategy after it's produced by strategy_fn.
+# When non-None, scripts/research_weaknesses.py uses this to A/B-test strategy
+# shifts on filtered decision buckets. Signature: (dp, base_strategy, legal) -> np.ndarray.
+# Only fires on the postflop (non-preflop-range) branch of both
+# analyze_decision_points and compute_showdown_ev.
+_STRATEGY_PERTURBATION = None
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Strategy functions
@@ -394,6 +401,8 @@ def analyze_decision_points(deep_cfr, decision_points: list,
                 dp.hole_cards, pf_rel, pot_bb, legal, deep_cfr.action_size)
         else:
             model_strategy = strategy_fn(dp.observation, rel_pos, legal)
+            if _STRATEGY_PERTURBATION is not None:
+                model_strategy = _STRATEGY_PERTURBATION(dp, model_strategy, legal)
 
         actual = dp.actual_action
         street = dp.street
@@ -736,6 +745,8 @@ def compute_showdown_ev(showdown_hands: list, all_decision_points: list,
                         deep_cfr.action_size)
                 else:
                     model_strategy = strategy_fn(dp.observation, rel_pos, legal)
+                    if _STRATEGY_PERTURBATION is not None:
+                        model_strategy = _STRATEGY_PERTURBATION(dp, model_strategy, legal)
 
                 model_top = int(np.argmax(model_strategy))
                 actual = dp.actual_action
@@ -1428,6 +1439,15 @@ def main():
                         help='Force re-parse, ignore cached data')
     parser.add_argument('--exploit', type=float, default=0.0,
                         help='Exploit factor 0.0-1.0 (0=GTO, 1=max exploit vs fish)')
+    parser.add_argument('--action-sample-cap', type=float, default=0.0,
+                        help='Threshold-sample mode: when > 0, sample from '
+                             'model strategy restricted to legal actions with '
+                             'prob >= cap (renormalized). Replaces argmax in '
+                             'analyze_decision_points / compute_showdown_ev. '
+                             '0 = argmax (default).')
+    parser.add_argument('--sample-seed', type=int, default=0,
+                        help='RNG seed for threshold sampling. Same seed → '
+                             'same trajectory of sampled actions (reproducible).')
     parser.add_argument('--no-preflop-ranges', action='store_true',
                         help='Disable preflop range override (default: ranges enabled)')
     parser.add_argument('--use-preflop-lookup', action='store_true',
@@ -1714,6 +1734,39 @@ def main():
         sfn = lambda obs, idx, lg: _current_strategy(deep_cfr, obs, idx, lg)
     else:
         sfn = lambda obs, idx, lg: _avg_strategy(deep_cfr, obs, idx, lg)
+
+    # ── Threshold sampling wrapper ──────────────────────────────────────
+    # When --action-sample-cap > 0, replace the model's strategy with a
+    # one-hot at a sampled action. The sample is drawn from the model's
+    # distribution restricted to legal actions with prob ≥ cap (renormalized).
+    # Downstream argmax() in analyze_decision_points / compute_showdown_ev
+    # picks the sampled action — equivalent to making the model sample
+    # instead of arg-maxing. Falls back to argmax when no legal action
+    # meets the cap.
+    if args.action_sample_cap > 0:
+        cap = float(args.action_sample_cap)
+        rng = np.random.default_rng(args.sample_seed)
+        _base_sfn = sfn
+
+        def sfn(obs, idx, lg):
+            strat = np.asarray(_base_sfn(obs, idx, lg), dtype=np.float64)
+            if strat.size == 0:
+                return strat
+            # Mask to legal actions ≥ cap
+            kept_idx = [a for a in lg if a < len(strat) and strat[a] >= cap]
+            if not kept_idx:
+                return strat  # fallback: original strategy (argmax-equivalent)
+            probs = np.array([strat[a] for a in kept_idx])
+            s = probs.sum()
+            if s <= 0:
+                return strat
+            probs = probs / s
+            sampled = int(rng.choice(kept_idx, p=probs))
+            one_hot = np.zeros_like(strat, dtype=np.float32)
+            one_hot[sampled] = 1.0
+            return one_hot
+
+        print(f'  Threshold sampling enabled: cap={cap:.2f}, seed={args.sample_seed}')
 
     metrics = analyze_decision_points(
         deep_cfr, all_decision_points, sfn, num_players,

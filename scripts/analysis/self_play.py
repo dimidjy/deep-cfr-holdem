@@ -1435,6 +1435,16 @@ def main():
                         help='Disable histogram-based bet-size sampling and use the '
                              'deterministic p25/p75 percentile path instead. Useful '
                              'for A/B comparisons with the new randomized sizing.')
+    # ── Threshold-sample sampling knobs (research mode) ──
+    parser.add_argument('--action-sample-cap', type=float, default=0.0,
+                        help='Engine A: when > 0, sample from model strategy '
+                             'restricted to legal actions with prob >= cap. '
+                             'Replaces argmax (and bypasses bet_over_check / '
+                             'mix_raise_sizes / raise_randomize). 0 = argmax.')
+    parser.add_argument('--vs-action-sample-cap', type=float, default=0.0,
+                        help='Engine B: same as --action-sample-cap but for '
+                             'the opponent engine. Default 0 = argmax. Use '
+                             'when running sampled-vs-argmax A/B tests.')
     args = parser.parse_args()
 
     vs_mode = bool(args.vs_facing_bet) or bool(args.archetype) or bool(args.opponent_model)
@@ -1462,7 +1472,14 @@ def main():
         _dc_kwargs['postflop_min_samples_for_promotion'] = args.postflop_min_samples_for_promotion
     if args.no_postflop_histogram:
         _dc_kwargs['postflop_use_histogram_sampling'] = False
+    if args.action_sample_cap > 0:
+        _dc_kwargs['action_sample_cap'] = args.action_sample_cap
     dc = DecisionConfig(**_dc_kwargs)
+    # Engine B uses a separate DecisionConfig so its action_sample_cap can
+    # differ from A's (enables A/B tests of sampled vs argmax on same model).
+    _dc_b_kwargs = dict(_dc_kwargs)
+    _dc_b_kwargs['action_sample_cap'] = args.vs_action_sample_cap
+    dc_b = DecisionConfig(**_dc_b_kwargs)
     engine = DecisionEngine(dc)
     if args.model:
         # Single Deep CFR checkpoint — use for all spots
@@ -1485,7 +1502,7 @@ def main():
     if args.archetype or args.opponent_model:
         # Load separate opponent model if specified, otherwise use engine A
         if args.opponent_model:
-            opp_engine = DecisionEngine(dc)
+            opp_engine = DecisionEngine(dc_b)
             opp_engine.load_models(
                 facing_bet=args.opponent_model,
                 checked_to=args.opponent_model,
@@ -1504,7 +1521,7 @@ def main():
             engine_b = opp_engine
             print(f'  Engine B: {opp_label}')
     elif vs_mode:
-        engine_b = DecisionEngine(dc)
+        engine_b = DecisionEngine(dc_b)
         engine_b.load_models(
             facing_bet=args.vs_facing_bet,
             checked_to=args.vs_checked_to or args.model_checked_to,

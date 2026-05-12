@@ -210,18 +210,7 @@ class ObservationBuilder:
                 player_idx = i
                 break
 
-        # >>> TEMP REVERT TO BUGGY POSITION CALC FOR A/B TEST <<<
-        # Reproduces the pre-2026-04-25 bug where, when the BTN seat is
-        # inactive (dead button), button_idx silently stays at 0 because the
-        # loop never matches — making the first active player look like BTN.
-        # To restore correct behavior, replace this block with:
-        #     rel_pos = game_state.compute_rel_pos()
-        button_idx = 0
-        for i, p in enumerate(players):
-            if p.seat == game_state.button_seat:
-                button_idx = i
-        rel_pos = (player_idx - button_idx) % self.num_players
-        # >>> END TEMP REVERT <<<
+        rel_pos = game_state.compute_rel_pos()
 
         hole_cards = [str(c) for c in my_player.hole_cards]
         community = [str(c) for c in game_state.community_cards]

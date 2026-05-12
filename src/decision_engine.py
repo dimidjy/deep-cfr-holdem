@@ -201,6 +201,12 @@ class DecisionConfig:
                                   # a small bet (Raise½) — "trust the model
                                   # that betting is correct when combined
                                   # raise probability beats check"
+    # Threshold-sample: when > 0, replaces argmax. Zero out any legal action
+    # with prob < cap, renormalize the remainder, then sample from that
+    # distribution. Bypasses all post-argmax overrides (bet_over_check,
+    # mix_raise_sizes, raise_randomize). Used to test whether stochastic
+    # play above a confidence floor outperforms strict argmax. 0 = disabled.
+    action_sample_cap: float = 0.0
 
     # Low-stakes postflop sampling: in small short-handed pots (≤3 active,
     # pot ≤8 BB), sample the action stochastically from the model's full
@@ -701,6 +707,24 @@ class DecisionEngine:
         # doesn't output — treat as probability 0)
         def _prob(a: int) -> float:
             return strategy[a] if 0 <= a < len(strategy) else 0.0
+
+        # ── Threshold sampling (research mode) ──────────────────────────
+        # When action_sample_cap > 0, sample from the model's distribution
+        # restricted to legal actions whose prob ≥ cap. Bypasses all the
+        # heuristic overrides below — used to A/B-test stochastic play vs
+        # argmax. Falls back to argmax-over-legal if no legal action meets
+        # the cap (avoids picking uniformly from very-low-prob actions).
+        cap = float(getattr(self.config, 'action_sample_cap', 0.0))
+        if cap > 0:
+            kept = [(a, _prob(a)) for a in legal_actions if _prob(a) >= cap]
+            if kept:
+                acts = [a for a, _ in kept]
+                probs = np.array([p for _, p in kept], dtype=np.float64)
+                s = probs.sum()
+                if s > 0:
+                    probs /= s
+                    return int(np.random.choice(acts, p=probs))
+            # No legal action ≥ cap → fall through to argmax fallback below.
 
         best_action = legal_actions[0]
         best_prob = -1.0
