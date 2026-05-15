@@ -49,4 +49,7 @@ poker/*
 lasts/*
 *.png
 logs/*
-scripts/analysis/results/*.txt
+scripts/analysis/results/*
+tournament_*/*
+
+debug_report.html

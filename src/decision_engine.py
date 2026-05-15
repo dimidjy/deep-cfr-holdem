@@ -159,6 +159,19 @@ class DecisionConfig:
     preflop_min_samples_exact: int = 5      # L0 (hole, pos, hist, stack, nta)
     preflop_min_samples_no_nta: int = 3     # L1 (drop num_to_act)
     preflop_min_samples_no_stack: int = 5   # L2 (drop stack_bucket)
+    # Per-position play_rate gate override for the preflop lookup. Keys
+    # MUST be the spot_key position labels: BTN / SB / BB / LJ / HJ / CO.
+    # When a spot's position is in this dict, its value overrides the
+    # global `preflop_min_play_rate` at L0/L1/L2. Higher value = stricter
+    # gate (fold more marginal hands from the cohort's wider band); lower
+    # value = looser gate (open wider). This is the lever that actually
+    # shapes range SIZE — the cohort's raise_pct is effectively binary
+    # (≥95% on virtually every kept row), so per-row mixing multipliers
+    # have no effect. Defaults below tighten BTN by 20% (0.25 → 0.30) and
+    # loosen non-BTN by 20% (0.25 → 0.20).
+    preflop_pos_min_play_rate: Dict[str, float] = field(default_factory=lambda: {
+        'BTN': 0.30, 'SB': 0.20, 'BB': 0.20, 'LJ': 0.20, 'HJ': 0.20, 'CO': 0.20,
+    })
 
     # Postflop sizing (data-driven cohort sizes for bets/raises)
     use_postflop_sizing: bool = True
@@ -386,7 +399,9 @@ class DecisionEngine:
                                 min_play_rate_vs_3bet=(
                                     self.config.preflop_min_play_rate_vs_3bet),
                                 min_play_rate_vs_4bet=(
-                                    self.config.preflop_min_play_rate_vs_4bet))
+                                    self.config.preflop_min_play_rate_vs_4bet),
+                                pos_min_play_rate=(
+                                    self.config.preflop_pos_min_play_rate))
                         logger.info(
                             f"Preflop lookup loaded from "
                             f"{self.config.preflop_db_path} "

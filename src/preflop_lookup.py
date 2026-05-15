@@ -94,7 +94,8 @@ class PreflopLookup:
                  min_play_rate_vs_3bet: Optional[float] = None,  # DEPRECATED
                  min_play_rate_vs_4bet: Optional[float] = None,  # DEPRECATED
                  l2_large_call_bb: float = 30.0,
-                 l2_large_call_play_rate: float = 0.40):
+                 l2_large_call_play_rate: float = 0.40,
+                 pos_min_play_rate: Optional[Dict[str, float]] = None):
         """
         Thresholds tuned for showdown-only HH bias. Rationale:
         - L0 exact: need a few confirmations to trust precise spot strategy.
@@ -141,6 +142,13 @@ class PreflopLookup:
                 "and cohort data only for raise sizing.")
         self._l2_large_call_bb = l2_large_call_bb
         self._l2_large_call_play_rate = l2_large_call_play_rate
+        # Per-position play_rate gate override. When a spot's `spot.position`
+        # is in this dict, use the dict value as the play_rate threshold
+        # instead of the global `min_play_rate`. Use to tighten one position
+        # (higher gate → folds more of the cohort's wider marginal band) or
+        # widen another (lower gate → opens more marginal hands). Hands
+        # missing from the dict use the global `min_play_rate`.
+        self._pos_min_play_rate: Dict[str, float] = pos_min_play_rate or {}
         if not Path(db_path).exists():
             raise FileNotFoundError(
                 f'Preflop lookup DB not found at {db_path}. '
@@ -181,6 +189,10 @@ class PreflopLookup:
             f"L2:{min_samples_no_stack} "
             f"play_rate(open/vs_raise)>={min_play_rate:.2f} "
             f"vs_3bet/vs_4bet+: static-action + cohort-size")
+        if self._pos_min_play_rate:
+            logger.info(
+                f"PreflopLookup pos_min_play_rate={self._pos_min_play_rate} "
+                f"(overrides global {min_play_rate:.2f} per position)")
 
     def reset_counters(self) -> None:
         for k in self._counters:
@@ -272,12 +284,14 @@ class PreflopLookup:
                 play_rate = self._play_rate(
                     spot.hole_class, spot.position, spot.action_history,
                     spot.stack_bucket, row['n_samples'], 'L0_exact')
-                if play_rate < self._min_play_rate:
+                min_pr = self._pos_min_play_rate.get(
+                    spot.position, self._min_play_rate)
+                if play_rate < min_pr:
                     self._log_decision(
                         'L3_fold_default', spot, row['n_samples'],
                         None, None,
                         extra=(f"play_rate={play_rate*100:.1f}% "
-                               f"< {self._min_play_rate*100:.0f}%"))
+                               f"< {min_pr*100:.0f}% (pos={spot.position})"))
                     return self._fold_default(legal_actions, action_size), None
                 strategy, custom_size = self._row_to_strategy(
                     row, legal_actions, action_size, pot_bb, call_amount_bb,
@@ -296,12 +310,14 @@ class PreflopLookup:
                 play_rate = self._play_rate(
                     spot.hole_class, spot.position, spot.action_history,
                     spot.stack_bucket, row['n_samples'], 'L1_no_nta')
-                if play_rate < self._min_play_rate:
+                min_pr = self._pos_min_play_rate.get(
+                    spot.position, self._min_play_rate)
+                if play_rate < min_pr:
                     self._log_decision(
                         'L3_fold_default', spot, row['n_samples'],
                         None, None,
                         extra=(f"play_rate={play_rate*100:.1f}% "
-                               f"< {self._min_play_rate*100:.0f}%"))
+                               f"< {min_pr*100:.0f}% (pos={spot.position})"))
                     return self._fold_default(legal_actions, action_size), None
                 strategy, custom_size = self._row_to_strategy(
                     row, legal_actions, action_size, pot_bb, call_amount_bb,
@@ -327,13 +343,15 @@ class PreflopLookup:
                 # blind fold default; the cohort's "play_rate" estimate may
                 # be biased low at coarse keys but the static range still
                 # encodes solid baseline strategy.
-                if play_rate < self._min_play_rate:
+                min_pr = self._pos_min_play_rate.get(
+                    spot.position, self._min_play_rate)
+                if play_rate < min_pr:
                     return self._static_or_fold(
                         spot, row['n_samples'], hole_cards, rel_pos, pot_bb,
                         legal_actions, action_size, num_limpers,
                         effective_stack, num_callers,
                         reason=(f"L2 play_rate={play_rate*100:.1f}% "
-                                f"< {self._min_play_rate*100:.0f}%"))
+                                f"< {min_pr*100:.0f}% (pos={spot.position})"))
                 # Stack-pooled rows are also dangerous when the decision
                 # commits a lot of chips (jam-call defense). Require a
                 # higher confidence floor for large calls; otherwise defer
