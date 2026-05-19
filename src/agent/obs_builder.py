@@ -113,6 +113,7 @@ _BETTING_LINE_NAMES = [
 ]
 BETTING_LINE_DIM = 3
 _EQUITY_VS_ODDS_NAMES = ['equity_vs_odds']
+_THREAT_RANGE_NAMES = ['equity_vs_threat_range']
 _OPP_PROFILE_NAMES = [
     'opp_vpip', 'opp_pfr', 'opp_af_norm', 'opp_fold_to_cbet', 'opp_wtsd',
 ]
@@ -121,7 +122,8 @@ _OPP_PROFILE_NAMES = [
 def feature_names(num_players: int = 6, pad_to_6p: bool = True,
                   behavioral_stats: bool = True,
                   equity_vs_odds: bool = True,
-                  opp_profile: bool = False) -> List[str]:
+                  opp_profile: bool = False,
+                  threat_range_equity: bool = False) -> List[str]:
     """Return ordered feature names matching ObservationBuilder.build() output.
 
     Pass the same constructor flags used for the builder to get matching names.
@@ -148,6 +150,8 @@ def feature_names(num_players: int = 6, pad_to_6p: bool = True,
         names += _OPP_PROFILE_NAMES
     if equity_vs_odds:
         names += _EQUITY_VS_ODDS_NAMES
+    if threat_range_equity:
+        names += _THREAT_RANGE_NAMES
     return names
 
 
@@ -160,11 +164,13 @@ class ObservationBuilder:
     """
 
     def __init__(self, num_players: int = 6, pad_to_6p: bool = False,
-                 behavioral_stats: bool = False, equity_vs_odds: bool = False):
+                 behavioral_stats: bool = False, equity_vs_odds: bool = False,
+                 threat_range_equity: bool = False):
         self.num_players = num_players
         self.pad_to_6p = pad_to_6p and num_players < 6
         self.behavioral_stats = behavioral_stats
         self.equity_vs_odds = equity_vs_odds
+        self.threat_range_equity = threat_range_equity
 
     def build(self, game_state: GameState,
               opponent_profile: np.ndarray = None,
@@ -222,7 +228,10 @@ class ObservationBuilder:
         features.append(self._hand_strength_features(hole_cards))
         features.append(self._stack_features(game_state, players, player_idx))
         n_opponents = max(len([p for p in players if p.is_active]) - 1, 1)
-        features.append(self._equity_features(hole_cards, community, n_opponents))
+        features.append(self._equity_features(hole_cards, community, n_opponents,
+                                                game_state=game_state, players=players,
+                                                hero_has_initiative=hero_has_initiative_override,
+                                                hand_raise_count=hand_raise_count_override))
         features.append(self._street_features(game_state.street))
         features.append(self._game_state_features(game_state, players, player_idx))
         features.append(self._betting_history_features(game_state, players, player_idx))
@@ -251,7 +260,50 @@ class ObservationBuilder:
             evo = np.clip(equity - equity_needed, -1.0, 1.0)
             obs = np.append(obs, np.float32(evo))
 
+        # threat_range_equity is now merged into obs[18] inside _equity_features
+        # (no longer appended as a separate dim). Flag retained for API compat.
         return obs
+
+    def _compute_opp_range_spot_key(self, game_state, players, player_idx,
+                                      obs, bh_hist_start, behavioral_start):
+        """Build OppRangeSpotKey from current game state. Returns None on
+        any failure or for preflop (DB is postflop-only).
+        """
+        if game_state.street == 'preflop':
+            return None
+        try:
+            from src.opp_range_spot_key import build_opp_range_spot_key
+            num_active = len(players)
+            my_player = players[player_idx]
+            effective_stack = my_player.stack
+            pot_bb = max(game_state.pot_total / game_state.big_blind, 0.5)
+            eff_bb = max(effective_stack / game_state.big_blind, 0.5)
+            rel_pos = game_state.compute_rel_pos()
+            # Use hero_has_initiative (betting_line[1]) as proxy for
+            # was_preflop_raiser. betting_line starts at behavioral_start+8.
+            betting_line_start = behavioral_start + 8
+            if len(obs) > betting_line_start + 1:
+                hero_has_initiative = float(obs[betting_line_start + 1])
+            else:
+                hero_has_initiative = 0.0
+            was_pf_raiser = bool(hero_has_initiative >= 0.5)
+            # facing_bet_size_pct: opp's max bet / pot
+            opp_bets = [p.bet_current_round for i, p in enumerate(players)
+                         if i != player_idx]
+            max_opp_bet = max(opp_bets) if opp_bets else 0.0
+            facing_bet_pct = None
+            if max_opp_bet > my_player.bet_current_round:
+                pot_before = max(game_state.pot_total - max_opp_bet, 1.0)
+                facing_bet_pct = (max_opp_bet - my_player.bet_current_round) / pot_before
+            return build_opp_range_spot_key(
+                street=game_state.street, obs=obs,
+                rel_pos=rel_pos, num_active=num_active,
+                effective_stack_bb=eff_bb, pot_bb=pot_bb,
+                was_preflop_raiser=was_pf_raiser,
+                facing_bet_size_pct=facing_bet_pct,
+            )
+        except Exception:
+            return None
 
     def get_position_label(self, game_state: GameState) -> str:
         n = max(len(game_state.active_players), 1)
@@ -331,7 +383,11 @@ class ObservationBuilder:
 
     def _equity_features(self, hole_cards: List[str],
                          community_cards: List[str],
-                         n_opponents: int = 1) -> np.ndarray:
+                         n_opponents: int = 1,
+                         game_state=None,
+                         players=None,
+                         hero_has_initiative=None,
+                         hand_raise_count=None) -> np.ndarray:
         if len(hole_cards) < 2:
             return np.zeros(9, dtype=np.float32)
 
@@ -352,11 +408,27 @@ class ObservationBuilder:
                                               board_ranks, board_suits, None, None,
                                               n_opponents=n_opponents)
                 if pred is not None:
+                    # Override obs[18] with tier-aware equity if state available
+                    if community_cards and players is not None:
+                        tre = self._compute_obs18_threat_equity(
+                            hole_cards, community_cards, players,
+                            hero_has_initiative=hero_has_initiative,
+                            hand_raise_count=hand_raise_count)
+                        if tre > 0.0:
+                            pred = pred.copy()
+                            pred[0] = np.float32(tre)
                     return pred
         except Exception:
             pass
 
-        if _EVAL7_AVAILABLE:
+        # Tier-aware equity (replaces equity-vs-random). Postflop only;
+        # preflop value is discarded below (returns zeros at line ~426).
+        if community_cards and _EVAL7_AVAILABLE and players is not None:
+            hand_strength = self._compute_obs18_threat_equity(
+                hole_cards, community_cards, players,
+                hero_has_initiative=hero_has_initiative,
+                hand_raise_count=hand_raise_count)
+        elif _EVAL7_AVAILABLE:
             try:
                 e7_hole = [_eval7.Card(c) for c in hole_cards[:2]]
                 e7_board = [_eval7.Card(c) for c in community_cards] if community_cards else []
@@ -365,7 +437,6 @@ class ObservationBuilder:
                     hand_strength = _eval7.py_hand_vs_range_monte_carlo(
                         e7_hole, _EVAL7_RANDOM_RANGE, e7_board, n_samples)
                 else:
-                    # Multiway equity: simulate vs N random opponents
                     hand_strength = self._multiway_equity(
                         e7_hole, e7_board, n_opponents, 500)
             except Exception:
@@ -480,6 +551,74 @@ class ObservationBuilder:
              top_pair, board_pairing_level, board_flush_texture,
              board_straight_texture, hand_rank_within_cat],
             dtype=np.float32)
+
+    def _compute_obs18_threat_equity(self, hole_cards: List[str],
+                                       community_cards: List[str],
+                                       players,
+                                       hero_has_initiative=None,
+                                       hand_raise_count=None) -> float:
+        """Tier-aware equity for obs[18]. Mirrors the engine's helper.
+
+        Reads per-street aggression from `players[i].bet_current_round` and
+        board texture from `community_cards`. Returns 0.0 on any error.
+
+        `hero_has_initiative` (bool, optional): if False AND
+        `hand_raise_count` > 0, opp has aggressed at some point this hand
+        — tier lifts from 0 → 1 even on checked-through streets.
+        """
+        try:
+            if len(hole_cards) < 2 or not community_cards:
+                return 0.0
+            from src.range_equity import (
+                select_threat_tier, get_threat_range_equity)
+            # Per-street tier signals from agent player state
+            big_blind = 1.0   # parser normalizes to BB units
+            max_opp_bet = max((getattr(p, 'bet_current_round', 0) for p in players),
+                                default=0)
+            pot_was_raised = 1.0 if max_opp_bet > big_blind else 0.0
+            facing_3bet_plus = 1.0 if max_opp_bet > 6 * big_blind else 0.0
+
+            # Multi-street aggression: did opp aggress at any prior point?
+            # Signal True when hand has had raises AND hero is not the
+            # most recent aggressor (opp is). Default False if unknown.
+            opp_aggressed_this_hand = 0.0
+            if (hero_has_initiative is not None
+                    and hand_raise_count is not None
+                    and not hero_has_initiative
+                    and hand_raise_count > 0):
+                opp_aggressed_this_hand = 1.0
+
+            # Board textures (same as obs[24]/obs[25] later)
+            board_ranks = [_rank_val(c[0]) for c in community_cards]
+            board_suit_counts = {}
+            for c in community_cards:
+                s = c[1]
+                board_suit_counts[s] = board_suit_counts.get(s, 0) + 1
+            max_bs = max(board_suit_counts.values()) if board_suit_counts else 1
+            board_flush_texture = float(np.clip((max_bs - 1) / 3.0, 0.0, 1.0))
+
+            board_ranks_unique = sorted(set(board_ranks))
+            if 14 in board_ranks_unique:
+                board_ranks_unique = sorted(set([1] + board_ranks_unique))
+            consecutive = sum(
+                1 for i in range(len(board_ranks_unique) - 1)
+                if board_ranks_unique[i + 1] - board_ranks_unique[i] == 1)
+            max_possible = max(len(board_ranks_unique) - 1, 1)
+            board_straight_texture = float(consecutive / max_possible)
+
+            tier = select_threat_tier(
+                num_raises_norm=0.0, max_bet_sizing=0.0,
+                facing_3bet_plus=facing_3bet_plus,
+                pot_was_raised=pot_was_raised,
+                board_flush_texture=board_flush_texture,
+                board_straight_texture=board_straight_texture,
+                opp_aggressed_this_hand=opp_aggressed_this_hand)
+
+            return get_threat_range_equity(
+                hole_cards, community_cards, tier,
+                spot_key=None, db_lookup=None, n_samples=300)
+        except Exception:
+            return 0.0
 
     @staticmethod
     def _multiway_equity(hole: list, board: list, n_opponents: int,

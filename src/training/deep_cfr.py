@@ -281,7 +281,14 @@ class ReplayBuffer:
                             total_seen=np.array([self._total_seen]))
 
     def load(self, filepath: str):
-        """Load buffer contents from disk."""
+        """Load buffer contents from disk.
+
+        Auto-adapts to obs dim mismatch (same convention as pool loader
+        in train_gpu.py): if the saved buffer has fewer obs dims than the
+        current buffer, pad each state with zeros at the end (treats new
+        feature columns as if they were 0 when those entries were collected).
+        If the saved buffer has more dims, trim the excess.
+        """
         data = np.load(filepath)
         n = int(data['size'][0])
         if n == 0:
@@ -290,7 +297,20 @@ class ReplayBuffer:
         if n > self.capacity:
             n = self.capacity
 
-        self.states[:n] = data['states'][:n]
+        saved_states = data['states'][:n]
+        target_dim = self.states.shape[1]
+        src_dim = saved_states.shape[1]
+        if src_dim < target_dim:
+            pad = np.zeros((n, target_dim - src_dim), dtype=saved_states.dtype)
+            saved_states = np.concatenate([saved_states, pad], axis=1)
+            print(f'  ReplayBuffer.load: padded {src_dim} → {target_dim} dim '
+                  f'({n:,} entries, new cols zero-init)')
+        elif src_dim > target_dim:
+            saved_states = saved_states[:, :target_dim]
+            print(f'  ReplayBuffer.load: trimmed {src_dim} → {target_dim} dim '
+                  f'({n:,} entries, tail cols dropped)')
+
+        self.states[:n] = saved_states
         self.actions[:n] = data['actions'][:n]
         self.regrets[:n] = data['regrets'][:n]
         self.strategies[:n] = data['strategies'][:n]

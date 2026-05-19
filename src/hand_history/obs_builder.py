@@ -225,7 +225,8 @@ class ObservationBuilder:
                               allow_unknown_cards: bool = False,
                               source_file: str = '',
                               track_action_history: bool = False,
-                              behavioral_stats: bool = False) -> List[DecisionPoint]:
+                              behavioral_stats: bool = False,
+                              threat_range_equity: bool = False) -> List[DecisionPoint]:
         """Replay a hand and build DecisionPoint at each non-blind decision.
 
         Args:
@@ -382,6 +383,8 @@ class ObservationBuilder:
                     bh_features = _bh_compute(bh, player.name)
                     bl_features = _bl_compute(bh, player.name)
                     obs = np.concatenate([obs, bh_features, bl_features])
+
+                # threat_range_equity now merged into obs[18] (no separate dim)
 
                 dp_kwargs = dict(
                     player_name=player.name,
@@ -549,7 +552,8 @@ class ObservationBuilder:
             features.append(self._hand_strength_features(hole))
             features.append(self._stack_features(players, player_idx))
             n_opponents = max(sum(1 for p in players if p.active) - 1, 1)
-            features.append(self._equity_features(hole, community_cards, n_opponents))
+            features.append(self._equity_features(hole, community_cards, n_opponents,
+                                                    players=players))
         else:
             # Neutral card features for unknown hands
             features.append(np.array([0.5, 0.5, 0.5, 0.5, 0.2],
@@ -630,8 +634,14 @@ class ObservationBuilder:
 
     def _equity_features(self, hole_cards: List[str],
                          community_cards: List[str],
-                         n_opponents: int = 1) -> np.ndarray:
-        """8 dims: equity (Monte Carlo) + board texture features."""
+                         n_opponents: int = 1,
+                         players=None) -> np.ndarray:
+        """9 dims: equity + board texture features.
+
+        obs[0]=hand_strength is now tier-aware (was: equity vs uniform random).
+        Requires `players` for per-street aggression signals; without it,
+        falls back to equity-vs-random.
+        """
         if len(hole_cards) < 2:
             return np.zeros(9, dtype=np.float32)
 
@@ -639,8 +649,12 @@ class ObservationBuilder:
         r2 = _rank_val(hole_cards[1][0])
         hi, lo = max(r1, r2), min(r1, r2)
 
-        # Monte Carlo equity — multiway when >1 opponent
-        if _EVAL7_AVAILABLE:
+        # Tier-aware equity (replaces equity-vs-random). Postflop only;
+        # preflop result is discarded by the early return below.
+        if community_cards and _EVAL7_AVAILABLE and players is not None:
+            hand_strength = self._compute_obs18_threat_equity(
+                hole_cards, community_cards, players)
+        elif _EVAL7_AVAILABLE:
             try:
                 e7_hole = [_eval7.Card(c) for c in hole_cards[:2]]
                 e7_board = [_eval7.Card(c) for c in community_cards] if community_cards else []
@@ -649,7 +663,6 @@ class ObservationBuilder:
                     hand_strength = _eval7.py_hand_vs_range_monte_carlo(
                         e7_hole, _EVAL7_RANDOM_RANGE, e7_board, n_samples)
                 else:
-                    # Multiway: fewer samples for speed (training processes millions)
                     hand_strength = self._multiway_equity(
                         e7_hole, e7_board, n_opponents, 200)
             except Exception:
@@ -755,6 +768,56 @@ class ObservationBuilder:
              top_pair, board_pairing_level, board_flush_texture,
              board_straight_texture, hand_rank_within_cat],
             dtype=np.float32)
+
+    def _compute_obs18_threat_equity(self, hole_cards: List[str],
+                                       community_cards: List[str],
+                                       players) -> float:
+        """Tier-aware equity for obs[18] (replaces equity vs random).
+
+        Reads per-street aggression from `players[i].bet_chips` and board
+        texture from `community_cards`. Returns 0.0 on any error.
+        """
+        try:
+            if len(hole_cards) < 2 or not community_cards:
+                return 0.0
+            from src.range_equity import (
+                select_threat_tier, get_threat_range_equity)
+
+            big_blind = 2  # HH builder uses raw chip values; SB=1, BB=2
+            max_opp_bet = max((getattr(p, 'bet_chips', 0) for p in players),
+                                default=0)
+            pot_was_raised = 1.0 if max_opp_bet > big_blind else 0.0
+            facing_3bet_plus = 1.0 if max_opp_bet > 6 * big_blind else 0.0
+
+            board_ranks = [_rank_val(c[0]) for c in community_cards]
+            board_suit_counts = {}
+            for c in community_cards:
+                s = c[1]
+                board_suit_counts[s] = board_suit_counts.get(s, 0) + 1
+            max_bs = max(board_suit_counts.values()) if board_suit_counts else 1
+            board_flush_texture = float(np.clip((max_bs - 1) / 3.0, 0.0, 1.0))
+
+            board_ranks_unique = sorted(set(board_ranks))
+            if 14 in board_ranks_unique:
+                board_ranks_unique = sorted(set([1] + board_ranks_unique))
+            consecutive = sum(
+                1 for i in range(len(board_ranks_unique) - 1)
+                if board_ranks_unique[i + 1] - board_ranks_unique[i] == 1)
+            max_possible = max(len(board_ranks_unique) - 1, 1)
+            board_straight_texture = float(consecutive / max_possible)
+
+            tier = select_threat_tier(
+                num_raises_norm=0.0, max_bet_sizing=0.0,
+                facing_3bet_plus=facing_3bet_plus,
+                pot_was_raised=pot_was_raised,
+                board_flush_texture=board_flush_texture,
+                board_straight_texture=board_straight_texture)
+
+            return get_threat_range_equity(
+                hole_cards, community_cards, tier,
+                spot_key=None, db_lookup=None, n_samples=300)
+        except Exception:
+            return 0.0
 
     @staticmethod
     def _multiway_equity(hole: list, board: list, n_opponents: int,

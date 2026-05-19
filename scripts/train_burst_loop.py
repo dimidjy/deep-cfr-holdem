@@ -258,7 +258,8 @@ def _run_cycle(*,
                selector: str = 'composite',
                hh_hands: int = 10000,
                self_play_hands: int = 10000,
-               composite_weights: dict = None) -> dict:
+               composite_weights: dict = None,
+               threat_range_equity: bool = False) -> dict:
     """Run one training cycle and return cycle stats."""
     cycle_dir.mkdir(parents=True, exist_ok=True)
     print()
@@ -286,6 +287,8 @@ def _run_cycle(*,
     if kbest_seed:
         cmd.append('--kbest-seed')
         cmd.extend(kbest_seed)
+    if threat_range_equity:
+        cmd.append('--threat-range-equity')
 
     print(f'  command: {" ".join(cmd)}\n', flush=True)
 
@@ -399,6 +402,10 @@ def main():
     p.add_argument('--config', type=Path,
                    default=Path('configs/training_config.json'),
                    help='Training config path')
+    p.add_argument('--threat-range-equity', action='store_true',
+                   help='Pass --threat-range-equity to each train_gpu.py cycle. '
+                        'Required when the start checkpoint is 54-dim (trained '
+                        'with the equity_vs_threat_range obs feature).')
     p.add_argument('--kbest-seed', nargs='+', default=None,
                    help='Checkpoints for K-Best opponent pool (frozen across cycles)')
     p.add_argument('--workers', type=int, default=54,
@@ -497,6 +504,7 @@ def main():
             hh_hands=args.hh_hands,
             self_play_hands=args.self_play_hands,
             composite_weights=composite_weights,
+            threat_range_equity=args.threat_range_equity,
         )
         timeline.append(cycle_summary)
 

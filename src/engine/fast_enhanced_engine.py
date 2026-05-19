@@ -494,6 +494,7 @@ class FastEnhancedPokerEngine(FastPokerEngine):
                  behavioral_stats: bool = False,
                  betting_line: bool = True,
                  opponent_profile: bool = False,
+                 threat_range_equity: bool = False,  # accepted, ignored (merged into obs[18])
                  rake_pct: float = 0.0,
                  rake_cap: float = 0.0):
         self.add_position_features = add_position_features
@@ -592,6 +593,80 @@ class FastEnhancedPokerEngine(FastPokerEngine):
         if self._opponent_profile is not None:
             return self._opponent_profile.astype(np.float32)
         return np.zeros(self.OPPONENT_PROFILE_DIM, dtype=np.float32)
+
+    def _compute_obs18_threat_equity(self, hole, board_pkrs) -> float:
+        """Tier-aware equity for obs[18] (hand_strength).
+
+        Replaces equity-vs-uniform-random with equity against a threat-tier
+        range selected from per-street aggression + board signals. Reads
+        engine state directly (no obs lookup) so it can be called inside
+        _get_equity_features BEFORE the obs vector is assembled.
+
+        Returns float in [0,1]; 0.0 on any error or missing board.
+        """
+        try:
+            if len(hole) < 2 or not board_pkrs:
+                return 0.0
+
+            from src.range_equity import (
+                select_threat_tier, get_threat_range_equity)
+
+            # Per-street tier signals from raw engine state
+            big_blind = 2
+            max_opp_bet = max(p.bet_chips for p in self._state.players_state)
+            pot_was_raised = 1.0 if max_opp_bet > big_blind else 0.0
+            facing_3bet_plus = 1.0 if max_opp_bet > 6 * big_blind else 0.0
+
+            # Multi-street aggression: did opp bet/raise on ANY past street?
+            # `last_aggressor` is set by _bh_track_action on aggressive actions.
+            opp_aggressed_this_hand = 0.0
+            if self._bh is not None:
+                last_agg = self._bh.get('last_aggressor')
+                hero_idx = self._cur_idx()
+                if last_agg is not None and last_agg != hero_idx:
+                    opp_aggressed_this_hand = 1.0
+
+            # Board textures from raw cards (same logic as equity block uses
+            # for obs[24] / obs[25] later — small duplication, no obs dep)
+            board_ranks = [self._rank_to_value(_pkrs_card_rank(c))
+                            for c in board_pkrs]
+            board_suit_counts = {}
+            for c in board_pkrs:
+                s = _pkrs_card_suit(c)
+                board_suit_counts[s] = board_suit_counts.get(s, 0) + 1
+            max_bs = max(board_suit_counts.values()) if board_suit_counts else 1
+            board_flush_texture = float(np.clip((max_bs - 1) / 3.0, 0.0, 1.0))
+
+            board_ranks_unique = sorted(set(board_ranks))
+            if 14 in board_ranks_unique:
+                board_ranks_unique = sorted(set([1] + board_ranks_unique))
+            consecutive = sum(
+                1 for i in range(len(board_ranks_unique) - 1)
+                if board_ranks_unique[i + 1] - board_ranks_unique[i] == 1)
+            max_possible = max(len(board_ranks_unique) - 1, 1)
+            board_straight_texture = float(consecutive / max_possible)
+
+            tier = select_threat_tier(
+                num_raises_norm=0.0,    # ignored by selector (per-street fix)
+                max_bet_sizing=0.0,     # ignored
+                facing_3bet_plus=facing_3bet_plus,
+                pot_was_raised=pot_was_raised,
+                board_flush_texture=board_flush_texture,
+                board_straight_texture=board_straight_texture,
+                opp_aggressed_this_hand=opp_aggressed_this_hand)
+
+            hole_strs = [_pkrs_card_rank(c) + _pkrs_card_suit(c).lower()
+                          for c in hole[:2]]
+            board_strs = [_pkrs_card_rank(c) + _pkrs_card_suit(c).lower()
+                           for c in board_pkrs]
+
+            # Tier-only (spot_key=None) — DB-aware refinement skipped to keep
+            # this fast and simple. Tier MC is sufficient for hand_strength.
+            return get_threat_range_equity(
+                hole_strs, board_strs, tier,
+                spot_key=None, db_lookup=None, n_samples=300)
+        except Exception:
+            return 0.0
 
     # ── Helper: quick access to current state ────────────────────────────────
 
@@ -717,19 +792,10 @@ class FastEnhancedPokerEngine(FastPokerEngine):
                 if pred is not None:
                     return pred
 
-            # Fallback: Monte Carlo equity vs random range (eval7)
-            def _to_card_str(c):
-                return _pkrs_card_rank(c) + _pkrs_card_suit(c).lower()
-
-            if _EVAL7_AVAILABLE:
-                try:
-                    e7_hole = [_eval7.Card(_to_card_str(c)) for c in hole[:2]]
-                    e7_board = [_eval7.Card(_to_card_str(c)) for c in board_pkrs] if board_pkrs else []
-                    n_samples = 500 if not board_pkrs else 150
-                    hand_strength = _eval7.py_hand_vs_range_monte_carlo(
-                        e7_hole, _EVAL7_RANDOM_RANGE, e7_board, n_samples)
-                except Exception:
-                    hand_strength = self._approx_preflop_equity(hole)
+            # Tier-aware equity (replaces equity-vs-random). Postflop only;
+            # preflop result is discarded right after this block anyway.
+            if board_pkrs and _EVAL7_AVAILABLE:
+                hand_strength = self._compute_obs18_threat_equity(hole, board_pkrs)
             else:
                 hand_strength = self._approx_preflop_equity(hole)
 

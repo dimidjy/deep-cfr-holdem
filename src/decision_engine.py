@@ -53,6 +53,7 @@ IDX_STRAIGHT_DRAW = 21  # obs[21] = hero_straight_participation (0/0.5/1.0)
 IDX_TOP_PAIR = 22       # obs[22] = top_pair (0 or 1)
 IDX_BOARD_PAIR = 23     # obs[23] = board_pairing_level (0/0.33/0.67/1.0)
 IDX_BOARD_FLUSH = 24    # obs[24] = board_flush_texture
+IDX_BOARD_STRAIGHT = 25 # obs[25] = board_straight_texture
 IDX_RANK_WITHIN_CAT = 26  # obs[26] = hand_rank_within_cat (0=worst..1=best in category)
 IDX_STACK_TO_POT = 9    # obs[9]  = effective_stack / pot (SPR)
 IDX_IS_RIVER = 30       # obs[30] = is_river flag
@@ -170,7 +171,13 @@ class DecisionConfig:
     # have no effect. Defaults below tighten BTN by 20% (0.25 → 0.30) and
     # loosen non-BTN by 20% (0.25 → 0.20).
     preflop_pos_min_play_rate: Dict[str, float] = field(default_factory=lambda: {
-        'BTN': 0.30, 'SB': 0.20, 'BB': 0.20, 'LJ': 0.20, 'HJ': 0.20, 'CO': 0.20,
+        # Position-aware thresholds (2026-05-19 — re-tuned to balance the
+        # cross-position RFI spread). Cohort plays loose from BTN/SB and
+        # tight from EP, so use HIGH thresholds late (trim BTN/SB) and LOW
+        # thresholds early (let LJ/HJ open as wide as the cohort allows).
+        # Target RFI: LJ~18, HJ~21, CO~25, BTN~26, SB~31. See
+        # scripts/analyze_preflop_ranges.py for the calibration data.
+        'BTN': 0.30, 'SB': 0.50, 'BB': 0.30, 'LJ': 0.20, 'HJ': 0.20, 'CO': 0.25,
     })
 
     # Postflop sizing (data-driven cohort sizes for bets/raises)
@@ -220,6 +227,12 @@ class DecisionConfig:
     # mix_raise_sizes, raise_randomize). Used to test whether stochastic
     # play above a confidence floor outperforms strict argmax. 0 = disabled.
     action_sample_cap: float = 0.0
+    # Same as action_sample_cap, but ONLY applies in c-bet spots (pot_odds == 0
+    # AND hero_has_initiative >= 0.5). Surgical fix for "model under-c-bets"
+    # without introducing randomness in face-bet spots (which would cause
+    # random folds/calls). Takes precedence over action_sample_cap in c-bet
+    # spots. 0 = disabled.
+    cbet_action_sample_cap: float = 0.0
 
     # Low-stakes postflop sampling: in small short-handed pots (≤3 active,
     # pot ≤8 BB), sample the action stochastically from the model's full
@@ -729,7 +742,27 @@ class DecisionEngine:
         # heuristic overrides below — used to A/B-test stochastic play vs
         # argmax. Falls back to argmax-over-legal if no legal action meets
         # the cap (avoids picking uniformly from very-low-prob actions).
-        cap = float(getattr(self.config, 'action_sample_cap', 0.0))
+        #
+        # `cbet_action_sample_cap` is a surgical variant: only fires in
+        # c-bet spots (pot_odds == 0 AND hero_has_initiative >= 0.5). All
+        # other spots use argmax (or the global action_sample_cap if set).
+        # Detection requires obs with behavioral_stats + betting_line blocks
+        # — for 6-max pad layout, hero_has_initiative lives at index 51
+        # (pos 8 + pot_odds 3 + hand 5 + stack 2 + equity 9 + street 4 +
+        #  game_state 6 + betting_hist 5 + behavioral 8 = 50; +1 for
+        #  hero_has_initiative inside betting_line).
+        cap_global = float(getattr(self.config, 'action_sample_cap', 0.0))
+        cap_cbet = float(getattr(self.config, 'cbet_action_sample_cap', 0.0))
+        is_cbet_spot = False
+        if cap_cbet > 0 and obs is not None and len(obs) > 51:
+            try:
+                pot_odds = float(obs[10])
+                hero_initiative = float(obs[51])
+                is_cbet_spot = (pot_odds < 0.001 and hero_initiative >= 0.5)
+            except Exception:
+                is_cbet_spot = False
+        cap = cap_cbet if is_cbet_spot else cap_global
+
         if cap > 0:
             kept = [(a, _prob(a)) for a in legal_actions if _prob(a) >= cap]
             if kept:

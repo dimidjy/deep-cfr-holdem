@@ -50,6 +50,6 @@ lasts/*
 *.png
 logs/*
 scripts/analysis/results/*
-tournament_*/*
+tournament/*
 
 debug_report.html

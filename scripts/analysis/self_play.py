@@ -288,7 +288,8 @@ class ArchetypeEngine:
 def run_self_play(engine: DecisionEngine, num_hands: int,
                   num_players: int = 6,
                   engine_b: DecisionEngine = None,
-                  track_range_analysis: bool = False
+                  track_range_analysis: bool = False,
+                  threat_range_equity: bool = False
                   ) -> Dict[int, PlayerStats]:
     """Play num_hands of poker with effective `num_players` seats.
 
@@ -302,7 +303,8 @@ def run_self_play(engine: DecisionEngine, num_hands: int,
     """
     from src.engine.factory import make_engine
     ENGINE_PLAYERS = 6  # always 6-max engine to keep obs shape consistent
-    eng = make_engine(num_players=ENGINE_PLAYERS)
+    eng = make_engine(num_players=ENGINE_PLAYERS,
+                       threat_range_equity=threat_range_equity)
     num_force_fold = max(0, ENGINE_PLAYERS - num_players)
 
     stats = {i: PlayerStats() for i in range(ENGINE_PLAYERS)}
@@ -1389,6 +1391,15 @@ def main():
                         help='Disable 80/20 raise-size randomization (always pick argmax raise).')
     parser.add_argument('--no-preflop-ranges', action='store_true',
                         help='Disable GTO preflop ranges (model plays preflop too)')
+    parser.add_argument('--no-preflop-lookup', action='store_true',
+                        help='Disable cohort preflop_lookup.sqlite (static '
+                             'ranges only). Matches runtime agent_config when '
+                             'use_preflop_lookup=false.')
+    parser.add_argument('--vs-no-preflop-lookup', action='store_true',
+                        help='A-vs-B test with SAME model: engine A uses '
+                             'whatever --no-preflop-lookup is set to, '
+                             'engine B uses the INVERSE. Lets you measure '
+                             'BB/100 edge of static-vs-lookup directly.')
     parser.add_argument('--archetype', type=str, default='',
                         choices=['', 'calling_station', 'nit', 'maniac', 'weak_tight', 'nl5_population'],
                         help='Use archetype as opponent (engine B). '
@@ -1411,6 +1422,16 @@ def main():
                         help='Override DecisionConfig.preflop_min_play_rate '
                              '(default 0.25). Higher values fold marginal hands '
                              'where the cohort plays them less often than AA.')
+    parser.add_argument('--preflop-pos-min-play-rate', type=str, default=None,
+                        help='Override DecisionConfig.preflop_pos_min_play_rate '
+                             'with a JSON dict (e.g. \'{"BTN":0.30,"SB":0.32,'
+                             '"BB":0.22,"LJ":0.35,"HJ":0.32,"CO":0.28}\'). '
+                             'Wrap in single quotes in shell. Matches the same '
+                             'field in the agent config.')
+    parser.add_argument('--threat-range-equity', action='store_true',
+                        help='Set when the model was trained with the '
+                             'equity_vs_threat_range obs feature (+1 dim). '
+                             'Auto-set if the loaded model has 54-dim input.')
     parser.add_argument('--preflop-min-samples-exact', type=int, default=None,
                         help='Override min_samples for L0 exact-key lookup '
                              '(default 5). Higher = more spots fall to L1/L2.')
@@ -1447,7 +1468,9 @@ def main():
                              'when running sampled-vs-argmax A/B tests.')
     args = parser.parse_args()
 
-    vs_mode = bool(args.vs_facing_bet) or bool(args.archetype) or bool(args.opponent_model)
+    vs_mode = (bool(args.vs_facing_bet) or bool(args.archetype)
+               or bool(args.opponent_model)
+               or bool(args.vs_no_preflop_lookup))
 
     print('=' * 70)
     print('SELF-PLAY ANALYSIS' + (' — VS MODE' if vs_mode else ''))
@@ -1456,10 +1479,15 @@ def main():
     # Setup DecisionEngine A
     _dc_kwargs = dict(
         use_preflop_ranges=not args.no_preflop_ranges,
+        use_preflop_lookup=not args.no_preflop_lookup,
         raise_randomize=not args.no_raise_randomize,
     )
     if args.preflop_min_play_rate is not None:
         _dc_kwargs['preflop_min_play_rate'] = args.preflop_min_play_rate
+    if args.preflop_pos_min_play_rate is not None:
+        import json as _json
+        _dc_kwargs['preflop_pos_min_play_rate'] = _json.loads(
+            args.preflop_pos_min_play_rate)
     if args.preflop_min_samples_exact is not None:
         _dc_kwargs['preflop_min_samples_exact'] = args.preflop_min_samples_exact
     if args.preflop_min_samples_no_nta is not None:
@@ -1479,6 +1507,10 @@ def main():
     # differ from A's (enables A/B tests of sampled vs argmax on same model).
     _dc_b_kwargs = dict(_dc_kwargs)
     _dc_b_kwargs['action_sample_cap'] = args.vs_action_sample_cap
+    # A-vs-B preflop-lookup test: B uses the INVERSE of A's setting so we
+    # can measure the static-vs-cohort edge directly.
+    if args.vs_no_preflop_lookup:
+        _dc_b_kwargs['use_preflop_lookup'] = args.no_preflop_lookup  # inverse
     dc_b = DecisionConfig(**_dc_b_kwargs)
     engine = DecisionEngine(dc)
     if args.model:
@@ -1496,6 +1528,18 @@ def main():
         )
     engine.load_preflop_ranges()
     print(f'  Engine A: {engine.info()}')
+
+    # Auto-detect threat_range_equity from loaded model's input dim. 54+
+    # means the model was trained with the feature; engine must match.
+    if not args.threat_range_equity:
+        try:
+            _sz = engine._obs_size_fb or engine._obs_size_ct
+            if _sz and _sz >= 54 and (_sz - 42) % 5 != 0:
+                # 54 = base 42 + bh 11 + threat 1; 55 = +evo too
+                args.threat_range_equity = True
+                print(f'  → auto-enabling threat_range_equity (model obs={_sz})')
+        except Exception:
+            pass
 
     # Setup DecisionEngine B (vs mode or archetype mode)
     engine_b = None
@@ -1522,11 +1566,20 @@ def main():
             print(f'  Engine B: {opp_label}')
     elif vs_mode:
         engine_b = DecisionEngine(dc_b)
+        # When the only vs trigger is --vs-no-preflop-lookup, B uses the same
+        # model as A. --model wins over the legacy default model_checked_to
+        # path that points to a deprecated CQL file.
+        if args.model and not (args.vs_facing_bet or args.vs_checked_to):
+            _vs_fb = args.model
+            _vs_ct = args.model
+        else:
+            _vs_fb = args.vs_facing_bet or args.model_facing_bet
+            _vs_ct = args.vs_checked_to or args.model_checked_to
+        _vs_3b = args.vs_facing_bet_3bet or args.model_facing_bet_3bet
         engine_b.load_models(
-            facing_bet=args.vs_facing_bet,
-            checked_to=args.vs_checked_to or args.model_checked_to,
-            facing_bet_3bet=(args.vs_facing_bet_3bet or args.model_facing_bet_3bet)
-                if Path(args.vs_facing_bet_3bet or args.model_facing_bet_3bet).exists() else '',
+            facing_bet=_vs_fb,
+            checked_to=_vs_ct,
+            facing_bet_3bet=_vs_3b if (_vs_3b and Path(_vs_3b).exists()) else '',
         )
         engine_b.load_preflop_ranges()
         print(f'  Engine B: {engine_b.info()}')
@@ -1553,7 +1606,8 @@ def main():
           f'{"A vs B" if vs_mode else "self-play"}...')
     stats = run_self_play(engine, args.hands, args.players,
                           engine_b=engine_b,
-                          track_range_analysis=args.range_analysis)
+                          track_range_analysis=args.range_analysis,
+                          threat_range_equity=args.threat_range_equity)
 
     # Generate report
     if vs_mode:

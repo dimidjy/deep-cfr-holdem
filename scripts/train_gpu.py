@@ -56,6 +56,50 @@ _REWARD_SCALE = 100.0   # divides chip rewards → regrets in roughly [-1, 1]
 _REGRET_CLIP  = 1.0     # clip bound on regret after scaling
 _RAKE_PCT     = 0.0
 _RAKE_CAP     = 0.0
+_THREAT_RANGE_EQUITY = False  # appends equity_vs_threat_range to obs (+1 dim)
+
+# =============================================================================
+# DEBUG LOGGING — temporary diagnostic, revert via git checkout after testing
+# =============================================================================
+_DEBUG_LOG_DIR = None       # set via --debug-log-dir, propagated to workers
+_DEBUG_SAMPLE_EVERY = 100   # log every Nth sampled event (per worker)
+_DEBUG_TRAV_COUNTER = 0     # per-worker traversal counter
+_DEBUG_BRANCH_COUNTER = 0   # per-worker branch counter
+_DEBUG_OPP_COUNTER = 0      # per-worker opponent-decision counter
+
+
+def _debug_should_sample(counter_attr: str) -> bool:
+    """Increment counter and return True every Nth call."""
+    global _DEBUG_TRAV_COUNTER, _DEBUG_BRANCH_COUNTER, _DEBUG_OPP_COUNTER
+    if _DEBUG_LOG_DIR is None:
+        return False
+    if counter_attr == 'trav':
+        _DEBUG_TRAV_COUNTER += 1
+        return _DEBUG_TRAV_COUNTER % _DEBUG_SAMPLE_EVERY == 0
+    if counter_attr == 'branch':
+        _DEBUG_BRANCH_COUNTER += 1
+        return _DEBUG_BRANCH_COUNTER % _DEBUG_SAMPLE_EVERY == 0
+    if counter_attr == 'opp':
+        _DEBUG_OPP_COUNTER += 1
+        return _DEBUG_OPP_COUNTER % _DEBUG_SAMPLE_EVERY == 0
+    return False
+
+
+def _debug_log(event: str, **fields):
+    """Append a JSONL event to the per-PID log file. No-op if disabled."""
+    if _DEBUG_LOG_DIR is None:
+        return
+    try:
+        fields['event'] = event
+        fields['pid'] = os.getpid()
+        fields['t'] = time.time()
+        path = Path(_DEBUG_LOG_DIR) / f'worker_{os.getpid()}.jsonl'
+        with open(path, 'a') as f:
+            f.write(json.dumps(fields, default=lambda x: float(x)
+                                if hasattr(x, '__float__') else str(x)) + '\n')
+    except Exception:
+        # Never break training because of debug logging
+        pass
 
 # =============================================================================
 # Worker-process globals — set via _worker_init, read by _traversal_worker
@@ -74,7 +118,7 @@ _OPP_PREFLOP_RANGES = None  # wider NL5 ranges — always used for opponents
 _ARCHETYPE_MODE = False     # mixed archetype opponents (extends obs 50→55)
 _DECK_RESHUFFLE = False     # reshuffle undealt cards per branch rollout
 _BLUFF_PENALTY  = 0.0       # penalize raises with equity<threshold (value-only nudge)
-_BLUFF_THRESHOLD = 0.60     # equity below this counts as "bluff" — was 0.50, raised
+_BLUFF_THRESHOLD = 0.33     # equity below this counts as "bluff" — was 0.50, raised
                             # so marginal spots (e.g. 42% 3-way) get meaningful penalty
 _CALL_BONUS     = 0.0       # reward +EV calls (equity > pot_odds_required)
 _VALUE_BONUS    = 0.0       # reward raises with strong equity (any position)
@@ -145,6 +189,7 @@ def _try_rebuild_obs_vector(spot: dict):
                 num_players=6,
                 behavioral_stats=True,
                 equity_vs_odds=True,
+                threat_range_equity=_THREAT_RANGE_EQUITY,
             )
         from src.agent.game_state import GameState
         gs = GameState.from_dict(gs_dict)
@@ -176,7 +221,9 @@ def _worker_init(shared_adv, shared_strat, act_size, use_preflop_ranges=False,
                  allin_monster_rate=0.0, allin_monster_threshold=0.375,
                  bluff_draw_exempt=True, draw_call_boost=0.0, draw_bet_boost=0.0,
                  barrel_fold_bonus=0.0, mid_pair_fold_bonus=0.0,
-                 num_players=6, random_preflop_folds_dist=None):
+                 num_players=6, random_preflop_folds_dist=None,
+                 threat_range_equity=False,
+                 debug_log_dir=None):
     global _SHARED_ADV_NETS, _SHARED_STRAT_NETS, _ACT_SIZE, _PREFLOP_RANGES
     global _ARCHETYPE_MODE, _KBEST_POOL, _OPP_PREFLOP_RANGES
     global _DECK_RESHUFFLE, _BLUFF_PENALTY, _CALL_BONUS, _VALUE_BONUS, _FOLD_PENALTY
@@ -184,6 +231,8 @@ def _worker_init(shared_adv, shared_strat, act_size, use_preflop_ranges=False,
     global _BLUFF_DRAW_EXEMPT, _DRAW_CALL_BOOST, _DRAW_BET_BOOST, _BARREL_FOLD_BONUS
     global _MID_PAIR_FOLD_BONUS
     global _NUM_PLAYERS, _RANDOM_PREFLOP_FOLDS_DIST
+    global _THREAT_RANGE_EQUITY
+    global _DEBUG_LOG_DIR
     _SHARED_ADV_NETS  = shared_adv
     _SHARED_STRAT_NETS = shared_strat
     _ACT_SIZE          = act_size
@@ -203,6 +252,24 @@ def _worker_init(shared_adv, shared_strat, act_size, use_preflop_ranges=False,
     _MID_PAIR_FOLD_BONUS = mid_pair_fold_bonus
     _NUM_PLAYERS       = num_players
     _RANDOM_PREFLOP_FOLDS_DIST = random_preflop_folds_dist
+    _THREAT_RANGE_EQUITY = threat_range_equity
+    _DEBUG_LOG_DIR = debug_log_dir
+    # Worker init log (one per worker process)
+    if _DEBUG_LOG_DIR is not None:
+        _debug_log('worker_init',
+                    num_players=num_players,
+                    threat_range_equity=threat_range_equity,
+                    archetype_mode=archetype_mode,
+                    deck_reshuffle=deck_reshuffle,
+                    kbest_pool_size=len(kbest_pool) if kbest_pool else 0,
+                    bluff_penalty=bluff_penalty,
+                    call_bonus=call_bonus,
+                    value_bonus=value_bonus,
+                    fold_penalty=fold_penalty,
+                    draw_call_boost=draw_call_boost,
+                    draw_bet_boost=draw_bet_boost,
+                    barrel_fold_bonus=barrel_fold_bonus,
+                    mid_pair_fold_bonus=mid_pair_fold_bonus)
     if use_preflop_ranges:
         from src.preflop_ranges import PreflopRanges
         from pathlib import Path
@@ -258,6 +325,7 @@ def _make_engine(num_players):
     return make_engine(
         num_players=num_players,
         opponent_profile=_ARCHETYPE_MODE,
+        threat_range_equity=_THREAT_RANGE_EQUITY,
         rake_pct=_RAKE_PCT,
         rake_cap=_RAKE_CAP,
     )
@@ -321,21 +389,33 @@ def _select_phase_opponent(current_iter, kbest_pool):
 
     Phase 1 (iters 1..PHASE1_END):     random opponents, high exploration
     Phase 2 (iters PHASE1_END+1..PHASE2_END):  self-play vs advantage net
-    Phase 3 (PHASE2_END+1..):           mixed 70% K-Best pool / 30% self-play
+    Phase 3 (PHASE2_END+1..):           mixed 50% K-Best pool / 50% self-play
     """
     if current_iter <= PHASE1_END:
+        if _DEBUG_LOG_DIR:
+            _debug_log('phase_opp', current_iter=current_iter,
+                        phase=1, source='random', kbest_idx=-1, epsilon=0.10)
         return 0.10, None  # random actions
 
     if current_iter <= PHASE2_END:
         # Deep CFR paper: opponents play current iteration's strategy (advantage net),
         # not the accumulated average.
         eps = max(0.06, 0.10 * (1.0 - (current_iter - PHASE1_END) / (PHASE2_END - PHASE1_END)))
+        if _DEBUG_LOG_DIR:
+            _debug_log('phase_opp', current_iter=current_iter,
+                        phase=2, source='advantage_net', kbest_idx=-1, epsilon=eps)
         return eps, _SHARED_ADV_NETS
 
     # Phase 3 — mixed pool
     opp_nets = _SHARED_ADV_NETS
-    if kbest_pool and np.random.random() < 0.7:
-        _, opp_nets = kbest_pool[np.random.randint(len(kbest_pool))]
+    kbest_idx = -1
+    if kbest_pool and np.random.random() < 0.5:
+        kbest_idx = int(np.random.randint(len(kbest_pool)))
+        _, opp_nets = kbest_pool[kbest_idx]
+    if _DEBUG_LOG_DIR:
+        _debug_log('phase_opp', current_iter=current_iter,
+                    phase=3, source='pool' if kbest_idx >= 0 else 'advantage_net',
+                    kbest_idx=kbest_idx, epsilon=0.05)
     return 0.05, opp_nets
 
 
@@ -362,7 +442,9 @@ def _create_worker_pool(num_workers, shared_adv, shared_strat, act_size,
                   args.barrel_fold_bonus,
                   args.mid_pair_fold_bonus,
                   getattr(args, '_num_players', 6),
-                  getattr(args, '_random_preflop_folds_dist', None)),
+                  getattr(args, '_random_preflop_folds_dist', None),
+                  args.threat_range_equity,
+                  getattr(args, 'debug_log_dir', None)),
     )
 
 
@@ -383,6 +465,10 @@ def _traversal_worker(args):
     advantage network learns the correct preflop values over time.
     """
     player_idx, num_players, current_iter = args
+    _trav_sample = _debug_should_sample('trav')
+    if _trav_sample and _DEBUG_LOG_DIR:
+        _debug_log('traversal_start', current_iter=current_iter,
+                    player_idx=player_idx, num_players=num_players)
 
     # Phase-dependent opponent + exploration ε (see _select_phase_opponent)
     epsilon, opp_nets = _select_phase_opponent(current_iter, _KBEST_POOL)
@@ -417,8 +503,12 @@ def _traversal_worker(args):
                     non_hero_seats, size=k, replace=False))
 
     def _pick_opponent_action(ai, obs, legal, eng=None, is_preflop=False):
+        _sample = _debug_should_sample('opp')
         # Forced preflop fold (simulates shorter-handed tables)
         if is_preflop and ai in forced_fold_seats and 0 in legal:
+            if _sample:
+                _debug_log('opp_action', source='forced_fold',
+                            ai=ai, is_preflop=True, action=0, legal=list(legal))
             return 0  # FOLD
 
         # Monster all-in override — postflop only, value-heavy teaching signal.
@@ -430,6 +520,11 @@ def _traversal_worker(args):
                 and len(obs) > 19):
             if (float(obs[19]) >= _ALLIN_MONSTER_THRESHOLD
                     and np.random.random() < _ALLIN_MONSTER_RATE):
+                if _sample:
+                    _debug_log('opp_action', source='monster_allin',
+                                ai=ai, is_preflop=False, action=4,
+                                legal=list(legal),
+                                made_hand_cat=float(obs[19]))
                 return 4  # ALL_IN
 
         # Preflop override for opponents — use NL5 ranges if in nl5 mode
@@ -442,7 +537,14 @@ def _traversal_worker(args):
                 lp = strat[legal].copy()
                 s = lp.sum()
                 lp = lp / s if s > 0 else np.ones(len(legal)) / len(legal)
-                return int(np.random.choice(legal, p=lp))
+                action = int(np.random.choice(legal, p=lp))
+                if _sample:
+                    _debug_log('opp_action', source='preflop_range',
+                                ai=ai, is_preflop=True, action=action,
+                                legal=list(legal),
+                                strategy={int(a): float(lp[i])
+                                            for i, a in enumerate(legal)})
+                return action
 
         nets = opp_nets
         if nets is not None:
@@ -459,8 +561,22 @@ def _traversal_worker(args):
             lp = strat[legal].copy()
             s = lp.sum()
             lp = lp / s if s > 0 else np.ones(len(legal)) / len(legal)
-            return int(np.random.choice(legal, p=lp))
-        return int(np.random.choice(legal))
+            action = int(np.random.choice(legal, p=lp))
+            if _sample:
+                _debug_log('opp_action', source='advantage_net_or_pool',
+                            ai=ai, is_preflop=is_preflop, action=action,
+                            legal=list(legal),
+                            obs_18=float(obs[18]) if len(obs) > 18 else 0.0,
+                            obs_53=float(obs[53]) if len(obs) > 53 else None,
+                            strategy={int(a): float(lp[i])
+                                        for i, a in enumerate(legal)})
+            return action
+        action = int(np.random.choice(legal))
+        if _sample:
+            _debug_log('opp_action', source='random',
+                        ai=ai, is_preflop=is_preflop, action=action,
+                        legal=list(legal))
+        return action
 
     def _run_to_terminal(eng):
         """Play to terminal using opponent strategy network. Returns reward."""
@@ -499,6 +615,17 @@ def _traversal_worker(args):
     def _branch_exact(history, legal_int, n_samples=3, n_visible_public=0,
                       hero_equity=None, pot_chips=None, pot_odds=None,
                       obs=None):
+        _branch_sample = _debug_should_sample('branch')
+        if _branch_sample and _DEBUG_LOG_DIR:
+            _debug_log('branch_start',
+                        n_visible_public=n_visible_public,
+                        legal=list(legal_int),
+                        hero_equity=float(hero_equity) if hero_equity is not None else None,
+                        pot_chips=float(pot_chips) if pot_chips is not None else None,
+                        pot_odds=float(pot_odds) if pot_odds is not None else None,
+                        obs_18=float(obs[18]) if obs is not None and len(obs) > 18 else None,
+                        obs_53=float(obs[53]) if obs is not None and len(obs) > 53 else None,
+                        obs_19_made=float(obs[19]) if obs is not None and len(obs) > 19 else None)
         """Branch all legal actions, average n_samples rollouts to reduce variance.
 
         With _DECK_RESHUFFLE on, each rollout uses an independent reshuffle of
@@ -723,6 +850,19 @@ def _traversal_worker(args):
             results[ba] = r
         # Restore global RNG state so traversal-level randomness continues unaffected
         np.random.set_state(saved_np_state)
+        if _branch_sample and _DEBUG_LOG_DIR:
+            _debug_log('branch_shapers',
+                        bluff_penalty_chips=float(bluff_penalty_chips),
+                        call_bonus_chips=float(call_bonus_chips),
+                        draw_call_boost_chips=float(draw_call_boost_chips),
+                        draw_bet_boost_chips=float(draw_bet_boost_chips),
+                        value_bonus_chips=float(value_bonus_chips),
+                        fold_penalty_chips=float(fold_penalty_chips),
+                        barrel_fold_bonus_chips=float(barrel_fold_bonus_chips),
+                        mid_pair_fold_bonus_chips=float(mid_pair_fold_bonus_chips),
+                        is_strong_draw=bool(is_strong_draw),
+                        has_overcards_air=bool(has_overcards_air),
+                        rewards={int(a): float(r) for a, r in results.items()})
         return results
 
     def _strategy_for(obs, legal_int):
@@ -904,6 +1044,12 @@ def _traversal_worker(args):
 
     _return_engine(eng)
 
+    if _trav_sample and _DEBUG_LOG_DIR:
+        _debug_log('traversal_end', current_iter=current_iter,
+                    player_idx=player_idx,
+                    n_steps=len(all_steps),
+                    sum_abs_regrets=float(sum(abs(s.get('regret', 0.0))
+                                               for s in all_steps)))
     return all_steps
 
 
@@ -1086,7 +1232,8 @@ def _selfplay_eval_stats(deep_cfr_ref, num_players, num_hands, eq_path):
         from src.engine.fast_enhanced_engine import load_equity_model
         load_equity_model(eq_path, device='cpu')
 
-    sp_eng = _mk_eng(num_players=num_players)
+    sp_eng = _mk_eng(num_players=num_players,
+                      threat_range_equity=_THREAT_RANGE_EQUITY)
     sp_ranges = PreflopRanges(num_players=num_players)
     postflop = {'bets': 0, 'calls': 0, 'checks': 0, 'folds': 0}
 
@@ -1203,6 +1350,15 @@ def main():
                         help='Disable preflop range override, let neural net learn preflop')
     parser.add_argument('--archetype-mode', action='store_true',
                         help='Mixed archetype opponent training (extends obs to 55 dims)')
+    parser.add_argument('--threat-range-equity', action='store_true',
+                        default=False,
+                        help='[DEPRECATED] threat_range_equity is now merged '
+                             'into obs[18] (hand_strength). Flag accepted but '
+                             'has no effect — obs remains 53-dim.')
+    parser.add_argument('--debug-log-dir', type=str, default=None,
+                        help='[DEBUG] Write JSONL debug logs to this directory '
+                             '(workers write to worker_<pid>.jsonl, main to '
+                             'main.jsonl). Temporary diagnostic flag.')
     parser.add_argument('--deck-reshuffle', action='store_true',
                         default=bool(opp.get('deck_reshuffle', False)),
                         help='Reshuffle undealt cards per branch rollout (variance reduction). '
@@ -1341,8 +1497,11 @@ def main():
 
     if args.no_preflop_ranges:
         args.preflop_ranges = False
-    # --fine-tune-from implies --archetype-mode
-    if args.fine_tune_from:
+    # --fine-tune-from implies --archetype-mode (legacy: original use case
+    # was extending obs with opp_profile). Skip when the fine-tune is for
+    # a different feature (threat_range_equity), so we don't accidentally
+    # train two new feature blocks at once.
+    if args.fine_tune_from and not args.threat_range_equity:
         args.archetype_mode = True
 
     # Apply CLI overrides to config (used by burst-training wrapper)
@@ -1374,10 +1533,22 @@ def main():
     args._random_preflop_folds_dist = fold_dist
 
     # Set globals so _make_engine() uses them in workers
-    global _ARCHETYPE_MODE, _RAKE_PCT, _RAKE_CAP
+    global _ARCHETYPE_MODE, _RAKE_PCT, _RAKE_CAP, _THREAT_RANGE_EQUITY
+    global _DEBUG_LOG_DIR
     _ARCHETYPE_MODE = args.archetype_mode
     _RAKE_PCT = args.rake
     _RAKE_CAP = args.rake_cap
+    _THREAT_RANGE_EQUITY = args.threat_range_equity
+    _DEBUG_LOG_DIR = args.debug_log_dir
+    if _DEBUG_LOG_DIR:
+        Path(_DEBUG_LOG_DIR).mkdir(parents=True, exist_ok=True)
+        # Main-process log file
+        _debug_log('main_start',
+                    threat_range_equity=args.threat_range_equity,
+                    num_iterations=args.num_iterations,
+                    workers=args.workers,
+                    config_path=args.config)
+        print(f'  DEBUG LOG: writing to {_DEBUG_LOG_DIR}')
 
     # Load GPU equity model if specified
     if args.equity_model:
@@ -1425,10 +1596,18 @@ def main():
     print(f'\n  obs_size={obs_size}  act_size={act_size}\n')
 
     # For fine-tuning: create DeepCFR with OLD obs size so checkpoint loads,
-    # then extend to new size after loading.
+    # then extend to new size after loading. Infer source obs size from the
+    # checkpoint's first-layer weight shape — works regardless of which feature
+    # block was added (opponent_profile / threat_range / etc.).
     init_obs_size = obs_size
     if args.fine_tune_from:
-        init_obs_size = obs_size - OPPONENT_PROFILE_DIM  # 55 - 5 = 50
+        try:
+            _ckpt = torch.load(args.fine_tune_from, map_location='cpu',
+                                weights_only=False)
+            _w = _ckpt['advantage_networks'][0]['network.0.weight']
+            init_obs_size = int(_w.shape[1])
+        except Exception:
+            init_obs_size = obs_size - OPPONENT_PROFILE_DIM  # legacy fallback
         print(f'  Fine-tune mode: init obs={init_obs_size}, target obs={obs_size}')
 
     deep_cfr = DeepCFR(
@@ -1567,7 +1746,15 @@ def main():
 
     # Seed the pool with the best known model + resume checkpoints
     def _load_pool_checkpoint(path, label):
-        """Load a checkpoint into K-Best pool as shared-memory nets."""
+        """Load a checkpoint into K-Best pool as shared-memory nets.
+
+        Pool models trained on a smaller obs (e.g. 53-dim pre-threat_range)
+        are auto-padded to the trainee's obs size. Padding inserts zero-init
+        columns at the END of the first Linear layer's weight matrix, which
+        matches the convention `extend_first_layer` uses for the trainee:
+        new feature dims live at the end so legacy weights see them as 0
+        and the pool model behaves exactly like its original 53-dim self.
+        """
         from src.training.deep_cfr import StrategyNetwork
         cp_data = torch.load(str(path), map_location='cpu')
         strat_states = cp_data.get('strategy_networks', [])
@@ -1575,6 +1762,22 @@ def main():
             return None
         pool_nets = []
         for sd in strat_states:
+            # Detect source obs dim from the first Linear layer weight
+            try:
+                src_obs = int(sd['network.0.weight'].shape[1])
+            except (KeyError, IndexError):
+                src_obs = obs_size
+            if src_obs < obs_size:
+                # Pad first-layer weight with zero columns at the right
+                w = sd['network.0.weight']
+                pad = torch.zeros(w.shape[0], obs_size - src_obs,
+                                  dtype=w.dtype, device=w.device)
+                sd = dict(sd)  # don't mutate the cached checkpoint
+                sd['network.0.weight'] = torch.cat([w, pad], dim=1)
+            elif src_obs > obs_size:
+                # Trim (rare — pool was BIGGER than trainee). Drop tail columns.
+                sd = dict(sd)
+                sd['network.0.weight'] = sd['network.0.weight'][:, :obs_size]
             net = StrategyNetwork(obs_size, act_size,
                                    config['network']['hidden_layers'],
                                    config['network'].get('dropout', 0.1))
@@ -1582,6 +1785,9 @@ def main():
             net.eval()
             net.share_memory()
             pool_nets.append(net)
+        if src_obs != obs_size:
+            print(f'  K-Best pool: {label} adapted {src_obs} → {obs_size} '
+                  f'dims (legacy model, new feature columns zero-init)')
         return (label, pool_nets)
 
     # Seed pool from --kbest-seed flag, or auto-detect best model
@@ -1755,6 +1961,12 @@ def main():
             iter_num = iteration + 1
             t0 = time.time()
 
+            if _DEBUG_LOG_DIR:
+                _debug_log('iter_start', iter_num=iter_num,
+                            buf_len=len(deep_cfr.replay_buffer),
+                            train_passes=train_passes,
+                            batch_size=batch_size)
+
             # Phase transitions: buffer clear + LR reset (Phase 2 & 3 boundaries)
             _handle_phase_transition(iter_num, deep_cfr, _phase_transitions_done)
 
@@ -1839,6 +2051,25 @@ def main():
             for _ in range(effective_passes):
                 adv_losses.append(deep_cfr.train_advantage_network(batch_size))
                 strat_losses.append(deep_cfr.train_strategy_network(batch_size))
+
+            if _DEBUG_LOG_DIR and effective_passes > 0:
+                # adv/strat losses may be tensors or floats per call; flatten
+                def _to_float_list(lst):
+                    out = []
+                    for x in lst:
+                        try:
+                            out.append(float(x))
+                        except Exception:
+                            try:
+                                out.append([float(y) for y in x])
+                            except Exception:
+                                pass
+                    return out
+                _debug_log('iter_losses', iter_num=iter_num,
+                            adv_losses=_to_float_list(adv_losses),
+                            strat_losses=_to_float_list(strat_losses),
+                            n_passes=effective_passes,
+                            buf_len_after=len(deep_cfr.replay_buffer))
 
             # ── Imitation pass on annotated spots ────────────────────
             # Runs only when imitation dataset is loaded AND CFR training

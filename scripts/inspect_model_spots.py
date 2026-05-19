@@ -298,12 +298,16 @@ def load_model():
         deep_cfr.load_models(MODEL_PATH)
         model = deep_cfr
         # Agent obs_builder bundles betting_line with behavioral_stats:
-        # 42=base, 53=base+bh+betting_line, 54=base+bh+betting_line+evo
+        # 42=base, 53=base+bh+betting_line, 54=base+bh+bl+threat,
+        # 55=base+bh+bl+evo+threat. Prefer threat_range over evo for the
+        # 1-dim case (new training uses threat; evo is trivially derivable).
         has_bh = model_obs_size >= 50
-        has_evo = model_obs_size >= 54
+        has_threat = model_obs_size >= 54
+        has_evo = model_obs_size >= 55
 
     obs_builder = ObservationBuilder(NUM_PLAYERS, behavioral_stats=has_bh,
-                                      equity_vs_odds=has_evo)
+                                      equity_vs_odds=has_evo,
+                                      threat_range_equity=has_threat)
 
     info = {
         'type': model_type, 'obs_size': model_obs_size,

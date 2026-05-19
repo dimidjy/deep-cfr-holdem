@@ -82,13 +82,16 @@ def main() -> None:
         return
 
     # Build with same flags used in the agent (6-max, pad_to_6p, behavioral_stats,
-    # equity_vs_odds) so obs matches what validate_spot_logs expects.
+    # threat_range_equity) so obs matches what validate_spot_logs expects.
+    # v41+ models are 54-dim with threat_range_equity; older 53-dim still works.
     builder = ObservationBuilder(
         num_players=6, pad_to_6p=True,
-        behavioral_stats=True, equity_vs_odds=True,
+        behavioral_stats=True, equity_vs_odds=False,
+        threat_range_equity=True,
     )
     names = feature_names(num_players=6, pad_to_6p=True,
-                          behavioral_stats=True, equity_vs_odds=True)
+                          behavioral_stats=True, equity_vs_odds=False,
+                          threat_range_equity=True)
     print(f'obs dim expected: {len(names)}')
 
     total = 0

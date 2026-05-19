@@ -206,11 +206,19 @@ class PreflopLookup:
                       result: Optional[Tuple[float, float, float]],
                       custom_size_bb: Optional[float],
                       extra: str = '') -> None:
-        """DEBUG: per-decision trace; INFO: periodic summary."""
+        """DEBUG: per-decision trace; INFO: periodic summary + fold-default
+        events (always emitted so we can catch unexpected folds without
+        enabling DEBUG-level noise from every spot).
+        """
         self._counters[level] += 1
-        if logger.isEnabledFor(logging.DEBUG):
-            spot_repr = (f"{spot.hole_class}/{spot.position}/"
-                         f"{spot.action_history}/{spot.stack_bucket}/nta={spot.num_to_act}")
+        spot_repr = (f"{spot.hole_class}/{spot.position}/"
+                     f"{spot.action_history}/{spot.stack_bucket}/nta={spot.num_to_act}")
+        # Always emit fold-default and static-fallback at INFO so they're
+        # visible in agent.log without DEBUG logging.
+        if level in ('L3_fold_default', 'L3_static_fallback'):
+            logger.info(f"PF[{level}] {spot_repr} → fold/static fallback"
+                        f"{(' ' + extra) if extra else ''}")
+        elif logger.isEnabledFor(logging.DEBUG):
             if result is not None:
                 f, c, r = result
                 size_str = f"{custom_size_bb:.2f}bb" if custom_size_bb else "preset"
