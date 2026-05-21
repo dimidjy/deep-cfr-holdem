@@ -495,6 +495,7 @@ class FastEnhancedPokerEngine(FastPokerEngine):
                  betting_line: bool = True,
                  opponent_profile: bool = False,
                  threat_range_equity: bool = False,  # accepted, ignored (merged into obs[18])
+                 equity_vs_random: bool = False,     # append raw vs-random equity as last dim
                  rake_pct: float = 0.0,
                  rake_cap: float = 0.0):
         self.add_position_features = add_position_features
@@ -511,6 +512,7 @@ class FastEnhancedPokerEngine(FastPokerEngine):
         # behavioral_stats. Off when behavioral_stats is off.
         self.add_betting_line = betting_line and behavioral_stats
         self.add_opponent_profile = opponent_profile
+        self.add_equity_vs_random = equity_vs_random  # append raw vs-random dim
         self._opponent_profile = None  # 5-dim array, set via set_opponent_profile()
         self.rake_pct = rake_pct  # e.g. 0.05 = 5%
         self.rake_cap = rake_cap  # max rake in chips (0 = no cap)
@@ -545,6 +547,8 @@ class FastEnhancedPokerEngine(FastPokerEngine):
             size += self.BETTING_LINE_DIM
         if self.add_opponent_profile:
             size += self.OPPONENT_PROFILE_DIM
+        # equity_vs_random reverted: no longer appended (obs[18] is now raw
+        # equity-vs-random). Flag accepted but unwired.
         return size
 
     def get_observation_space_size(self) -> int:
@@ -581,6 +585,45 @@ class FastEnhancedPokerEngine(FastPokerEngine):
         if features:
             return np.concatenate(features).astype(np.float32)
         return np.zeros(self.enhanced_obs_size, dtype=np.float32)
+
+    def _get_equity_vs_random_feature(self) -> np.ndarray:
+        """1-dim: raw MC equity vs a uniform-random opponent range.
+
+        This is the original (pre-threat-overlay) obs[18] value, exposed as a
+        separate appended feature so the model sees BOTH the range-conditioned
+        equity (obs[18]) and the unconditioned strength.
+        """
+        try:
+            ps = self._cur_ps()
+            hole = ps.hand
+            board = self._state.public_cards
+            if len(hole) < 2:
+                return np.zeros(1, dtype=np.float32)
+            # GPU model fast path (pred[0] = equity vs random)
+            if self.use_equity_model:
+                r1 = self._rank_to_value(_pkrs_card_rank(hole[0]))
+                r2 = self._rank_to_value(_pkrs_card_rank(hole[1]))
+                hole_suits = [_SUIT_MAP_EQ.get(_pkrs_card_suit(c).lower(), 0)
+                              for c in hole[:2]]
+                board_ranks = [self._rank_to_value(_pkrs_card_rank(c)) for c in board]
+                board_suits = [_SUIT_MAP_EQ.get(_pkrs_card_suit(c).lower(), 0)
+                               for c in board]
+                pred = _equity_model_predict([r1, r2], hole_suits,
+                                              board_ranks, board_suits, hole, board,
+                                              n_opponents=1)
+                if pred is not None:
+                    return np.array([float(pred[0])], dtype=np.float32)
+            # eval7 MC vs uniform-random range
+            if board and _EVAL7_AVAILABLE:
+                e7_hole = [_eval7.Card(_pkrs_card_rank(c) + _pkrs_card_suit(c).lower())
+                           for c in hole[:2]]
+                e7_board = [_eval7.Card(_pkrs_card_rank(c) + _pkrs_card_suit(c).lower())
+                            for c in board]
+                return np.array([float(_eval7.py_hand_vs_range_monte_carlo(
+                    e7_hole, _EVAL7_RANDOM_RANGE, e7_board, 300))], dtype=np.float32)
+            return np.array([self._approx_preflop_equity(hole)], dtype=np.float32)
+        except Exception:
+            return np.zeros(1, dtype=np.float32)
 
     # ── Opponent profile (cross-hand, set externally) ──────────────────────
 
@@ -646,6 +689,15 @@ class FastEnhancedPokerEngine(FastPokerEngine):
             max_possible = max(len(board_ranks_unique) - 1, 1)
             board_straight_texture = float(consecutive / max_possible)
 
+            # hand_raise_count = total raises this hand (hero + opps, all
+            # streets). Drives CR-escalation in tier selection.
+            # preflop_raise_count = raises during preflop only. Detects
+            # 3-bet+ pots whose flop was checked through.
+            hand_raise_count = (int(self._bh.get('raise_count', 0))
+                                if self._bh is not None else 0)
+            preflop_raise_count = (
+                int(self._bh.get('preflop_raise_count', 0))
+                if self._bh is not None else 0)
             tier = select_threat_tier(
                 num_raises_norm=0.0,    # ignored by selector (per-street fix)
                 max_bet_sizing=0.0,     # ignored
@@ -653,7 +705,9 @@ class FastEnhancedPokerEngine(FastPokerEngine):
                 pot_was_raised=pot_was_raised,
                 board_flush_texture=board_flush_texture,
                 board_straight_texture=board_straight_texture,
-                opp_aggressed_this_hand=opp_aggressed_this_hand)
+                opp_aggressed_this_hand=opp_aggressed_this_hand,
+                hand_raise_count=hand_raise_count,
+                preflop_raise_count=preflop_raise_count)
 
             hole_strs = [_pkrs_card_rank(c) + _pkrs_card_suit(c).lower()
                           for c in hole[:2]]
@@ -790,14 +844,14 @@ class FastEnhancedPokerEngine(FastPokerEngine):
                                               board_ranks, board_suits, hole, board_pkrs,
                                               n_opponents=n_opp)
                 if pred is not None:
+                    # pred[0] = raw equity vs random → obs[18]. No threat
+                    # overlay (reverted to 53-dim, obs[18]=equity-vs-random).
                     return pred
 
-            # Tier-aware equity (replaces equity-vs-random). Postflop only;
-            # preflop result is discarded right after this block anyway.
-            if board_pkrs and _EVAL7_AVAILABLE:
-                hand_strength = self._compute_obs18_threat_equity(hole, board_pkrs)
-            else:
-                hand_strength = self._approx_preflop_equity(hole)
+            # obs[18] = raw MC equity vs a uniform-random range (threat-range
+            # overlay reverted; _compute_obs18_threat_equity / src/range_equity.py
+            # kept for future re-wiring). Preflop result is discarded below.
+            hand_strength = float(self._get_equity_vs_random_feature()[0])
 
             if not board_pkrs:
                 return np.zeros(9, dtype=np.float32)
@@ -1047,6 +1101,9 @@ class FastEnhancedPokerEngine(FastPokerEngine):
                 'player_fold': {},           # player_idx → fold count
                 'sizing_ratios': [],         # (player_idx, ratio) tuples
                 'raise_count': 0,
+                'preflop_raise_count': 0,  # frozen at end of preflop; used
+                                            # for threat-tier 3bet-pot detection
+
                 'street_actions': [],        # (player_idx, action_type) tuples
                 'avg_stack': avg_stack,
                 # str(stage) yields 'Stage.Preflop' (enum repr) — match that
@@ -1097,6 +1154,13 @@ class FastEnhancedPokerEngine(FastPokerEngine):
         if is_aggressive:
             bh['player_agg'][pidx] = bh['player_agg'].get(pidx, 0) + 1
             bh['raise_count'] += 1
+            # Preflop-only raise count (frozen after preflop). Used by
+            # select_threat_tier to detect 3-bet+ pots regardless of who
+            # was the most recent aggressor postflop.
+            stage_str = str(self._state.stage)
+            if 'Preflop' in stage_str:
+                bh['preflop_raise_count'] = bh.get(
+                    'preflop_raise_count', 0) + 1
             # Betting-line: track most recent aggressor (initiative) and per-street count
             bh['last_aggressor'] = pidx
             bh['street_agg_count'] = bh.get('street_agg_count', 0) + 1

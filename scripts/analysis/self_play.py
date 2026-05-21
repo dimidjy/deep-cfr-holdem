@@ -289,7 +289,8 @@ def run_self_play(engine: DecisionEngine, num_hands: int,
                   num_players: int = 6,
                   engine_b: DecisionEngine = None,
                   track_range_analysis: bool = False,
-                  threat_range_equity: bool = False
+                  threat_range_equity: bool = False,
+                  equity_vs_random: bool = False
                   ) -> Dict[int, PlayerStats]:
     """Play num_hands of poker with effective `num_players` seats.
 
@@ -304,7 +305,8 @@ def run_self_play(engine: DecisionEngine, num_hands: int,
     from src.engine.factory import make_engine
     ENGINE_PLAYERS = 6  # always 6-max engine to keep obs shape consistent
     eng = make_engine(num_players=ENGINE_PLAYERS,
-                       threat_range_equity=threat_range_equity)
+                       threat_range_equity=threat_range_equity,
+                       equity_vs_random=equity_vs_random)
     num_force_fold = max(0, ENGINE_PLAYERS - num_players)
 
     stats = {i: PlayerStats() for i in range(ENGINE_PLAYERS)}
@@ -1529,17 +1531,9 @@ def main():
     engine.load_preflop_ranges()
     print(f'  Engine A: {engine.info()}')
 
-    # Auto-detect threat_range_equity from loaded model's input dim. 54+
-    # means the model was trained with the feature; engine must match.
-    if not args.threat_range_equity:
-        try:
-            _sz = engine._obs_size_fb or engine._obs_size_ct
-            if _sz and _sz >= 54 and (_sz - 42) % 5 != 0:
-                # 54 = base 42 + bh 11 + threat 1; 55 = +evo too
-                args.threat_range_equity = True
-                print(f'  → auto-enabling threat_range_equity (model obs={_sz})')
-        except Exception:
-            pass
+    # equity_vs_random was reverted: obs is 53-dim with obs[18] = raw
+    # equity-vs-random. The flag is passed through but ignored by the engine.
+    args_equity_vs_random = False
 
     # Setup DecisionEngine B (vs mode or archetype mode)
     engine_b = None
@@ -1607,7 +1601,8 @@ def main():
     stats = run_self_play(engine, args.hands, args.players,
                           engine_b=engine_b,
                           track_range_analysis=args.range_analysis,
-                          threat_range_equity=args.threat_range_equity)
+                          threat_range_equity=args.threat_range_equity,
+                          equity_vs_random=args_equity_vs_random)
 
     # Generate report
     if vs_mode:

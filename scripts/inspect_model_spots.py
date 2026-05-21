@@ -262,12 +262,22 @@ def load_model():
     model_obs_size = checkpoint.get('obs_size', 38)
     model_action_size = checkpoint.get('action_size', 5)
 
+    # Reconstruct the architecture from the checkpoint instead of assuming a
+    # default: the top-level nn.Linear layers (2-D weights NOT inside a
+    # ResidualBlock '.block.') give the layer widths in order — the last is the
+    # output layer (action_size), the rest are the hidden-layer sizes.
+    inferred_hidden = None
     if 'advantage_networks' in checkpoint:
         adv0 = checkpoint['advantage_networks'][0]
         model_obs_size = adv0['network.0.weight'].shape[1]
-        last_w = max((k for k in adv0.keys() if k.endswith('.weight') and adv0[k].dim() == 2),
-                     key=lambda k: int(k.split('.')[1]) if k.split('.')[1].isdigit() else -1)
-        model_action_size = adv0[last_w].shape[0]
+        linears = sorted(
+            (int(k.split('.')[1]), adv0[k].shape[0])
+            for k in adv0
+            if k.endswith('.weight') and adv0[k].dim() == 2 and '.block.' not in k
+        )
+        widths = [w for _, w in linears]
+        inferred_hidden = widths[:-1]
+        model_action_size = widths[-1]
 
     if model_type in ('cql', 'iql'):
         from scripts.train_cql import QNetwork, CQLModelWrapper
@@ -289,29 +299,34 @@ def load_model():
             model._behavioral_stats = True
         if has_evo:
             model._equity_vs_odds = True
+        has_threat = False
+        has_evr = False
     else:
         from src.training import DeepCFR
         deep_cfr = DeepCFR(
             observation_size=model_obs_size, action_size=model_action_size,
-            num_players=NUM_PLAYERS, hidden_layers=[512, 512, 256],
+            num_players=NUM_PLAYERS,
+            hidden_layers=inferred_hidden or [512, 512, 256],
             learning_rate=0.001, buffer_size=100000, device='cpu')
         deep_cfr.load_models(MODEL_PATH)
         model = deep_cfr
-        # Agent obs_builder bundles betting_line with behavioral_stats:
-        # 42=base, 53=base+bh+betting_line, 54=base+bh+bl+threat,
-        # 55=base+bh+bl+evo+threat. Prefer threat_range over evo for the
-        # 1-dim case (new training uses threat; evo is trivially derivable).
+        # Obs layout: 53 = base 42 + behavioral 8 + betting_line 3.
+        # obs[18] = raw equity-vs-random (threat overlay + appended
+        # equity_vs_random dim were reverted).
         has_bh = model_obs_size >= 50
-        has_threat = model_obs_size >= 54
-        has_evo = model_obs_size >= 55
+        has_evr = False
+        has_evo = False
+        has_threat = False
 
     obs_builder = ObservationBuilder(NUM_PLAYERS, behavioral_stats=has_bh,
                                       equity_vs_odds=has_evo,
-                                      threat_range_equity=has_threat)
+                                      threat_range_equity=has_threat,
+                                      equity_vs_random=has_evr)
 
     info = {
         'type': model_type, 'obs_size': model_obs_size,
         'action_size': model_action_size, 'epoch': checkpoint.get('epoch', '?'),
+        'hidden': inferred_hidden,
     }
     return model, obs_builder, info
 
@@ -365,7 +380,7 @@ def main():
 
     print(f"Model: {MODEL_PATH}")
     print(f"Type: {info['type']}, obs={info['obs_size']}, actions={model_action_size}, "
-          f"epoch={info['epoch']}, temp={temperature}")
+          f"hidden={info.get('hidden')}, epoch={info['epoch']}, temp={temperature}")
     print()
 
     act_header = '  '.join(f'{n:>8}' for n in ACTION_NAMES)

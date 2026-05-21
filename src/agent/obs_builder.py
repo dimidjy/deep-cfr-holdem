@@ -114,6 +114,7 @@ _BETTING_LINE_NAMES = [
 BETTING_LINE_DIM = 3
 _EQUITY_VS_ODDS_NAMES = ['equity_vs_odds']
 _THREAT_RANGE_NAMES = ['equity_vs_threat_range']
+_EQUITY_VS_RANDOM_NAMES = ['equity_vs_random']
 _OPP_PROFILE_NAMES = [
     'opp_vpip', 'opp_pfr', 'opp_af_norm', 'opp_fold_to_cbet', 'opp_wtsd',
 ]
@@ -123,7 +124,8 @@ def feature_names(num_players: int = 6, pad_to_6p: bool = True,
                   behavioral_stats: bool = True,
                   equity_vs_odds: bool = True,
                   opp_profile: bool = False,
-                  threat_range_equity: bool = False) -> List[str]:
+                  threat_range_equity: bool = False,
+                  equity_vs_random: bool = False) -> List[str]:
     """Return ordered feature names matching ObservationBuilder.build() output.
 
     Pass the same constructor flags used for the builder to get matching names.
@@ -150,8 +152,9 @@ def feature_names(num_players: int = 6, pad_to_6p: bool = True,
         names += _OPP_PROFILE_NAMES
     if equity_vs_odds:
         names += _EQUITY_VS_ODDS_NAMES
-    if threat_range_equity:
-        names += _THREAT_RANGE_NAMES
+    # threat_range_equity / equity_vs_random are accepted for backward compat
+    # but no longer wired into the obs (reverted to 53-dim; obs[18] = raw
+    # equity-vs-random). Range-equity functions remain in src/range_equity.py.
     return names
 
 
@@ -165,17 +168,26 @@ class ObservationBuilder:
 
     def __init__(self, num_players: int = 6, pad_to_6p: bool = False,
                  behavioral_stats: bool = False, equity_vs_odds: bool = False,
-                 threat_range_equity: bool = False):
+                 threat_range_equity: bool = False,
+                 equity_vs_random: bool = False):
         self.num_players = num_players
         self.pad_to_6p = pad_to_6p and num_players < 6
         self.behavioral_stats = behavioral_stats
         self.equity_vs_odds = equity_vs_odds
+        # NOTE: threat_range_equity / equity_vs_random are accepted for backward
+        # compat but NO LONGER WIRED. obs is 53-dim with obs[18] = raw MC equity
+        # vs a uniform-random range. The range-equity machinery
+        # (_compute_obs18_threat_equity, src/range_equity.py) is retained for
+        # future re-wiring.
         self.threat_range_equity = threat_range_equity
+        self.equity_vs_random = equity_vs_random
+        self._last_equity_vs_random: float = 0.0
 
     def build(self, game_state: GameState,
               opponent_profile: np.ndarray = None,
               hero_has_initiative_override: Optional[bool] = None,
               hand_raise_count_override: Optional[int] = None,
+              preflop_raise_count_override: Optional[int] = None,
               opp_bet_sizings_override: Optional[List[float]] = None,
               opp_action_counts_override: Optional[dict] = None,
               street_action_counts_override: Optional[dict] = None
@@ -205,6 +217,10 @@ class ObservationBuilder:
         if not players:
             return None
 
+        # Reset per-build so a stale value from the previous build can't leak
+        # into the appended equity_vs_random feature.
+        self._last_equity_vs_random = 0.0
+
         my_player = game_state.my_player
         if not my_player or not my_player.hole_cards:
             return None
@@ -231,7 +247,8 @@ class ObservationBuilder:
         features.append(self._equity_features(hole_cards, community, n_opponents,
                                                 game_state=game_state, players=players,
                                                 hero_has_initiative=hero_has_initiative_override,
-                                                hand_raise_count=hand_raise_count_override))
+                                                hand_raise_count=hand_raise_count_override,
+                                                preflop_raise_count=preflop_raise_count_override))
         features.append(self._street_features(game_state.street))
         features.append(self._game_state_features(game_state, players, player_idx))
         features.append(self._betting_history_features(game_state, players, player_idx))
@@ -260,8 +277,13 @@ class ObservationBuilder:
             evo = np.clip(equity - equity_needed, -1.0, 1.0)
             obs = np.append(obs, np.float32(evo))
 
-        # threat_range_equity is now merged into obs[18] inside _equity_features
-        # (no longer appended as a separate dim). Flag retained for API compat.
+        # NOTE: obs is 53-dim. obs[18] = raw MC equity vs a uniform-random range
+        # (see _equity_features). The threat-range overlay and the appended
+        # equity_vs_random dim were reverted; threat_range_equity/equity_vs_random
+        # flags are accepted but no longer wired. The range-equity functions
+        # (_compute_obs18_threat_equity, src/range_equity.py) remain for future
+        # re-wiring.
+
         return obs
 
     def _compute_opp_range_spot_key(self, game_state, players, player_idx,
@@ -387,7 +409,8 @@ class ObservationBuilder:
                          game_state=None,
                          players=None,
                          hero_has_initiative=None,
-                         hand_raise_count=None) -> np.ndarray:
+                         hand_raise_count=None,
+                         preflop_raise_count=None) -> np.ndarray:
         if len(hole_cards) < 2:
             return np.zeros(9, dtype=np.float32)
 
@@ -408,27 +431,16 @@ class ObservationBuilder:
                                               board_ranks, board_suits, None, None,
                                               n_opponents=n_opponents)
                 if pred is not None:
-                    # Override obs[18] with tier-aware equity if state available
-                    if community_cards and players is not None:
-                        tre = self._compute_obs18_threat_equity(
-                            hole_cards, community_cards, players,
-                            hero_has_initiative=hero_has_initiative,
-                            hand_raise_count=hand_raise_count)
-                        if tre > 0.0:
-                            pred = pred.copy()
-                            pred[0] = np.float32(tre)
+                    # pred[0] = raw equity vs random → obs[18]. No threat
+                    # overlay (reverted to 53-dim, obs[18]=equity-vs-random).
                     return pred
         except Exception:
             pass
 
-        # Tier-aware equity (replaces equity-vs-random). Postflop only;
-        # preflop value is discarded below (returns zeros at line ~426).
-        if community_cards and _EVAL7_AVAILABLE and players is not None:
-            hand_strength = self._compute_obs18_threat_equity(
-                hole_cards, community_cards, players,
-                hero_has_initiative=hero_has_initiative,
-                hand_raise_count=hand_raise_count)
-        elif _EVAL7_AVAILABLE:
+        # obs[18] = raw MC equity vs a uniform-random opponent range. The
+        # threat-range overlay was reverted; _compute_obs18_threat_equity and
+        # src/range_equity.py remain available for future re-wiring.
+        if _EVAL7_AVAILABLE:
             try:
                 e7_hole = [_eval7.Card(c) for c in hole_cards[:2]]
                 e7_board = [_eval7.Card(c) for c in community_cards] if community_cards else []
@@ -552,11 +564,33 @@ class ObservationBuilder:
              board_straight_texture, hand_rank_within_cat],
             dtype=np.float32)
 
+    def _equity_vs_random(self, hole_cards: List[str],
+                          community_cards: List[str],
+                          n_opponents: int = 1) -> float:
+        """Raw MC equity vs a uniform-random opponent range (the original
+        pre-threat-overlay obs[18]). Used for the appended equity_vs_random
+        feature. Returns 0.0 on failure / preflop with no eval7."""
+        if len(hole_cards) < 2:
+            return 0.0
+        if not _EVAL7_AVAILABLE:
+            return self._approx_preflop_equity(hole_cards)
+        try:
+            e7_hole = [_eval7.Card(c) for c in hole_cards[:2]]
+            e7_board = [_eval7.Card(c) for c in community_cards] if community_cards else []
+            if n_opponents <= 1:
+                ns = 1000 if not community_cards else 300
+                return float(_eval7.py_hand_vs_range_monte_carlo(
+                    e7_hole, _EVAL7_RANDOM_RANGE, e7_board, ns))
+            return float(self._multiway_equity(e7_hole, e7_board, n_opponents, 300))
+        except Exception:
+            return self._approx_preflop_equity(hole_cards)
+
     def _compute_obs18_threat_equity(self, hole_cards: List[str],
                                        community_cards: List[str],
                                        players,
                                        hero_has_initiative=None,
-                                       hand_raise_count=None) -> float:
+                                       hand_raise_count=None,
+                                       preflop_raise_count=None) -> float:
         """Tier-aware equity for obs[18]. Mirrors the engine's helper.
 
         Reads per-street aggression from `players[i].bet_current_round` and
@@ -612,7 +646,9 @@ class ObservationBuilder:
                 pot_was_raised=pot_was_raised,
                 board_flush_texture=board_flush_texture,
                 board_straight_texture=board_straight_texture,
-                opp_aggressed_this_hand=opp_aggressed_this_hand)
+                opp_aggressed_this_hand=opp_aggressed_this_hand,
+                hand_raise_count=int(hand_raise_count or 0),
+                preflop_raise_count=int(preflop_raise_count or 0))
 
             return get_threat_range_equity(
                 hole_cards, community_cards, tier,

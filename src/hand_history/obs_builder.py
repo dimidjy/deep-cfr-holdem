@@ -118,6 +118,10 @@ def _bh_track_action(action, bh):
     # All-player raise count
     if atype == 'raise':
         bh['raise_count'] += 1
+        # Preflop-only raise count for threat-tier 3bet-pot detection.
+        # action.street is 'preflop'/'flop'/'turn'/'river'.
+        if action.street == 'preflop':
+            bh['preflop_raise_count'] = bh.get('preflop_raise_count', 0) + 1
 
     # Update street bet tracking (for pot computation)
     if atype in ('bet', 'call'):
@@ -226,7 +230,8 @@ class ObservationBuilder:
                               source_file: str = '',
                               track_action_history: bool = False,
                               behavioral_stats: bool = False,
-                              threat_range_equity: bool = False) -> List[DecisionPoint]:
+                              threat_range_equity: bool = False,
+                              equity_vs_random: bool = False) -> List[DecisionPoint]:
         """Replay a hand and build DecisionPoint at each non-blind decision.
 
         Args:
@@ -273,6 +278,8 @@ class ObservationBuilder:
                 'player_fold': defaultdict(int),
                 'sizing_ratios': [],     # (player_name, ratio) tuples
                 'raise_count': 0,
+                'preflop_raise_count': 0,  # frozen after preflop; drives
+                                           # threat-tier 3bet-pot detection
                 'street_actions': [],    # (name, action_type, is_all_in)
                 'avg_stack': avg_stack,
                 # Betting-line tracking (3 features)
@@ -361,6 +368,14 @@ class ObservationBuilder:
                 player_stake=player.stake,
             )
 
+            # Extract aggression signals from bh for threat-tier computation
+            # (mirrors what fast_enhanced_engine.py does at training time).
+            _hand_raise_count = int(bh['raise_count']) if bh else 0
+            _preflop_raise_count = int(bh.get('preflop_raise_count', 0)) if bh else 0
+            _opp_aggressed = 0.0
+            if bh and bh.get('last_aggressor') is not None:
+                if bh['last_aggressor'] != action.player_name:
+                    _opp_aggressed = 1.0
             obs = self._build_observation(
                 players=players,
                 player_idx=pidx,
@@ -368,6 +383,9 @@ class ObservationBuilder:
                 street=current_street,
                 community_cards=community_cards,
                 allow_unknown_cards=allow_unknown_cards,
+                hand_raise_count=_hand_raise_count,
+                preflop_raise_count=_preflop_raise_count,
+                opp_aggressed_this_hand=_opp_aggressed,
             )
 
             has_cards = bool(player.hole_cards)
@@ -384,7 +402,11 @@ class ObservationBuilder:
                     bl_features = _bl_compute(bh, player.name)
                     obs = np.concatenate([obs, bh_features, bl_features])
 
-                # threat_range_equity now merged into obs[18] (no separate dim)
+                # obs is 53-dim. obs[18] = raw equity-vs-random (see
+                # _equity_features). threat_range_equity / equity_vs_random
+                # reverted (no overlay, no appended dim); flags accepted but
+                # unwired. _equity_vs_random / _compute_obs18_threat_equity kept
+                # for future re-wiring.
 
                 dp_kwargs = dict(
                     player_name=player.name,
@@ -532,7 +554,10 @@ class ObservationBuilder:
                            player_idx: int, button_idx: int,
                            street: str,
                            community_cards: List[str],
-                           allow_unknown_cards: bool = False) -> Optional[np.ndarray]:
+                           allow_unknown_cards: bool = False,
+                           hand_raise_count: int = 0,
+                           preflop_raise_count: int = 0,
+                           opp_aggressed_this_hand: float = 0.0) -> Optional[np.ndarray]:
         """Build the 41-dim observation vector.
 
         Mirrors FastEnhancedPokerEngine.get_observation() exactly.
@@ -552,8 +577,12 @@ class ObservationBuilder:
             features.append(self._hand_strength_features(hole))
             features.append(self._stack_features(players, player_idx))
             n_opponents = max(sum(1 for p in players if p.active) - 1, 1)
-            features.append(self._equity_features(hole, community_cards, n_opponents,
-                                                    players=players))
+            features.append(self._equity_features(
+                hole, community_cards, n_opponents,
+                players=players,
+                hand_raise_count=hand_raise_count,
+                preflop_raise_count=preflop_raise_count,
+                opp_aggressed_this_hand=opp_aggressed_this_hand))
         else:
             # Neutral card features for unknown hands
             features.append(np.array([0.5, 0.5, 0.5, 0.5, 0.2],
@@ -635,7 +664,10 @@ class ObservationBuilder:
     def _equity_features(self, hole_cards: List[str],
                          community_cards: List[str],
                          n_opponents: int = 1,
-                         players=None) -> np.ndarray:
+                         players=None,
+                         hand_raise_count: int = 0,
+                         preflop_raise_count: int = 0,
+                         opp_aggressed_this_hand: float = 0.0) -> np.ndarray:
         """9 dims: equity + board texture features.
 
         obs[0]=hand_strength is now tier-aware (was: equity vs uniform random).
@@ -649,12 +681,10 @@ class ObservationBuilder:
         r2 = _rank_val(hole_cards[1][0])
         hi, lo = max(r1, r2), min(r1, r2)
 
-        # Tier-aware equity (replaces equity-vs-random). Postflop only;
-        # preflop result is discarded by the early return below.
-        if community_cards and _EVAL7_AVAILABLE and players is not None:
-            hand_strength = self._compute_obs18_threat_equity(
-                hole_cards, community_cards, players)
-        elif _EVAL7_AVAILABLE:
+        # obs[18] = raw MC equity vs a uniform-random opponent range. The
+        # threat-range overlay was reverted; _compute_obs18_threat_equity and
+        # src/range_equity.py remain available for future re-wiring.
+        if _EVAL7_AVAILABLE:
             try:
                 e7_hole = [_eval7.Card(c) for c in hole_cards[:2]]
                 e7_board = [_eval7.Card(c) for c in community_cards] if community_cards else []
@@ -771,11 +801,21 @@ class ObservationBuilder:
 
     def _compute_obs18_threat_equity(self, hole_cards: List[str],
                                        community_cards: List[str],
-                                       players) -> float:
+                                       players,
+                                       hand_raise_count: int = 0,
+                                       preflop_raise_count: int = 0,
+                                       opp_aggressed_this_hand: float = 0.0
+                                       ) -> float:
         """Tier-aware equity for obs[18] (replaces equity vs random).
 
         Reads per-street aggression from `players[i].bet_chips` and board
         texture from `community_cards`. Returns 0.0 on any error.
+
+        Optional aggression-history params (hand_raise_count,
+        preflop_raise_count, opp_aggressed_this_hand) drive CR / 3bet-pot
+        tier escalation when supplied by the caller. Defaults preserve the
+        old behavior (tier from per-street signals only) for callers that
+        don't track multi-street aggression.
         """
         try:
             if len(hole_cards) < 2 or not community_cards:
@@ -811,13 +851,33 @@ class ObservationBuilder:
                 facing_3bet_plus=facing_3bet_plus,
                 pot_was_raised=pot_was_raised,
                 board_flush_texture=board_flush_texture,
-                board_straight_texture=board_straight_texture)
+                board_straight_texture=board_straight_texture,
+                opp_aggressed_this_hand=opp_aggressed_this_hand,
+                hand_raise_count=int(hand_raise_count or 0),
+                preflop_raise_count=int(preflop_raise_count or 0))
 
             return get_threat_range_equity(
                 hole_cards, community_cards, tier,
                 spot_key=None, db_lookup=None, n_samples=300)
         except Exception:
             return 0.0
+
+    def _equity_vs_random(self, hole_cards, community_cards, n_opponents=1) -> float:
+        """Raw MC equity vs uniform-random range (pre-threat-overlay obs[18]).
+        Mirrors the agent/engine vs-random computation for the appended
+        equity_vs_random feature."""
+        if len(hole_cards) < 2 or not _EVAL7_AVAILABLE:
+            return self._approx_preflop_equity(hole_cards) if len(hole_cards) >= 2 else 0.0
+        try:
+            e7_hole = [_eval7.Card(c) for c in hole_cards[:2]]
+            e7_board = [_eval7.Card(c) for c in community_cards] if community_cards else []
+            if n_opponents <= 1:
+                ns = 1000 if not community_cards else 300
+                return float(_eval7.py_hand_vs_range_monte_carlo(
+                    e7_hole, _EVAL7_RANDOM_RANGE, e7_board, ns))
+            return float(self._multiway_equity(e7_hole, e7_board, n_opponents, 300))
+        except Exception:
+            return self._approx_preflop_equity(hole_cards)
 
     @staticmethod
     def _multiway_equity(hole: list, board: list, n_opponents: int,

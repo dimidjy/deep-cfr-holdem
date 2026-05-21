@@ -57,6 +57,7 @@ _REGRET_CLIP  = 1.0     # clip bound on regret after scaling
 _RAKE_PCT     = 0.0
 _RAKE_CAP     = 0.0
 _THREAT_RANGE_EQUITY = False  # appends equity_vs_threat_range to obs (+1 dim)
+_EQUITY_VS_RANDOM = False  # appends raw equity-vs-random as last dim (+1 dim)
 
 # =============================================================================
 # DEBUG LOGGING — temporary diagnostic, revert via git checkout after testing
@@ -118,7 +119,7 @@ _OPP_PREFLOP_RANGES = None  # wider NL5 ranges — always used for opponents
 _ARCHETYPE_MODE = False     # mixed archetype opponents (extends obs 50→55)
 _DECK_RESHUFFLE = False     # reshuffle undealt cards per branch rollout
 _BLUFF_PENALTY  = 0.0       # penalize raises with equity<threshold (value-only nudge)
-_BLUFF_THRESHOLD = 0.33     # equity below this counts as "bluff" — was 0.50, raised
+_BLUFF_THRESHOLD = 0.5     # equity below this counts as "bluff" — was 0.50, raised
                             # so marginal spots (e.g. 42% 3-way) get meaningful penalty
 _CALL_BONUS     = 0.0       # reward +EV calls (equity > pot_odds_required)
 _VALUE_BONUS    = 0.0       # reward raises with strong equity (any position)
@@ -190,6 +191,7 @@ def _try_rebuild_obs_vector(spot: dict):
                 behavioral_stats=True,
                 equity_vs_odds=True,
                 threat_range_equity=_THREAT_RANGE_EQUITY,
+                equity_vs_random=_EQUITY_VS_RANDOM,
             )
         from src.agent.game_state import GameState
         gs = GameState.from_dict(gs_dict)
@@ -223,6 +225,7 @@ def _worker_init(shared_adv, shared_strat, act_size, use_preflop_ranges=False,
                  barrel_fold_bonus=0.0, mid_pair_fold_bonus=0.0,
                  num_players=6, random_preflop_folds_dist=None,
                  threat_range_equity=False,
+                 equity_vs_random=False,
                  debug_log_dir=None):
     global _SHARED_ADV_NETS, _SHARED_STRAT_NETS, _ACT_SIZE, _PREFLOP_RANGES
     global _ARCHETYPE_MODE, _KBEST_POOL, _OPP_PREFLOP_RANGES
@@ -231,7 +234,7 @@ def _worker_init(shared_adv, shared_strat, act_size, use_preflop_ranges=False,
     global _BLUFF_DRAW_EXEMPT, _DRAW_CALL_BOOST, _DRAW_BET_BOOST, _BARREL_FOLD_BONUS
     global _MID_PAIR_FOLD_BONUS
     global _NUM_PLAYERS, _RANDOM_PREFLOP_FOLDS_DIST
-    global _THREAT_RANGE_EQUITY
+    global _THREAT_RANGE_EQUITY, _EQUITY_VS_RANDOM
     global _DEBUG_LOG_DIR
     _SHARED_ADV_NETS  = shared_adv
     _SHARED_STRAT_NETS = shared_strat
@@ -253,6 +256,7 @@ def _worker_init(shared_adv, shared_strat, act_size, use_preflop_ranges=False,
     _NUM_PLAYERS       = num_players
     _RANDOM_PREFLOP_FOLDS_DIST = random_preflop_folds_dist
     _THREAT_RANGE_EQUITY = threat_range_equity
+    _EQUITY_VS_RANDOM = equity_vs_random
     _DEBUG_LOG_DIR = debug_log_dir
     # Worker init log (one per worker process)
     if _DEBUG_LOG_DIR is not None:
@@ -326,6 +330,7 @@ def _make_engine(num_players):
         num_players=num_players,
         opponent_profile=_ARCHETYPE_MODE,
         threat_range_equity=_THREAT_RANGE_EQUITY,
+        equity_vs_random=_EQUITY_VS_RANDOM,
         rake_pct=_RAKE_PCT,
         rake_cap=_RAKE_CAP,
     )
@@ -444,8 +449,23 @@ def _create_worker_pool(num_workers, shared_adv, shared_strat, act_size,
                   getattr(args, '_num_players', 6),
                   getattr(args, '_random_preflop_folds_dist', None),
                   args.threat_range_equity,
+                  getattr(args, 'equity_vs_random', False),
                   getattr(args, 'debug_log_dir', None)),
     )
+
+
+def _shaper_equity(obs) -> float:
+    """Equity the reward shapers (bluff_penalty / call_bonus / etc.) read.
+
+    obs[18] = raw MC equity vs a uniform-random opponent range — exactly the
+    value the shaper thresholds (_BLUFF_THRESHOLD etc.) were calibrated for.
+    (The threat-range overlay and the appended equity_vs_random dim were
+    reverted; obs is 53-dim again.)
+    """
+    try:
+        return float(obs[18])
+    except Exception:
+        return 0.0
 
 
 def _traversal_worker(args):
@@ -965,7 +985,7 @@ def _traversal_worker(args):
     # obs[10]=pot_odds, obs[18]=hero equity (see CLAUDE.md observation layout).
     branch_rewards = _branch_exact(history, first_legal,
                                     n_visible_public=first_n_public,
-                                    hero_equity=float(first_obs[18]),
+                                    hero_equity=_shaper_equity(first_obs),
                                     pot_chips=first_pot_chips,
                                     pot_odds=float(first_obs[10]),
                                     obs=first_obs)
@@ -1013,7 +1033,7 @@ def _traversal_worker(args):
             n_pub          = len(eng._state.public_cards)
             branch_rewards = _branch_exact(history, legal_int,
                                             n_visible_public=n_pub,
-                                            hero_equity=float(obs[18]),
+                                            hero_equity=_shaper_equity(obs),
                                             pot_chips=eng.get_pot_size(),
                                             pot_odds=float(obs[10]),
                                             obs=obs)
@@ -1233,7 +1253,8 @@ def _selfplay_eval_stats(deep_cfr_ref, num_players, num_hands, eq_path):
         load_equity_model(eq_path, device='cpu')
 
     sp_eng = _mk_eng(num_players=num_players,
-                      threat_range_equity=_THREAT_RANGE_EQUITY)
+                      threat_range_equity=_THREAT_RANGE_EQUITY,
+                      equity_vs_random=_EQUITY_VS_RANDOM)
     sp_ranges = PreflopRanges(num_players=num_players)
     postflop = {'bets': 0, 'calls': 0, 'checks': 0, 'folds': 0}
 
@@ -1352,9 +1373,17 @@ def main():
                         help='Mixed archetype opponent training (extends obs to 55 dims)')
     parser.add_argument('--threat-range-equity', action='store_true',
                         default=False,
-                        help='[DEPRECATED] threat_range_equity is now merged '
-                             'into obs[18] (hand_strength). Flag accepted but '
-                             'has no effect — obs remains 53-dim.')
+                        help='[DEPRECATED/no-op] threat-range overlay was '
+                             'reverted; obs[18] is raw equity-vs-random and obs '
+                             'is 53-dim. Flag accepted but ignored.')
+    parser.add_argument('--equity-vs-random', dest='equity_vs_random',
+                        action='store_true', default=False,
+                        help='[DEPRECATED/no-op] the appended equity_vs_random '
+                             'dim was reverted; obs[18] is now raw '
+                             'equity-vs-random and obs is 53-dim. Ignored.')
+    parser.add_argument('--no-equity-vs-random', dest='equity_vs_random',
+                        action='store_false',
+                        help='[DEPRECATED/no-op] obs is 53-dim regardless.')
     parser.add_argument('--debug-log-dir', type=str, default=None,
                         help='[DEBUG] Write JSONL debug logs to this directory '
                              '(workers write to worker_<pid>.jsonl, main to '
@@ -1533,12 +1562,13 @@ def main():
     args._random_preflop_folds_dist = fold_dist
 
     # Set globals so _make_engine() uses them in workers
-    global _ARCHETYPE_MODE, _RAKE_PCT, _RAKE_CAP, _THREAT_RANGE_EQUITY
+    global _ARCHETYPE_MODE, _RAKE_PCT, _RAKE_CAP, _THREAT_RANGE_EQUITY, _EQUITY_VS_RANDOM
     global _DEBUG_LOG_DIR
     _ARCHETYPE_MODE = args.archetype_mode
     _RAKE_PCT = args.rake
     _RAKE_CAP = args.rake_cap
     _THREAT_RANGE_EQUITY = args.threat_range_equity
+    _EQUITY_VS_RANDOM = args.equity_vs_random
     _DEBUG_LOG_DIR = args.debug_log_dir
     if _DEBUG_LOG_DIR:
         Path(_DEBUG_LOG_DIR).mkdir(parents=True, exist_ok=True)
@@ -2179,7 +2209,11 @@ def main():
                     print(f'  K-Best pool update failed: {e}')
 
             # ── Checkpoint save ─────────────────────────────────────────────
-            if iter_num % ckpt_interval == 0:
+            # Save .pt on the normal cadence, plus once at each phase boundary
+            # end so every phase leaves behind a matching (.pt + _buffer.npz)
+            # resume point even if ckpt_interval doesn't divide the boundary.
+            is_phase_end = iter_num in (PHASE1_END, PHASE2_END)
+            if iter_num % ckpt_interval == 0 or is_phase_end:
                 ckpt = str(models_dir / f'checkpoint_iter_{iter_num}.pt')
                 deep_cfr.save_models(ckpt)
                 meta = {'iteration': iter_num,
@@ -2193,7 +2227,13 @@ def main():
                 # Historical buffers are KEPT (not deleted) — gives you multiple
                 # restart candidates if training diverges. Buffer files are large
                 # (~hundreds of MB each), so choose the interval carefully.
-                if iter_num % BUFFER_SAVE_INTERVAL == 0:
+                # Phase 1/2 skip the per-interval saves (low value), but we DO
+                # save once at each phase boundary end (iter 600 / 1600): the
+                # buffer is cleared at the next phase's first iter, so this is
+                # the last chance to capture that phase's full buffer.
+                save_buffer = is_phase_end or (
+                    iter_num > PHASE2_END and iter_num % BUFFER_SAVE_INTERVAL == 0)
+                if save_buffer:
                     buf_path = ckpt.replace('.pt', '_buffer.npz')
                     try:
                         deep_cfr.replay_buffer.save(buf_path)
@@ -2202,7 +2242,9 @@ def main():
                         print(f'  [buffer save warning: {e}]')
 
             # ── Self-play + validation every EVAL_INTERVAL iters ────────────
-            if iter_num % EVAL_INTERVAL == 0:
+            # Skipped during Phase 1/2 — spot/self-play validation is only
+            # meaningful once the net is in the mixed-pool Phase 3 regime.
+            if iter_num % EVAL_INTERVAL == 0 and iter_num > PHASE2_END:
                 _run_eval(deep_cfr, engine, iter_num)
 
     finally:

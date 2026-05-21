@@ -53,10 +53,16 @@ _TIER_RANGE_STRS = [
     _build_random_range_str(),
     # ~40% — open-raise / loose 3bet-call / std cbet range
     "22+,A2s+,A8o+,K2s+,K9o+,Q2s+,Q9o+,J6s+,JTo,T7s+,T9o,96s+,98o,86s+,76s,65s,54s",
-    # ~15% — 3bet value / strong cbet / barrel range
-    "66+,A9s+,ATo+,K9s+,KJo+,Q9s+,QTo+,J9s+,JTo,T9s,98s,87s",
-    # ~5% — 4bet+ value / river-jam range
-    "99+,AJs+,AQo+,KQs",
+    # ~20% — 3bet value / strong cbet / barrel / check-raise range.
+    # Includes 22-55 (small pocket pairs → sets on low boards) and small
+    # suited connectors (54s, 65s, 76s → two-pair combos on low boards) —
+    # without these the tier under-represents typical check-raise ranges
+    # on low-card flops, leaving hero's "pair of N" looking too strong.
+    "22+,A9s+,ATo+,K9s+,KJo+,Q9s+,QTo+,J9s+,JTo,T9s,98s,87s,76s,65s,54s",
+    # ~8% — 4bet+ value / river-jam range. Includes 22+ (all pocket pairs)
+    # because river jams come from sets, which can be any pair that hits
+    # the board.
+    "22+,AJs+,AQo+,KQs",
 ]
 
 if _EVAL7_AVAILABLE:
@@ -71,7 +77,9 @@ def select_threat_tier(num_raises_norm: float = 0.0,
                        pot_was_raised: float = 0.0,
                        board_flush_texture: float = 0.0,
                        board_straight_texture: float = 0.0,
-                       opp_aggressed_this_hand: float = 0.0) -> int:
+                       opp_aggressed_this_hand: float = 0.0,
+                       hand_raise_count: int = 0,
+                       preflop_raise_count: int = 0) -> int:
     """Pick tier 0..3 from per-street aggression signals.
 
     `num_raises_norm` and `max_bet_sizing` accumulate hand-wide (preflop
@@ -83,20 +91,50 @@ def select_threat_tier(num_raises_norm: float = 0.0,
     this hand) lifts tier from 0 → 1 when the current street is checked
     through. Carries multi-street aggression context that pot_was_raised
     loses when bets get collected into the pot between streets.
+
+    `hand_raise_count` (total raises this hand, hero + opp, all streets):
+    ≥ 3 indicates multi-aggression scenarios like check-raise (hero open
+    + hero bet + opp raise) or 3bet-pot continuation. Such ranges are
+    concentrated nuts/strong — escalates tier to 3 directly so hero's
+    equity estimate doesn't get inflated by a tier-1 (40%) range that
+    includes air the opp would never have at this aggression depth.
     """
+    # Detect multi-aggression scenarios. ≥ 3 total raises this hand means
+    # at least one opp raise (3 raises minimum require 2 hero + 1 opp or
+    # 1 hero + 2 opp by alternation). Both branches imply opp's range is
+    # concentrated regardless of who raised LAST:
+    #   - Hero last_agg (4bet pot, opp called) → opp called a 4-bet → tight
+    #   - Opp last_agg (CR, opp 3-bet flop after hero cbet) → opp raised
+    #     into hero's bet → tight by show of strength
+    # Drop the `opp_aggressed_this_hand` requirement so 4-bet pots where
+    # hero is the last aggressor still see opp's narrowed range.
+    multi_aggression = hand_raise_count >= 3
+
+    # 3-bet pot preflop: opp's range is fundamentally tight on every postflop
+    # street (3-bet call/raise range ~5-7%) regardless of postflop action.
+    # `preflop_raise_count >= 2` catches both: opp 3-bet (hero called) AND
+    # hero 3-bet (opp called). Either way opp's range is concentrated.
+    # Distinguishes from "1 preflop open + 1 postflop bet" (hand_raise_count=2
+    # too, but opp's range is much wider there — flop donking range).
+    preflop_3bet_or_higher = preflop_raise_count >= 2
+
     if pot_was_raised < 0.5:
         # No bet THIS street, but did opp show aggression earlier?
-        if opp_aggressed_this_hand >= 0.5:
-            tier = 1                   # prior aggression → opp's range narrow
+        if multi_aggression or preflop_3bet_or_higher:
+            tier = 3                   # multi-raise / 3bet pot → polarized range
+        elif opp_aggressed_this_hand >= 0.5:
+            tier = 1                   # single prior bet → narrow but not nuts
         else:
             tier = 0                   # truly passive
     elif facing_3bet_plus >= 0.5:
         tier = 3                       # 3bet+ pressure this street
+    elif multi_aggression or preflop_3bet_or_higher:
+        tier = 3                       # CR/4bet-pot history or 3bet pot
     else:
         tier = 1                       # single bet/raise this street
 
     board_wet = max(board_flush_texture, board_straight_texture) > 0.4
-    if board_wet and tier > 0:
+    if board_wet and 0 < tier < 3:
         tier = min(tier + 1, 3)        # wet board → tighter implied range
 
     return tier

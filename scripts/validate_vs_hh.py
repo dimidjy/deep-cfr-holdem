@@ -125,7 +125,8 @@ def _current_strategy(deep_cfr, obs, player_idx, legal):
 def _make_engine(num_players: int, legacy_game_state: bool = False,
                   behavioral_stats: bool = False,
                   betting_line: bool = False,
-                  threat_range_equity: bool = False) -> EnhancedPokerEngine:
+                  threat_range_equity: bool = False,
+                  equity_vs_random: bool = False) -> EnhancedPokerEngine:
     return EnhancedPokerEngine(
         num_players=num_players,
         add_position_features=True,
@@ -140,6 +141,7 @@ def _make_engine(num_players: int, legacy_game_state: bool = False,
         behavioral_stats=behavioral_stats,
         betting_line=betting_line,
         threat_range_equity=threat_range_equity,
+        equity_vs_random=equity_vs_random,
     )
 
 
@@ -270,7 +272,8 @@ def _load_model(model_path: Path, config: dict, num_players: int,
                 legacy: bool = False, model_num_players: int = None,
                 behavioral_stats: bool = False,
                 betting_line: bool = False,
-                threat_range_equity: bool = False):
+                threat_range_equity: bool = False,
+                equity_vs_random: bool = False):
     """Load model. If model_num_players is set and differs from num_players,
     observations will be padded from num_players to model_num_players format."""
     ckpt = torch.load(str(model_path), map_location='cpu')
@@ -293,7 +296,8 @@ def _load_model(model_path: Path, config: dict, num_players: int,
         engine_for_model = _make_engine(model_np, legacy_game_state=legacy,
                                          behavioral_stats=behavioral_stats,
                                          betting_line=betting_line,
-                                         threat_range_equity=threat_range_equity)
+                                         threat_range_equity=threat_range_equity,
+                                         equity_vs_random=equity_vs_random)
         obs_size = ckpt.get('obs_size', engine_for_model.get_observation_space_size())
         action_size = ckpt.get('action_size', engine_for_model.get_action_space_size())
         hidden = ckpt.get('hidden_layers', config['network']['hidden_layers'])
@@ -308,7 +312,8 @@ def _load_model(model_path: Path, config: dict, num_players: int,
     engine = _make_engine(num_players, legacy_game_state=legacy,
                           behavioral_stats=behavioral_stats,
                           betting_line=betting_line,
-                          threat_range_equity=threat_range_equity)
+                          threat_range_equity=threat_range_equity,
+                          equity_vs_random=equity_vs_random)
     # Auto-detect hidden layer dims from checkpoint state_dict (layers 0/5/9
     # are the three Linear layers between residual blocks). Falls back to
     # config-file value for older / non-standard architectures.
@@ -1480,9 +1485,12 @@ def main():
     parser.add_argument('--betting-line', action='store_true',
                         help='Append 3-dim betting-line features (requires behavioral stats)')
     parser.add_argument('--threat-range-equity', action='store_true',
-                        help='Append equity_vs_threat_range feature (+1 dim, '
-                             'requires behavioral stats). Set for models trained '
-                             'with --threat-range-equity. Auto-detected by obs size.')
+                        help='[DEPRECATED] threat-range equity is merged into '
+                             'obs[18] (no extra dim). Flag has no effect.')
+    parser.add_argument('--equity-vs-random', action='store_true',
+                        help='Append raw equity-vs-random feature (+1 dim → '
+                             '54-dim). Set for models trained with '
+                             '--equity-vs-random. Auto-detected by obs size.')
     parser.add_argument('--fold-equity', type=float, default=_DEFAULT_P_FOLD,
                         help=f'Assumed opponent fold probability when model raises '
                              f'where NL5 player did not (default {_DEFAULT_P_FOLD}). '
@@ -1623,10 +1631,11 @@ def main():
             _input_sz = _ckpt['advantage_networks'][0]['network.0.weight'].shape[1]
             if _input_sz >= 50: args.behavioral_stats = True
             if _input_sz >= 53: args.betting_line = True
-            if _input_sz >= 54: args.threat_range_equity = True
+            # equity_vs_random reverted: obs is 53-dim, obs[18] = raw
+            # equity-vs-random. The flag is no longer used (kept inert).
+            args.equity_vs_random = False
             print(f'Auto-detected obs flags: bh={args.behavioral_stats} '
-                  f'bl={args.betting_line} threat={args.threat_range_equity} '
-                  f'(input_size={_input_sz})')
+                  f'bl={args.betting_line} (input_size={_input_sz})')
         except Exception:
             pass
 
@@ -1634,7 +1643,8 @@ def main():
                                model_num_players=model_np if num_players != model_np else None,
                                behavioral_stats=args.behavioral_stats,
                                betting_line=args.betting_line,
-                               threat_range_equity=args.threat_range_equity)
+                               threat_range_equity=args.threat_range_equity,
+                               equity_vs_random=args.equity_vs_random)
         for net in deep_cfr.advantage_networks + deep_cfr.strategy_networks:
             net.eval()
         print(f'Loaded model: {model_path.name}  (iteration {deep_cfr.iteration})')
@@ -1688,7 +1698,8 @@ def main():
     for i, hand in enumerate(showdown):
         dps = builder.build_decision_points(
             hand, behavioral_stats=use_bh,
-            threat_range_equity=args.threat_range_equity)
+            threat_range_equity=args.threat_range_equity,
+            equity_vs_random=args.equity_vs_random)
         if dps:
             all_decision_points.extend(dps)
             hands_with_dp += 1
