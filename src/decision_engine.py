@@ -206,6 +206,11 @@ class DecisionConfig:
     # bets). Falls back to percentile path on sparse spots.
     postflop_use_histogram_sampling: bool = True
     postflop_min_samples_for_histogram: int = 20
+    # When True, the cohort POT→ALL-IN promotion only fires with set-or-better
+    # or two pair made by hero's hole cards (board NOT paired). Blocks
+    # auto-shoving counterfeited/weak hands (e.g. top pair + a board pair on a
+    # paired 3-flush). Blocked spots fall through to a normal sized raise.
+    postflop_promotion_requires_strong_hand: bool = True
 
     # Re-raise classifier
     reraise_classifier_path: str = ''
@@ -449,6 +454,7 @@ class DecisionEngine:
                         min_samples_for_promotion=self.config.postflop_min_samples_for_promotion,
                         use_histogram_sampling=self.config.postflop_use_histogram_sampling,
                         min_samples_for_histogram=self.config.postflop_min_samples_for_histogram,
+                        promotion_requires_strong_hand=self.config.postflop_promotion_requires_strong_hand,
                     )
                     logger.info(
                         f"Postflop sizing loaded from "

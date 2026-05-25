@@ -22,7 +22,22 @@ from typing import Dict, List, Optional, Tuple, Union
 from src.postflop_db import connect, load_lookup_into_memory
 from src.postflop_spot_key import (
     PostflopSpotKey, MIN_SAMPLES_PER_SPOT, build_spot_key,
+    HB_TWO_PAIR, HB_TRIPS_SET, HB_STRAIGHT, HB_FLUSH, HB_FULL_PLUS,
 )
+
+# Hand buckets that always qualify for the all-in promotion: three of a
+# kind or better (set/trips, straight, flush, full house+). These are
+# strong, non-counterfeited holdings worth stacking off.
+_PROMOTION_SET_PLUS_BUCKETS = frozenset(
+    {HB_TRIPS_SET, HB_STRAIGHT, HB_FLUSH, HB_FULL_PLUS})
+
+
+def _board_is_paired(community: List[str]) -> bool:
+    """True if any rank appears twice or more on the board (pair/trips/
+    quads on the board). Cards are 'Rs' strings (rank = all but last char,
+    suit = last char), so 'Ts'→'T', '5c'→'5'."""
+    ranks = [c[:-1].upper() for c in (community or []) if c and len(c) >= 2]
+    return len(ranks) != len(set(ranks))
 
 # Boundary between "small bet" (RAISE_HALF) and "big bet" (RAISE_POT) when
 # filtering the cohort bet-size histogram. Buckets whose median pct is
@@ -86,7 +101,8 @@ class PostflopSizingLookup:
                  all_in_promotion_threshold: Union[float, Dict[str, float]] = 0.35,
                  min_samples_for_promotion: int = 20,
                  use_histogram_sampling: bool = True,
-                 min_samples_for_histogram: int = 20):
+                 min_samples_for_histogram: int = 20,
+                 promotion_requires_strong_hand: bool = True):
         if not Path(db_path).exists():
             raise FileNotFoundError(
                 f'Postflop sizing DB not found at {db_path}. '
@@ -96,6 +112,14 @@ class PostflopSizingLookup:
         self._min_samples_for_promotion = min_samples_for_promotion
         self._use_histogram_sampling = use_histogram_sampling
         self._min_samples_for_histogram = min_samples_for_histogram
+        # When True, the cohort all-in promotion only fires with genuinely
+        # strong, non-counterfeited hands: set-or-better, or two pair hero
+        # made with his own hole cards (board NOT paired). A "two pair" on a
+        # paired board is usually top-pair + a counterfeiting board pair with
+        # a weak kicker — the coarse `two_pair` cohort bucket overvalues it
+        # (cohort shove% is dominated by genuine two pairs/sets). Weaker
+        # holdings (pairs, high card) are never auto-shoved by the database.
+        self._promotion_requires_strong_hand = promotion_requires_strong_hand
         conn = connect(db_path)
         try:
             self._cache: Dict[Tuple, Dict] = load_lookup_into_memory(conn)
@@ -104,7 +128,7 @@ class PostflopSizingLookup:
         self._counters = {
             'queries': 0, 'no_data': 0,
             'sizing_override': 0, 'all_in_promotions': 0,
-            'promo_below_sample_floor': 0,
+            'promo_below_sample_floor': 0, 'promo_blocked_weak_hand': 0,
             'histogram_sampled': 0, 'histogram_fallback': 0,
             'non_postflop': 0, 'non_raise': 0, 'error_fallback': 0,
         }
@@ -133,6 +157,31 @@ class PostflopSizingLookup:
             # safer than defaulting low and accidentally promoting unknown SPRs.
             return float(thr.get(spr_bucket, 1.01))
         return float(thr)
+
+    def _promotion_hand_allowed(self, spot: PostflopSpotKey,
+                                spot_inputs: Dict) -> bool:
+        """Whether hero's hand is strong enough to auto-shove via the cohort
+        all-in promotion.
+
+        Allowed only for genuinely strong, non-counterfeited holdings:
+          - set or better (trips/set, straight, flush, full house+), OR
+          - two pair that hero made with his own hole cards — i.e. the board
+            is NOT paired (a "two pair" on a paired board is usually top pair
+            + a counterfeiting board pair with a weak kicker, which the
+            coarse `two_pair` cohort bucket badly overvalues).
+        Everything weaker (one pair, high card) is never auto-shoved.
+
+        Disabled (always True) when `promotion_requires_strong_hand=False`,
+        restoring the legacy behaviour.
+        """
+        if not self._promotion_requires_strong_hand:
+            return True
+        hb = spot.hand_bucket
+        if hb in _PROMOTION_SET_PLUS_BUCKETS:
+            return True
+        if hb == HB_TWO_PAIR:
+            return not _board_is_paired(spot_inputs.get('community_cards'))
+        return False
 
     @property
     def num_spots(self) -> int:
@@ -236,7 +285,17 @@ class PostflopSizingLookup:
         all_in_pct_frac = float(row['all_in_pct']) / 100.0
         spr_threshold = self._threshold_for_spr(spot.spr_bucket)
         if all_in_pct_frac >= spr_threshold:
-            if row['n_samples'] < self._min_samples_for_promotion:
+            if not self._promotion_hand_allowed(spot, spot_inputs):
+                self._counters['promo_blocked_weak_hand'] += 1
+                logger.info(
+                    f"Postflop ALL-IN promotion BLOCKED (weak/counterfeit hand): "
+                    f"{spot.to_tuple()} hand_bucket={spot.hand_bucket} "
+                    f"board={spot_inputs.get('community_cards')} "
+                    f"cohort_shove={row['all_in_pct']:.0f}% — require set+ or "
+                    f"two pair on an UNpaired board to stack off")
+                # Fall through to sizing-override path below (sized raise,
+                # not all-in).
+            elif row['n_samples'] < self._min_samples_for_promotion:
                 self._counters['promo_below_sample_floor'] += 1
                 logger.info(
                     f"Postflop ALL-IN promotion SUPPRESSED (low samples): "

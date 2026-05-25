@@ -312,6 +312,17 @@ def run_self_play(engine: DecisionEngine, num_hands: int,
     stats = {i: PlayerStats() for i in range(ENGINE_PLAYERS)}
     t0 = time.time()
 
+    # Build the unified decision pipeline for each real DecisionEngine (hero +
+    # a symmetric engine_b). This is the SAME pipeline the runtime agent runs, so
+    # self-play no longer diverges. low_pot_sampling=True preserves self-play's
+    # existing stochastic small-pot sampling. ArchetypeEngine (archetype mode)
+    # is intentionally NOT unified — it keeps its own proportional sampler.
+    from src.agent.decision_pipeline import build_pipeline, DecisionState
+    pipelines = {}
+    for _e in (engine, engine_b):
+        if isinstance(_e, DecisionEngine):
+            pipelines[id(_e)] = build_pipeline(_e, {}, low_pot_sampling=True)
+
     for hand_idx in range(num_hands):
         state = eng.reset()
         if hand_idx % 2000 == 0 and hand_idx > 0:
@@ -439,52 +450,65 @@ def run_self_play(engine: DecisionEngine, num_hands: int,
                 call_amount_bb=call_amount_bb,
             )
 
-            # Get action from DecisionEngine (same pipeline as runtime agent)
-            # In vs mode: even seats (0,2,4) = engine A, odd seats (1,3,5) = engine B
+            # Get action via the UNIFIED decision pipeline (same code path as
+            # the runtime agent). In vs mode: even seats = engine A, odd = B.
             active_engine = engine if (engine_b is None or seat % 2 == 0) else engine_b
-            action, strategy_list = active_engine.decide(ctx)
-
-            # ── Postflop sizing override (mirrors default_core.decide()) ──
-            # The DecisionEngine itself doesn't invoke _postflop_sizing — that
-            # call lives in the runtime agent's wrapper. To make self-play stats
-            # reflect the same action distribution the runtime agent produces,
-            # invoke the override here too. This may promote a raise → ALL_IN.
-            if (track_range_analysis
-                    and stage in ('Flop', 'Turn', 'River')
-                    and action in (RAISE_HALF, RAISE_POT, ALL_IN, RAISE_MIN)
-                    and getattr(active_engine, '_postflop_sizing', None) is not None):
+            pipe = pipelines.get(id(active_engine))
+            if pipe is not None:
+                community = []
                 try:
-                    community = []
+                    community = [str(c) for c in eng.get_community_cards()]
+                except Exception:
+                    pass
+                eff_stack = eng.get_player_chips(agent) / 2.0
+                st = DecisionState(
+                    ctx=ctx, engine=active_engine, obs=obs, legal=legal,
+                    street=ctx.street,
+                    call_amount_bb=call_amount_bb,
+                    my_stack_bb=eff_stack,
+                    effective_stack_bb=eff_stack,
+                    min_raise_bb=1.0,         # RAISE_THIRD size is unused by self-play
+                    pot_total=pot_bb,
+                    community_cards=community,
+                    hole_cards=cards,
+                    num_active=ENGINE_PLAYERS,
+                    was_preflop_raiser=(seat == preflop_raiser),
+                    facing_bet_size_pct=(1.0 if facing_bet else None),
+                )
+                pipe.run(st)
+                action, strategy_list = st.action, st.strategy_list
+            else:
+                # Non-unified engine (ArchetypeEngine) — keep its own sampler,
+                # plus the postflop sizing override (no-op when it has no DB).
+                action, strategy_list = active_engine.decide(ctx)
+                if (stage in ('Flop', 'Turn', 'River')
+                        and action in (RAISE_HALF, RAISE_POT, ALL_IN, RAISE_MIN)
+                        and getattr(active_engine, '_postflop_sizing', None) is not None):
                     try:
-                        community = [str(c) for c in eng.get_community_cards()]
+                        community = []
+                        try:
+                            community = [str(c) for c in eng.get_community_cards()]
+                        except Exception:
+                            pass
+                        spot_inputs = {
+                            'street': stage.lower(), 'obs': obs, 'hole_cards': cards,
+                            'community_cards': community, 'rel_pos': rel_pos,
+                            'num_active': ENGINE_PLAYERS,
+                            'effective_stack_bb': eng.get_player_chips(agent) / 2.0,
+                            'pot_bb': max(pot_bb, 0.01),
+                            'was_preflop_raiser': (seat == preflop_raiser),
+                            'facing_bet_size_pct': (1.0 if facing_bet else None),
+                            'facing_check_raise': False, 'call_amount_bb': 0.0,
+                        }
+                        new_action, _ = active_engine._postflop_sizing.adjust(
+                            action, spot_inputs)
+                        if new_action != action:
+                            action = new_action
+                            strategy_list = [0.0] * NUM_ACTIONS
+                            if 0 <= action < NUM_ACTIONS:
+                                strategy_list[action] = 1.0
                     except Exception:
                         pass
-                    spot_inputs = {
-                        'street': stage.lower(),
-                        'obs': obs,
-                        'hole_cards': cards,
-                        'community_cards': community,
-                        'rel_pos': rel_pos,
-                        'num_active': ENGINE_PLAYERS,
-                        'effective_stack_bb': eng.get_player_chips(agent) / 2.0,
-                        'pot_bb': max(pot_bb, 0.01),
-                        'was_preflop_raiser': (seat == preflop_raiser),
-                        # facing_bet_size_pct: rough proxy from pot_odds (only
-                        # nonzero when facing a bet; ratio is approximate).
-                        'facing_bet_size_pct': (1.0 if facing_bet else None),
-                        'facing_check_raise': False,
-                        'call_amount_bb': 0.0,
-                    }
-                    new_action, _ = active_engine._postflop_sizing.adjust(
-                        action, spot_inputs)
-                    if new_action != action:
-                        action = new_action
-                        strategy_list = [0.0] * NUM_ACTIONS
-                        if 0 <= action < NUM_ACTIONS:
-                            strategy_list[action] = 1.0
-                except Exception:
-                    # Counter increments to error_fallback on its own
-                    pass
 
             # ── Record preflop stats ──
             if stage == 'Preflop':
