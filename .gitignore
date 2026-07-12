@@ -53,3 +53,6 @@ scripts/analysis/results/*
 tournament/*
 
 debug_report.html
+
+# TexasSolver binary + resources (large; install via scripts/setup_texassolver.sh)
+tools/texassolver/
