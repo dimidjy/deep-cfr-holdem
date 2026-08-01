@@ -44,30 +44,17 @@ logger = logging.getLogger('decision_engine')
 # Feature index constants (shared across entire codebase)
 # ─────────────────────────────────────────────────────────────────────────────
 
-IDX_POT_NORM = 8       # obs[8]  = pot / (6 * 100)
-IDX_POT_ODDS = 10      # obs[10] = pot / (pot + call)   — 0 when not facing bet
-IDX_EQUITY = 18         # obs[18] = hand_strength (equity vs random)
-IDX_MADE_HAND = 19      # obs[19] = made_hand_cat (0.0=highcard .. 0.875=quads)
-IDX_FLUSH_DRAW = 20     # obs[20] = hero_flush_participation (0/0.5/1.0)
-IDX_STRAIGHT_DRAW = 21  # obs[21] = hero_straight_participation (0/0.5/1.0)
-IDX_TOP_PAIR = 22       # obs[22] = top_pair (0 or 1)
-IDX_BOARD_PAIR = 23     # obs[23] = board_pairing_level (0/0.33/0.67/1.0)
-IDX_BOARD_FLUSH = 24    # obs[24] = board_flush_texture
-IDX_BOARD_STRAIGHT = 25 # obs[25] = board_straight_texture
-IDX_RANK_WITHIN_CAT = 26  # obs[26] = hand_rank_within_cat (0=worst..1=best in category)
-IDX_STACK_TO_POT = 9    # obs[9]  = effective_stack / pot (SPR)
-IDX_IS_RIVER = 30       # obs[30] = is_river flag
-IDX_HIGH_CARD = 13      # obs[13] = high_card_norm ((hi-2)/12, A=1.0, J≈0.75)
-
-# Made hand categories
-HAND_HIGH_CARD = 0.0
-HAND_ONE_PAIR = 0.125
-HAND_TWO_PAIR = 0.25
-HAND_TRIPS = 0.375
-HAND_STRAIGHT = 0.5
-HAND_FLUSH = 0.625
-HAND_FULL_HOUSE = 0.75
-HAND_QUADS = 0.875
+# Re-exported from src/obs_schema.py, which derives every index from the one
+# canonical feature list. Do not turn these back into literals — a second copy
+# is how obs[18] and the annotator's made-hand labels drifted apart before.
+from src.obs_schema import (  # noqa: F401  (re-exported for existing callers)
+    IDX_POT_NORM, IDX_POT_ODDS, IDX_EQUITY, IDX_MADE_HAND,
+    IDX_FLUSH_DRAW, IDX_STRAIGHT_DRAW, IDX_TOP_PAIR, IDX_BOARD_PAIR,
+    IDX_BOARD_FLUSH, IDX_BOARD_STRAIGHT, IDX_RANK_WITHIN_CAT,
+    IDX_STACK_TO_POT, IDX_IS_RIVER, IDX_HIGH_CARD,
+    HAND_HIGH_CARD, HAND_ONE_PAIR, HAND_TWO_PAIR, HAND_TRIPS,
+    HAND_STRAIGHT, HAND_FLUSH, HAND_FULL_HOUSE, HAND_QUADS,
+)
 
 # Action indices
 FOLD = 0
@@ -170,14 +157,19 @@ class DecisionConfig:
     # (≥95% on virtually every kept row), so per-row mixing multipliers
     # have no effect. Defaults below tighten BTN by 20% (0.25 → 0.30) and
     # loosen non-BTN by 20% (0.25 → 0.20).
+    # THE single source of truth for these thresholds. The runtime agent used to
+    # carry its own copy in the agent config that had
+    # drifted (BTN .35/SB .30 live vs BTN .30/SB .50 here), so self-play and
+    # validation were measuring a different strategy than the agent played.
+    # The JSON copy was removed; per-table overrides remain possible but are
+    # no longer needed to reproduce production behavior.
     preflop_pos_min_play_rate: Dict[str, float] = field(default_factory=lambda: {
-        # Position-aware thresholds (2026-05-19 — re-tuned to balance the
-        # cross-position RFI spread). Cohort plays loose from BTN/SB and
-        # tight from EP, so use HIGH thresholds late (trim BTN/SB) and LOW
-        # thresholds early (let LJ/HJ open as wide as the cohort allows).
-        # Target RFI: LJ~18, HJ~21, CO~25, BTN~26, SB~31. See
-        # scripts/analyze_preflop_ranges.py for the calibration data.
-        'BTN': 0.30, 'SB': 0.50, 'BB': 0.30, 'LJ': 0.20, 'HJ': 0.20, 'CO': 0.25,
+        # Position-aware thresholds. Cohort plays loose from BTN/SB and tight
+        # from EP, so use HIGH thresholds late (trim BTN/SB) and LOW thresholds
+        # early (let LJ/HJ open as wide as the cohort allows). Values below are
+        # the ones the runtime agent has actually been playing.
+        # See scripts/analyze_preflop_ranges.py for the calibration data.
+        'BTN': 0.35, 'SB': 0.30, 'BB': 0.30, 'LJ': 0.20, 'HJ': 0.20, 'CO': 0.25,
     })
 
     # Postflop sizing (data-driven cohort sizes for bets/raises)

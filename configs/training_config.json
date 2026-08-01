@@ -12,12 +12,17 @@
     "train_passes": 7,
     "gradient_clip": 1.0,
     "lr_scheduler_t_max": 5000,
-    "imitation_weight": 0.02,
-    "imitation_passes": 1,
-    "random_preflop_folds": "0:100"
+    "imitation_weight": 0.03,
+    "imitation_passes": 3,
+    "random_preflop_folds": "0:100",
+    "imitation_batch_size": 256
   },
   "network": {
-    "hidden_layers": [512, 512, 256],
+    "hidden_layers": [
+      512,
+      512,
+      256
+    ],
     "activation": "leaky_relu",
     "dropout": 0.15
   },
@@ -38,6 +43,8 @@
     "draw_call_boost": 0.2,
     "draw_bet_boost": 0.2,
     "barrel_fold_bonus": 0.2,
-    "mid_pair_fold_bonus": 0.2
+    "mid_pair_fold_bonus": 0.2,
+    "station_rate": 0.0,
+    "station_call_boost": 1.75
   }
 }

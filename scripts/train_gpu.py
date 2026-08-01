@@ -151,6 +151,23 @@ _MID_PAIR_FOLD_BONUS = 0.0        # extra FOLD-reward bonus when hero faces ANY 
                                   # pair to aggression" exploit beyond just heavy
                                   # 3-barrel lines — single bets, turn probes, etc.
                                   # Fires ONLY when action == FOLD and pot_odds > 0.
+_STATION_RATE       = 0.0         # fraction of traversals where postflop opponents
+                                  # play as calling stations (call boosted, fold cut).
+                                  # Teaches hero that bluffs don't get through and
+                                  # value bets get paid — the actual NL5 pool shape.
+_STATION_CALL_BOOST = 1.75        # multiplier on opponent CALL prob in station
+                                  # traversals; FOLD prob is divided by the same
+                                  # factor, then the strategy is renormalized.
+
+
+def _rollouts_for_street(n_visible_public):
+    """Rollouts per branch action: 3 preflop/flop, 5 turn/river.
+
+    Turn/river regrets need the least noise (that's where the measured
+    leaks live) and their rollouts are the cheapest — few decisions left
+    to terminal — so the extra samples cost little.
+    """
+    return 5 if n_visible_public >= 4 else 3
 
 # Training table size + forced preflop folds (simulates shorter tables).
 # _RANDOM_PREFLOP_FOLDS_DIST is a list of (num_forced_folds, weight) tuples.
@@ -226,13 +243,14 @@ def _worker_init(shared_adv, shared_strat, act_size, use_preflop_ranges=False,
                  num_players=6, random_preflop_folds_dist=None,
                  threat_range_equity=False,
                  equity_vs_random=False,
+                 station_rate=0.0, station_call_boost=1.75,
                  debug_log_dir=None):
     global _SHARED_ADV_NETS, _SHARED_STRAT_NETS, _ACT_SIZE, _PREFLOP_RANGES
     global _ARCHETYPE_MODE, _KBEST_POOL, _OPP_PREFLOP_RANGES
     global _DECK_RESHUFFLE, _BLUFF_PENALTY, _CALL_BONUS, _VALUE_BONUS, _FOLD_PENALTY
     global _ALLIN_MONSTER_RATE, _ALLIN_MONSTER_THRESHOLD
     global _BLUFF_DRAW_EXEMPT, _DRAW_CALL_BOOST, _DRAW_BET_BOOST, _BARREL_FOLD_BONUS
-    global _MID_PAIR_FOLD_BONUS
+    global _MID_PAIR_FOLD_BONUS, _STATION_RATE, _STATION_CALL_BOOST
     global _NUM_PLAYERS, _RANDOM_PREFLOP_FOLDS_DIST
     global _THREAT_RANGE_EQUITY, _EQUITY_VS_RANDOM
     global _DEBUG_LOG_DIR
@@ -253,6 +271,8 @@ def _worker_init(shared_adv, shared_strat, act_size, use_preflop_ranges=False,
     _DRAW_BET_BOOST    = draw_bet_boost
     _BARREL_FOLD_BONUS = barrel_fold_bonus
     _MID_PAIR_FOLD_BONUS = mid_pair_fold_bonus
+    _STATION_RATE       = station_rate
+    _STATION_CALL_BOOST = station_call_boost
     _NUM_PLAYERS       = num_players
     _RANDOM_PREFLOP_FOLDS_DIST = random_preflop_folds_dist
     _THREAT_RANGE_EQUITY = threat_range_equity
@@ -273,7 +293,9 @@ def _worker_init(shared_adv, shared_strat, act_size, use_preflop_ranges=False,
                     draw_call_boost=draw_call_boost,
                     draw_bet_boost=draw_bet_boost,
                     barrel_fold_bonus=barrel_fold_bonus,
-                    mid_pair_fold_bonus=mid_pair_fold_bonus)
+                    mid_pair_fold_bonus=mid_pair_fold_bonus,
+                    station_rate=station_rate,
+                    station_call_boost=station_call_boost)
     if use_preflop_ranges:
         from src.preflop_ranges import PreflopRanges
         from pathlib import Path
@@ -450,6 +472,8 @@ def _create_worker_pool(num_workers, shared_adv, shared_strat, act_size,
                   getattr(args, '_random_preflop_folds_dist', None),
                   args.threat_range_equity,
                   getattr(args, 'equity_vs_random', False),
+                  getattr(args, 'station_rate', 0.0),
+                  getattr(args, 'station_call_boost', 1.75),
                   getattr(args, 'debug_log_dir', None)),
     )
 
@@ -500,6 +524,15 @@ def _traversal_worker(args):
         arch_name = random_archetype()
         archetype_skew_fn = get_archetype_skew(arch_name)
         archetype_profile = get_archetype_profile(arch_name)
+
+    # Station traversal: postflop opponents over-call and under-fold, like
+    # the real NL5 pool. Decided once per traversal so opponent behavior is
+    # consistent across branches (branch RNG seeding keeps per-branch draws
+    # aligned). Against sticky opponents, CFR learns that bluffs burn money
+    # and value bets get paid — the low-bluff profile we want, learned
+    # instead of patched. No obs change (unlike archetype_mode).
+    is_station_traversal = (_STATION_RATE > 0
+                            and np.random.random() < _STATION_RATE)
 
     # Random preflop forced folds — simulates shorter-handed tables.
     # Sample K from the config distribution; the first K opponents that
@@ -578,6 +611,13 @@ def _traversal_worker(args):
             # Apply archetype skew if configured
             if archetype_skew_fn is not None:
                 strat = archetype_skew_fn(strat, legal)
+            # Station skew: boost CALL, cut FOLD, renormalize (postflop only —
+            # preflop opponent play is range-driven above).
+            if is_station_traversal and not is_preflop:
+                if 1 in legal:
+                    strat[1] *= _STATION_CALL_BOOST
+                if 0 in legal:
+                    strat[0] /= _STATION_CALL_BOOST
             lp = strat[legal].copy()
             s = lp.sum()
             lp = lp / s if s > 0 else np.ones(len(legal)) / len(legal)
@@ -688,6 +728,8 @@ def _traversal_worker(args):
         """
         results = {}
 
+        is_river = n_visible_public >= 5
+
         # Detect strong semi-bluff draws (exempt bluff penalty + boost call).
         # Broadened to include backdoor (3-card) flush draws and pair+draw
         # combos — these are legitimate semi-bluffs at NL5 but were excluded
@@ -712,6 +754,14 @@ def _traversal_worker(args):
             # Air with J+ high card (draw-like hand that can turn TP)
             has_overcards_air = (made_hand_cat < 0.11 and high_card >= 0.75)
         is_strong_draw = has_flush_draw or has_straight_draw_with_overcards
+        # No draws exist on the river — obs[20]/obs[21] participation flags
+        # there indicate made hands (or dead backdoor cards), so every
+        # draw-keyed shaper must switch off: exempting "draws" from the
+        # bluff penalty and boosting "draw" bets on the river just rewards
+        # betting air.
+        if is_river:
+            is_strong_draw = False
+            has_overcards_air = False
 
         bluff_penalty_chips = 0.0
         if _BLUFF_PENALTY > 0 and hero_equity is not None and pot_chips is not None:
@@ -781,10 +831,15 @@ def _traversal_worker(args):
         # Previously only fired when checked-to (pot_odds == 0). Now fires
         # anywhere equity is strong — addresses the "KK facing bet, model won't
         # raise" failure mode where overpair value-raises were not incentivized.
+        # On the river the bonus additionally requires at least a made pair
+        # (made_hand_cat >= 0.125): with no hand at all there is nothing to
+        # value-bet, and vs-random equity can still read high (e.g. ace-high
+        # on a dry board), which otherwise pays a bonus for betting air.
         value_bonus_chips = 0.0
         if (_VALUE_BONUS > 0 and hero_equity is not None and pot_chips is not None):
-            excess = max(0.0, float(hero_equity) - _VALUE_THRESHOLD)
-            value_bonus_chips = excess * float(pot_chips) * _VALUE_BONUS
+            if not (is_river and made_hand_cat < 0.125):
+                excess = max(0.0, float(hero_equity) - _VALUE_THRESHOLD)
+                value_bonus_chips = excess * float(pot_chips) * _VALUE_BONUS
 
         # Fold penalty: punish folding when equity CLEARLY beats the pot-odds
         # requirement. Symmetric to bluff_penalty. Prevents spots like folding
@@ -886,15 +941,36 @@ def _traversal_worker(args):
         return results
 
     def _strategy_for(obs, legal_int):
-        """Regret-matching strategy from advantage network."""
+        """PURE regret-matching strategy from advantage network (no epsilon).
+
+        The returned σ is what gets stored in the buffer as the strategy-net
+        target. Mixing exploration noise in here (as before) taught the
+        average strategy a permanent ~ε/len(legal) floor on every legal
+        action — including nonsense ones — and flattened close spots.
+        Exploration still happens, but at SAMPLE time via _explore_mix().
+        """
         if _SHARED_ADV_NETS is not None:
             with torch.no_grad():
                 obs_t  = torch.from_numpy(obs.astype(np.float32)).unsqueeze(0)
                 adv_np = _SHARED_ADV_NETS[player_idx](obs_t).numpy()[0]
-            return _regret_match(adv_np, legal_int, epsilon=epsilon)
+            return _regret_match(adv_np, legal_int, epsilon=0.0)
         strat = np.zeros(_ACT_SIZE, dtype=np.float32)
         strat[legal_int] = 1.0 / len(legal_int)
         return strat
+
+    def _explore_mix(strategy, legal_int):
+        """ε-uniform exploration mix applied only when SAMPLING hero's action.
+
+        Keeps all actions visited (so regrets stay unbiased) without
+        contaminating the stored strategy targets.
+        """
+        lp = strategy[legal_int].copy()
+        s = lp.sum()
+        lp = lp / s if s > 0 else np.ones(len(legal_int)) / len(legal_int)
+        if epsilon > 0:
+            lp = (1.0 - epsilon) * lp + epsilon / len(legal_int)
+            lp /= lp.sum()
+        return lp
 
     def _make_steps(obs, legal_int, branch_rewards, strategy):
         """Turn branch rewards + strategy into buffer-ready step dicts.
@@ -984,6 +1060,7 @@ def _traversal_worker(args):
     # Preflop decision — use range override if available.
     # obs[10]=pot_odds, obs[18]=hero equity (see CLAUDE.md observation layout).
     branch_rewards = _branch_exact(history, first_legal,
+                                    n_samples=_rollouts_for_street(first_n_public),
                                     n_visible_public=first_n_public,
                                     hero_equity=_shaper_equity(first_obs),
                                     pot_chips=first_pot_chips,
@@ -1013,7 +1090,7 @@ def _traversal_worker(args):
     if _PREFLOP_RANGES is None:
         all_steps += _make_steps(first_obs, first_legal, branch_rewards, strategy)
 
-    lp = strategy[first_legal].copy(); lp /= lp.sum()
+    lp = _explore_mix(strategy, first_legal)
     history.append(int(np.random.choice(first_legal, p=lp)))
 
     # Remaining decisions (postflop, or additional preflop actions like re-raises)
@@ -1032,6 +1109,7 @@ def _traversal_worker(args):
             legal_int      = [int(a) for a in legal]
             n_pub          = len(eng._state.public_cards)
             branch_rewards = _branch_exact(history, legal_int,
+                                            n_samples=_rollouts_for_street(n_pub),
                                             n_visible_public=n_pub,
                                             hero_equity=_shaper_equity(obs),
                                             pot_chips=eng.get_pot_size(),
@@ -1054,7 +1132,7 @@ def _traversal_worker(args):
             if not is_pf:
                 all_steps += _make_steps(obs.copy(), legal_int, branch_rewards, strategy)
 
-            lp = strategy[legal_int].copy(); lp /= lp.sum()
+            lp = _explore_mix(strategy, legal_int)
             action = int(np.random.choice(legal_int, p=lp))
         else:
             action = _pick_opponent_action(ai, obs, legal, eng, is_pf)
@@ -1429,9 +1507,12 @@ def main():
                              'Config default: training.imitation_weight.')
     parser.add_argument('--imitation-spots-dir', type=str, default='logs/action_debug',
                         help='Directory with annotated spot JSONs (default: logs/action_debug)')
-    parser.add_argument('--imitation-batch-size', type=int, default=64,
-                        help='Batch size for imitation pass (default: 64). Smaller than CFR '
-                             'batch since the annotated dataset is small.')
+    parser.add_argument('--imitation-batch-size', type=int,
+                        default=int(config.get('training', {}).get(
+                            'imitation_batch_size', 256)),
+                        help='Batch size for imitation pass (default: 256). Smaller than CFR '
+                             'batch since the annotated dataset is small. '
+                             'Config default: training.imitation_batch_size.')
     parser.add_argument('--imitation-passes', type=int,
                         default=int(config.get('training', {}).get('imitation_passes', 3)),
                         help='Gradient steps per iteration on imitation batches. '
@@ -1522,6 +1603,20 @@ def main():
                              'barrels — useful at NL5 where flop bets get too '
                              'much respect. Applies ONLY to FOLD action. '
                              'Config default: opponent.mid_pair_fold_bonus.')
+    parser.add_argument('--station-rate', type=float,
+                        default=float(opp.get('station_rate', 0.0)),
+                        help='Fraction of traversals where postflop opponents play '
+                             'as calling stations (CALL prob × boost, FOLD prob ÷ '
+                             'boost). 0 = off, 0.5 = half of traversals, 1.0 = all. '
+                             'Teaches hero that bluffs do not get through and value '
+                             'bets get paid — matches the NL5 pool. '
+                             'Config default: opponent.station_rate.')
+    parser.add_argument('--station-call-boost', type=float,
+                        default=float(opp.get('station_call_boost', 1.75)),
+                        help='Multiplier applied to opponent CALL probability in '
+                             'station traversals (FOLD is divided by it). '
+                             '1.5 = mild, 1.75 = default, 2.5 = extreme station. '
+                             'Config default: opponent.station_call_boost.')
     args = parser.parse_args()
 
     if args.no_preflop_ranges:
@@ -1710,6 +1805,7 @@ def main():
     imitation_obs: Optional[torch.Tensor] = None
     imitation_targets: Optional[torch.Tensor] = None
     imitation_legal: Optional[torch.Tensor] = None
+    imitation_probs: Optional[torch.Tensor] = None
     if args.imitation_weight > 0:
         from scripts.validate_spot_logs import load_annotated_spots
         raw_spots = load_annotated_spots(args.imitation_spots_dir)
@@ -1749,7 +1845,16 @@ def main():
             mask = [1.0 if a in legal else 0.0 for a in range(act_size)]
             if mask[ra] == 0.0:
                 continue  # target is illegal — skip rather than train nonsense
-            usable.append((ov, ra, mask))
+            # Oversampling weight: the annotated set is flop-heavy and
+            # call-heavy while the measured leaks are river bets that
+            # should be checks and folds that should be calls. Weight
+            # river (and turn) spots and fold-labeled spots up so the
+            # correction signal lands where the problems are.
+            street = str(s.get('game_state', {}).get('street', '')).lower()
+            w = {'river': 3.0, 'turn': 1.5}.get(street, 1.0)
+            if ra == 0:
+                w *= 2.0
+            usable.append((ov, ra, mask, w))
         if usable:
             imitation_obs = torch.tensor(
                 [u[0] for u in usable], dtype=torch.float32, device=device)
@@ -1757,6 +1862,9 @@ def main():
                 [u[1] for u in usable], dtype=torch.long, device=device)
             imitation_legal = torch.tensor(
                 [u[2] for u in usable], dtype=torch.float32, device=device)
+            probs = torch.tensor(
+                [u[3] for u in usable], dtype=torch.float32, device=device)
+            imitation_probs = probs / probs.sum()
             extra = ''
             if rebuild_count or rebuild_fail:
                 extra = (f' (rebuilt {rebuild_count} from stale schema, '
@@ -2054,7 +2162,7 @@ def main():
             # tiny buffer causes catastrophic overfitting (network sees all data
             # many times per iteration). Skip training entirely until buffer has
             # enough diverse samples, then ramp up train_passes gradually.
-            # Minimum threshold: 10× batch_size (~655K entries, ~15 iterations).
+            # Minimum threshold: 40× batch_size (~2.6M entries at batch 65536).
             buf_len = len(deep_cfr.replay_buffer)
             min_buf = batch_size * 40  # ~2.6M entries, several iterations of diverse data
             if buf_len < min_buf:
@@ -2111,9 +2219,9 @@ def main():
                 n_data = imitation_obs.size(0)
                 losses = []
                 for _ in range(args.imitation_passes):
-                    # Random minibatch (use numpy randint — same seed as
-                    # other training randomness)
-                    idx = torch.randint(0, n_data, (bs,), device=device)
+                    # Weighted minibatch: river/turn + fold-labeled spots
+                    # oversampled (see imitation_probs construction above).
+                    idx = torch.multinomial(imitation_probs, bs, replacement=True)
                     losses.append(deep_cfr.train_imitation_step(
                         imitation_obs[idx],
                         imitation_targets[idx],

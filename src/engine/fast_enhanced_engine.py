@@ -12,6 +12,8 @@ from pathlib import Path
 
 import numpy as np
 
+from src import obs_schema as _schema
+
 from .fast_poker_engine import (
     FastPokerEngine,
     _pkrs_card_rank, _pkrs_card_suit,
@@ -477,9 +479,12 @@ class FastEnhancedPokerEngine(FastPokerEngine):
     Produces identical feature vectors for the same game state.
     """
 
-    BEHAVIORAL_STATS_DIM = 8
-    BETTING_LINE_DIM = 3
-    OPPONENT_PROFILE_DIM = 5
+    # Block widths come from src/obs_schema.py — the layout shared with the
+    # runtime agent's builder. Local literals here would let training and runtime
+    # disagree about how wide a block is.
+    BEHAVIORAL_STATS_DIM = _schema.BEHAVIORAL_STATS_DIM
+    BETTING_LINE_DIM = _schema.BETTING_LINE_DIM
+    OPPONENT_PROFILE_DIM = _schema.OPPONENT_PROFILE_DIM
 
     def __init__(self, num_players: int = 6,
                  add_position_features: bool = True,
@@ -586,12 +591,55 @@ class FastEnhancedPokerEngine(FastPokerEngine):
             return np.concatenate(features).astype(np.float32)
         return np.zeros(self.enhanced_obs_size, dtype=np.float32)
 
-    def _get_equity_vs_random_feature(self) -> np.ndarray:
-        """1-dim: raw MC equity vs a uniform-random opponent range.
+    def _n_active_opponents(self) -> int:
+        """Opponents still in the hand (folded players excluded), min 1.
 
-        This is the original (pre-threat-overlay) obs[18] value, exposed as a
-        separate appended feature so the model sees BOTH the range-conditioned
-        equity (obs[18]) and the unconditioned strength.
+        `players_state[i].active` is the fold flag — it goes False when a
+        player folds. Getting this wrong silently collapses every multiway
+        equity to a heads-up number, so both equity paths share this helper.
+        """
+        try:
+            n_alive = sum(1 for ps in self._state.players_state if ps.active)
+            return max(n_alive - 1, 1)
+        except Exception:
+            return 1
+
+    @staticmethod
+    def _multiway_equity_mc(e7_hole, e7_board, n_opponents: int,
+                            n_samples: int = 300) -> float:
+        """MC win rate vs N random opponents. Mirrors the agent's
+        src/agent/obs_builder.ObservationBuilder._multiway_equity so
+        training and runtime obs[18] agree in multiway pots."""
+        import random as _rng
+        deck = [_eval7.Card(r + s) for r in '23456789TJQKA' for s in 'shdc']
+        used = set(str(c) for c in list(e7_hole) + list(e7_board))
+        available = [c for c in deck if str(c) not in used]
+        need = n_opponents * 2 + (5 - len(e7_board))
+        if len(available) < need:
+            return 0.5
+        wins = 0
+        for _ in range(n_samples):
+            _rng.shuffle(available)
+            idx = 5 - len(e7_board)
+            full_board = list(e7_board) + available[:idx]
+            my_score = _eval7.evaluate(list(e7_hole) + full_board)
+            beat_all = True
+            for _ in range(n_opponents):
+                opp = [available[idx], available[idx + 1]]
+                idx += 2
+                if _eval7.evaluate(opp + full_board) > my_score:
+                    beat_all = False
+                    break
+            if beat_all:
+                wins += 1
+        return wins / max(n_samples, 1)
+
+    def _get_equity_vs_random_feature(self) -> np.ndarray:
+        """1-dim: raw MC equity vs uniform-random opponent range(s).
+
+        Accounts for the number of live opponents — a heads-up number in a
+        6-way pot overstates a hand by up to ~0.5 and was the source of a
+        train/serve obs[18] mismatch against the runtime agent.
         """
         try:
             ps = self._cur_ps()
@@ -599,6 +647,7 @@ class FastEnhancedPokerEngine(FastPokerEngine):
             board = self._state.public_cards
             if len(hole) < 2:
                 return np.zeros(1, dtype=np.float32)
+            n_opp = self._n_active_opponents()
             # GPU model fast path (pred[0] = equity vs random)
             if self.use_equity_model:
                 r1 = self._rank_to_value(_pkrs_card_rank(hole[0]))
@@ -610,17 +659,21 @@ class FastEnhancedPokerEngine(FastPokerEngine):
                                for c in board]
                 pred = _equity_model_predict([r1, r2], hole_suits,
                                               board_ranks, board_suits, hole, board,
-                                              n_opponents=1)
+                                              n_opponents=n_opp)
                 if pred is not None:
                     return np.array([float(pred[0])], dtype=np.float32)
-            # eval7 MC vs uniform-random range
+            # eval7 MC vs uniform-random range(s)
             if board and _EVAL7_AVAILABLE:
                 e7_hole = [_eval7.Card(_pkrs_card_rank(c) + _pkrs_card_suit(c).lower())
                            for c in hole[:2]]
                 e7_board = [_eval7.Card(_pkrs_card_rank(c) + _pkrs_card_suit(c).lower())
                             for c in board]
-                return np.array([float(_eval7.py_hand_vs_range_monte_carlo(
-                    e7_hole, _EVAL7_RANDOM_RANGE, e7_board, 300))], dtype=np.float32)
+                if n_opp <= 1:
+                    return np.array([float(_eval7.py_hand_vs_range_monte_carlo(
+                        e7_hole, _EVAL7_RANDOM_RANGE, e7_board, 300))],
+                        dtype=np.float32)
+                return np.array([self._multiway_equity_mc(
+                    e7_hole, e7_board, n_opp, 300)], dtype=np.float32)
             return np.array([self._approx_preflop_equity(hole)], dtype=np.float32)
         except Exception:
             return np.zeros(1, dtype=np.float32)
@@ -834,12 +887,10 @@ class FastEnhancedPokerEngine(FastPokerEngine):
                 hole_suits = [_SUIT_MAP_EQ.get(_pkrs_card_suit(c).lower(), 0) for c in hole[:2]]
                 board_ranks = [self._rank_to_value(_pkrs_card_rank(c)) for c in board_pkrs]
                 board_suits = [_SUIT_MAP_EQ.get(_pkrs_card_suit(c).lower(), 0) for c in board_pkrs]
-                # Count active opponents for multiway equity
-                try:
-                    n_opp = max(sum(1 for a in self.agents if not self._state.player_states[
-                        self.agents.index(a)].has_folded) - 1, 1)
-                except Exception:
-                    n_opp = 1
+                # Count active opponents for multiway equity. (This used to
+                # read `_state.player_states[...].has_folded` — neither name
+                # exists, so it always threw and silently fell back to 1.)
+                n_opp = self._n_active_opponents()
                 pred = _equity_model_predict(hole_ranks, hole_suits,
                                               board_ranks, board_suits, hole, board_pkrs,
                                               n_opponents=n_opp)

@@ -72,52 +72,13 @@ def _rank_val(rank_char: str) -> int:
     return _RANK_MAP.get(rank_char.upper(), 0)
 
 
-# Feature names in the exact order produced by ObservationBuilder.build().
-# When pad_to_6p=True, position block is 8 dims (6 one-hot + norm + is_button).
-# When pad_to_6p=False, position block is num_players + 2.
-_POSITION_6P_NAMES = [
-    'pos_btn', 'pos_sb', 'pos_bb', 'pos_utg', 'pos_mp', 'pos_co',
-    'pos_norm', 'is_button',
-]
-_POT_ODDS_NAMES = ['pot_normalized', 'stack_to_pot', 'pot_odds']
-_HAND_STRENGTH_NAMES = [
-    'is_pair', 'is_suited', 'high_card_norm', 'low_card_norm', 'rank_gap_norm',
-]
-_STACK_NAMES = ['m_ratio', 'relative_stack']
-_EQUITY_NAMES = [
-    'hand_strength', 'made_hand_cat',
-    'hero_flush_participation', 'hero_straight_participation',
-    'top_pair', 'board_pairing_level',
-    'board_flush_texture', 'board_straight_texture',
-    'hand_rank_within_cat',
-]
-_STREET_NAMES = ['is_preflop', 'is_flop', 'is_turn', 'is_river']
-_GAME_STATE_NAMES = [
-    'players_alive_norm', 'call_amount_norm', 'aggression_level',
-    'facing_bet', 'bet_to_pot_norm', 'can_raise',
-]
-_BETTING_HIST_NAMES = [
-    'my_pot_share', 'not_raise_fraction', 'facing_3bet_plus',
-    'pot_was_raised', 'min_opp_stack_norm',
-]
-_BEHAVIORAL_NAMES = [
-    'opp_aggression_ratio', 'opp_fold_ratio',
-    'avg_bet_sizing', 'max_bet_sizing',
-    'num_raises_norm', 'street_aggression',
-    'opp_check_ratio', 'pot_escalation',
-]
-_BETTING_LINE_NAMES = [
-    'pot_at_street_start_norm',
-    'hero_has_initiative',
-    'agg_count_this_street_norm',
-]
-BETTING_LINE_DIM = 3
-_EQUITY_VS_ODDS_NAMES = ['equity_vs_odds']
-_THREAT_RANGE_NAMES = ['equity_vs_threat_range']
-_EQUITY_VS_RANDOM_NAMES = ['equity_vs_random']
-_OPP_PROFILE_NAMES = [
-    'opp_vpip', 'opp_pfr', 'opp_af_norm', 'opp_fold_to_cbet', 'opp_wtsd',
-]
+# Feature layout lives in src/obs_schema.py — the one definition shared with
+# the training engine and the hand-history builder. Never re-declare block
+# names or widths here.
+from src.obs_schema import (
+    BETTING_LINE_DIM,
+    feature_names as _schema_feature_names,
+)
 
 
 def feature_names(num_players: int = 6, pad_to_6p: bool = True,
@@ -129,33 +90,15 @@ def feature_names(num_players: int = 6, pad_to_6p: bool = True,
     """Return ordered feature names matching ObservationBuilder.build() output.
 
     Pass the same constructor flags used for the builder to get matching names.
-    Position block size depends on pad_to_6p:
-    - True (or num_players=6): 8 dims (6 one-hot + norm + is_button)
-    - False + num_players<6: num_players + 2 dims
+    `threat_range_equity` / `equity_vs_random` are accepted for backward compat
+    but are no longer wired into the obs (reverted to 53-dim; obs[18] = raw
+    equity-vs-random). Range-equity functions remain in src/range_equity.py.
     """
-    names = []
-    if pad_to_6p or num_players == 6:
-        names += _POSITION_6P_NAMES
-    else:
-        names += [f'pos_seat_{i}' for i in range(num_players)] + ['pos_norm', 'is_button']
-    names += _POT_ODDS_NAMES
-    names += _HAND_STRENGTH_NAMES
-    names += _STACK_NAMES
-    names += _EQUITY_NAMES
-    names += _STREET_NAMES
-    names += _GAME_STATE_NAMES
-    names += _BETTING_HIST_NAMES
-    if behavioral_stats:
-        names += _BEHAVIORAL_NAMES
-        names += _BETTING_LINE_NAMES
-    if opp_profile:
-        names += _OPP_PROFILE_NAMES
-    if equity_vs_odds:
-        names += _EQUITY_VS_ODDS_NAMES
-    # threat_range_equity / equity_vs_random are accepted for backward compat
-    # but no longer wired into the obs (reverted to 53-dim; obs[18] = raw
-    # equity-vs-random). Range-equity functions remain in src/range_equity.py.
-    return names
+    return _schema_feature_names(
+        num_players=num_players, pad_to_6p=pad_to_6p,
+        behavioral_stats=behavioral_stats, equity_vs_odds=equity_vs_odds,
+        opp_profile=opp_profile,
+    )
 
 
 class ObservationBuilder:

@@ -11,6 +11,8 @@ from typing import List, Optional
 
 import numpy as np
 
+from src import obs_schema as _schema
+
 from .models import ParsedHand, ParsedAction, DecisionPoint, dollars_to_chips
 from .action_mapper import map_action, get_legal_actions
 
@@ -82,8 +84,9 @@ class _PlayerState:
 
 # ── Behavioral stats helpers ──────────────────────────────────────────────
 
-# Number of behavioral features appended to observation
-BEHAVIORAL_STATS_DIM = 8
+# Number of behavioral features appended to observation.
+# Width comes from src/obs_schema.py so all three builders stay in step.
+BEHAVIORAL_STATS_DIM = _schema.BEHAVIORAL_STATS_DIM
 
 
 def _bh_track_action(action, bh):
@@ -192,8 +195,8 @@ def _bh_compute(bh, hero_name):
     return feats
 
 
-# Number of betting-line features appended to observation
-BETTING_LINE_DIM = 3
+# Number of betting-line features appended to observation (see obs_schema).
+BETTING_LINE_DIM = _schema.BETTING_LINE_DIM
 
 
 def _bl_compute(bh, hero_name):
