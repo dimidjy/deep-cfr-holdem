@@ -56,3 +56,9 @@ debug_report.html
 
 # TexasSolver binary + resources (large; install via scripts/setup_texassolver.sh)
 tools/texassolver/
+
+# webui job artifacts (logs/configs per run)
+webui/runs/
+
+# curated spot regression suite (rebuild via UI seeding)
+data/spot_library.sqlite

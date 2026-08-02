@@ -1,0 +1,1124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Poker Runner</title>
+<style>
+  :root{
+    --bg:#0f1216; --panel:#161b22; --panel2:#1c2230; --line:#2a3140;
+    --fg:#e6edf3; --dim:#8b97a8; --accent:#4c8dff; --ok:#3fb950;
+    --warn:#d29922; --bad:#f85149; --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  header{display:flex;align-items:center;gap:16px;padding:10px 16px;
+         background:var(--panel);border-bottom:1px solid var(--line);
+         position:sticky;top:0;z-index:10;flex-wrap:wrap}
+  header h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.3px}
+  .pill{font-size:12px;padding:2px 9px;border-radius:20px;border:1px solid var(--line);
+        color:var(--dim)}
+  .pill.run{background:rgba(63,185,80,.12);color:var(--ok);border-color:var(--ok)}
+  .pill.idle{color:var(--dim)}
+  .pill.fail{background:rgba(248,81,73,.12);color:var(--bad);border-color:var(--bad)}
+  .grow{flex:1}
+  .layout{display:grid;grid-template-columns:minmax(300px,380px) 1fr;gap:14px;padding:14px;
+          align-items:start}
+  @media (max-width:1000px){.layout{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+        margin-bottom:14px;overflow:hidden}
+  .card > h2{font-size:12px;text-transform:uppercase;letter-spacing:.8px;color:var(--dim);
+             margin:0;padding:10px 13px;border-bottom:1px solid var(--line);
+             display:flex;align-items:center;gap:8px}
+  .card .body{padding:12px 13px}
+  .tabs{display:flex;gap:6px;padding:8px 13px 0}
+  .tabs button{background:none;border:none;color:var(--dim);padding:7px 12px;cursor:pointer;
+               border-radius:7px 7px 0 0;font-size:13px}
+  .tabs button.on{background:var(--panel2);color:var(--fg)}
+  fieldset{border:1px solid var(--line);border-radius:8px;margin:0 0 11px;padding:9px 11px}
+  legend{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--dim);padding:0 5px}
+  .row{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;margin:5px 0}
+  .row label{font-size:12.5px;color:var(--dim)}
+  input,select{background:var(--bg);border:1px solid var(--line);color:var(--fg);
+               border-radius:6px;padding:5px 7px;font:12.5px var(--mono);width:118px}
+  input[type=checkbox]{width:auto}
+  input:focus,select:focus{outline:1px solid var(--accent);border-color:var(--accent)}
+  select.wide,input.wide{width:100%}
+  button.act{background:var(--accent);color:#fff;border:none;border-radius:7px;
+             padding:9px 15px;font-weight:600;cursor:pointer;font-size:13px}
+  button.act:disabled{opacity:.4;cursor:not-allowed}
+  button.stop{background:var(--bad)}
+  button.ghost{background:none;border:1px solid var(--line);color:var(--dim);
+               border-radius:6px;padding:5px 10px;cursor:pointer;font-size:12px}
+  #console{background:#0a0d11;font:12px/1.55 var(--mono);padding:11px;height:330px;
+           overflow:auto;white-space:pre-wrap;word-break:break-word}
+  #console .meta{color:var(--accent)}
+  #console .error{color:var(--bad)}
+  #console .warn{color:var(--warn)}
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(105px,1fr));gap:9px}
+  .stat{background:var(--panel2);border-radius:8px;padding:9px 11px}
+  .stat .k{font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;color:var(--dim)}
+  .stat .v{font-size:17px;font-weight:600;font-family:var(--mono);margin-top:2px}
+  .stat .v.ok{color:var(--ok)} .stat .v.warn{color:var(--warn)} .stat .v.bad{color:var(--bad)}
+  .bar{height:7px;background:var(--panel2);border-radius:4px;overflow:hidden;margin-top:7px}
+  .bar > i{display:block;height:100%;background:var(--accent);transition:width .3s}
+  canvas{width:100%;height:170px;display:block}
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  th,td{text-align:left;padding:5px 7px;border-bottom:1px solid var(--line)}
+  th{color:var(--dim);font-weight:500;font-size:11px;text-transform:uppercase}
+  td.mono{font-family:var(--mono)}
+  .note{font-size:12px;color:var(--warn);background:rgba(210,153,34,.09);
+        border:1px solid rgba(210,153,34,.3);border-radius:7px;padding:8px 10px;margin-bottom:9px}
+  .muted{color:var(--dim);font-size:12px}
+  .band{font-size:11px;color:var(--dim);margin-top:3px}
+  /* ── spots tab ── */
+  .chips{display:flex;flex-wrap:wrap;gap:5px}
+  .chip{font-size:11.5px;padding:4px 9px;border-radius:14px;cursor:pointer;
+        border:1px solid var(--line);color:var(--dim);user-select:none;
+        background:var(--bg);white-space:nowrap}
+  .chip.on{background:var(--accent);border-color:var(--accent);color:#fff}
+  a{color:var(--accent);text-decoration:none}
+  /* stacked action bar: fold | call | aggression */
+  .mix{display:flex;height:16px;border-radius:4px;overflow:hidden;min-width:130px;
+       background:var(--panel2)}
+  .mix i{display:block;height:100%}
+  .mix .f{background:var(--bad)} .mix .c{background:var(--warn)}
+  .mix .a{background:var(--ok)}
+  .cards{font-family:var(--mono);font-size:12.5px;white-space:nowrap}
+  .cards .r{color:#f85149} .cards .b{color:#9db4d0}
+  /* playing cards */
+  .pc{display:inline-flex;flex-direction:column;align-items:center;justify-content:center;
+      width:34px;height:46px;background:#f6f8fa;color:#111;border-radius:5px;
+      font-family:var(--mono);font-weight:700;line-height:1.05;
+      box-shadow:0 1px 3px rgba(0,0,0,.45);margin-right:4px}
+  .pc.red{color:#c9252d}
+  .pc .rk{font-size:15px} .pc .st{font-size:13px}
+  .pc.sm{width:26px;height:35px} .pc.sm .rk{font-size:12px} .pc.sm .st{font-size:10px}
+  /* spot grid */
+  .spotgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));
+            gap:11px;padding:12px}
+  .spotcard{background:var(--panel2);border:1px solid var(--line);border-radius:9px;
+            padding:11px 12px}
+  .spotcard.warn{border-color:var(--warn)}
+  .sc-head{display:flex;align-items:center;gap:7px;margin-bottom:9px;flex-wrap:wrap}
+  .sc-title{font-weight:600;font-size:13.5px}
+  .tag{font-size:10.5px;padding:2px 7px;border-radius:10px;border:1px solid var(--line);
+       color:var(--dim)}
+  .tag.ip{color:#7ee787;border-color:#2c5f3a}
+  .tag.oop{color:#79c0ff;border-color:#1f4d7a}
+  .sc-cards{display:flex;align-items:center;gap:14px;margin-bottom:10px;flex-wrap:wrap}
+  .sc-cards .lbl{font-size:10px;text-transform:uppercase;letter-spacing:.6px;
+                 color:var(--dim);margin-bottom:3px}
+  .sc-out{display:flex;align-items:center;gap:8px;margin-bottom:7px}
+  .sc-big{font-size:15px;font-weight:700;font-family:var(--mono)}
+  .sc-big.fold{color:var(--bad)} .sc-big.call{color:var(--warn)}
+  .sc-big.aggr{color:var(--ok)}
+  .arow{display:grid;grid-template-columns:66px 1fr 42px;align-items:center;gap:7px;
+        font-size:11.5px;margin:2px 0}
+  .arow .track{height:9px;background:var(--bg);border-radius:5px;overflow:hidden}
+  .arow .track i{display:block;height:100%}
+  .arow .pct{text-align:right;font-family:var(--mono);color:var(--dim)}
+  .viewtabs{display:flex;gap:6px}
+  .viewtabs .chip{padding:3px 10px}
+  .act-tag{font-family:var(--mono);font-size:11.5px;padding:2px 6px;
+           border-radius:4px;background:var(--panel2)}
+  .act-tag.fold{color:var(--bad)} .act-tag.call{color:var(--warn)}
+  .act-tag.aggr{color:var(--ok)}
+  .disagree{color:var(--warn);font-weight:600}
+  #sp_table td{vertical-align:middle}
+  .grouprow td{background:var(--panel2);font-weight:600;font-size:11.5px;
+               text-transform:uppercase;letter-spacing:.5px;color:var(--dim)}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>♠ Poker Runner</h1>
+  <span id="statusPill" class="pill idle">idle</span>
+  <span id="jobLabel" class="muted"></span>
+  <span class="grow"></span>
+  <span id="diskInfo" class="muted"></span>
+  <button class="ghost" onclick="loadHistory()">↻ history</button>
+</header>
+
+<div class="layout">
+
+  <!-- ─────────── left: forms ─────────── -->
+  <div>
+    <div class="card">
+      <div class="tabs">
+        <button id="tab-train" class="on" onclick="showTab('train')">Training</button>
+        <button id="tab-validate" onclick="showTab('validate')">Validation</button>
+        <button id="tab-spots" onclick="showTab('spots')">Spots</button>
+        <button id="tab-library" onclick="showTab('library')">Library</button>
+        <button id="tab-vector" onclick="showTab('vector')">Vectors</button>
+      </div>
+
+      <!-- TRAIN -->
+      <div class="body" id="pane-train">
+        <div class="note" id="trainNote"></div>
+
+        <fieldset><legend>Run</legend>
+          <div class="row"><label>iterations</label><input id="num_iterations" type="number"></div>
+          <div class="row"><label>traversals / iter</label><input id="traversals_per_iteration" type="number"></div>
+          <div class="row"><label>workers (0=auto)</label><input id="workers" type="number" value="0"></div>
+          <div class="row"><label>checkpoint every</label><input id="checkpoint_interval" type="number"></div>
+          <div class="row"><label>device</label>
+            <select id="device"><option value="">auto</option><option>cuda</option><option>cpu</option></select></div>
+          <div class="row"><label>resume from</label></div>
+          <select id="resume" class="wide"><option value="">— none (fresh) —</option></select>
+          <div class="row" style="margin-top:7px"><label>equity model</label></div>
+          <select id="equity_model" class="wide"><option value="">— none —</option></select>
+          <div class="row" style="margin-top:7px"><label>models dir</label></div>
+          <input id="models_dir" class="wide" placeholder="models/v3/ (blank = config)">
+        </fieldset>
+
+        <fieldset><legend>Optimizer</legend>
+          <div class="row"><label>batch size</label><input id="batch_size" type="number"></div>
+          <div class="row"><label>train passes</label><input id="train_passes" type="number"></div>
+          <div class="row"><label>learning rate</label><input id="learning_rate" type="number" step="0.00001"></div>
+          <div class="row"><label>buffer size</label><input id="buffer_size" type="number"></div>
+          <div class="row"><label>lr sched T_max</label><input id="lr_scheduler_t_max" type="number"></div>
+        </fieldset>
+
+        <fieldset><legend>Imitation (annotated spots)</legend>
+          <div class="row"><label>weight</label><input id="imitation_weight" type="number" step="0.01"></div>
+          <div class="row"><label>passes</label><input id="imitation_passes" type="number"></div>
+          <div class="row"><label>batch</label><input id="imitation_batch_size" type="number"></div>
+        </fieldset>
+
+        <fieldset><legend>Reward shapers</legend>
+          <div class="row"><label>bluff penalty</label><input id="bluff_penalty" type="number" step="0.05"></div>
+          <div class="row"><label>value bonus</label><input id="value_bonus" type="number" step="0.05"></div>
+          <div class="row"><label>call bonus</label><input id="call_bonus" type="number" step="0.05"></div>
+          <div class="row"><label>fold penalty</label><input id="fold_penalty" type="number" step="0.05"></div>
+          <div class="row"><label>draw call boost</label><input id="draw_call_boost" type="number" step="0.05"></div>
+          <div class="row"><label>draw bet boost</label><input id="draw_bet_boost" type="number" step="0.05"></div>
+          <div class="row"><label>barrel fold bonus</label><input id="barrel_fold_bonus" type="number" step="0.05"></div>
+          <div class="row"><label>mid-pair fold bonus</label><input id="mid_pair_fold_bonus" type="number" step="0.05"></div>
+          <div class="band">keep each ≤ 0.5 — stronger shapers make strategy loss climb</div>
+        </fieldset>
+
+        <fieldset><legend>Opponents</legend>
+          <div class="row"><label>station rate</label><input id="station_rate" type="number" step="0.05"></div>
+          <div class="row"><label>station call boost</label><input id="station_call_boost" type="number" step="0.05"></div>
+          <div class="row"><label>all-in monster rate</label><input id="allin_monster_rate" type="number" step="0.05"></div>
+          <div class="row"><label>monster threshold</label><input id="allin_monster_threshold" type="number" step="0.125"></div>
+          <div class="row"><label>deck reshuffle</label><input id="deck_reshuffle" type="checkbox"></div>
+          <div class="row"><label>bluff draw exempt</label><input id="bluff_draw_exempt" type="checkbox"></div>
+          <div class="row"><label>preflop ranges</label><input id="preflop_ranges" type="checkbox" checked></div>
+          <div class="row"><label>forced folds dist</label><input id="random_preflop_folds"></div>
+        </fieldset>
+
+        <fieldset><legend>K-Best opponent pool</legend>
+          <div class="muted" style="margin-bottom:5px">ctrl/cmd-click to pick several</div>
+          <select id="kbest_seed" class="wide" multiple size="5"></select>
+          <div class="row" style="margin-top:7px"><label>update interval (0=frozen)</label>
+            <input id="kbest_update_interval" type="number" value="0"></div>
+        </fieldset>
+
+        <input id="train_label" class="wide" placeholder="run label (optional)" style="margin-bottom:9px">
+        <button class="act" id="btnTrain" onclick="startTrain()">▶ Start training</button>
+      </div>
+
+      <!-- VALIDATE -->
+      <div class="body" id="pane-validate" style="display:none">
+        <fieldset><legend>Script</legend>
+          <select id="v_kind" class="wide" onchange="vKindChanged()">
+            <option value="self_play">Self-play GTO check</option>
+            <option value="validate_hh">Hand-history validation</option>
+            <option value="spots">Spot inspection (raw + guards)</option>
+            <option value="spot_logs">Annotated spot score</option>
+          </select>
+          <div class="row" style="margin-top:9px"><label>model</label></div>
+          <select id="v_model" class="wide"></select>
+          <div class="row" id="row_hands"><label>hands</label><input id="v_hands" type="number" value="10000"></div>
+          <div class="row" id="row_maxhands" style="display:none"><label>max hands</label><input id="v_maxhands" type="number" value="50000"></div>
+          <div class="row" id="row_range"><label>range analysis</label><input id="v_range" type="checkbox"></div>
+        </fieldset>
+        <div class="muted" id="v_hint" style="margin-bottom:9px"></div>
+        <button class="act" onclick="startValidate()">▶ Run validation</button>
+      </div>
+
+      <!-- SPOTS -->
+      <div class="body" id="pane-spots" style="display:none">
+        <fieldset><legend>Model</legend>
+          <select id="sp_model" class="wide"></select>
+          <div class="muted" style="margin-top:5px">blank = default checkpoint</div>
+        </fieldset>
+
+        <fieldset><legend>Hand categories</legend>
+          <div class="muted" style="margin-bottom:5px">
+            <a href="#" onclick="spSelAll(true);return false">all</a> ·
+            <a href="#" onclick="spSelAll(false);return false">none</a> ·
+            <a href="#" onclick="spSelGroup();return false">made hands only</a>
+          </div>
+          <div id="sp_cats" class="chips"></div>
+        </fieldset>
+
+        <fieldset><legend>Street</legend><div id="sp_streets" class="chips"></div></fieldset>
+        <fieldset><legend>Position</legend><div id="sp_pos" class="chips"></div></fieldset>
+        <fieldset><legend>Facing</legend><div id="sp_facing" class="chips"></div></fieldset>
+        <fieldset><legend>Players</legend><div id="sp_players" class="chips"></div></fieldset>
+
+        <fieldset><legend>Sizing</legend>
+          <div class="row"><label>pot (bb, before bet)</label>
+            <input id="sp_pot" type="number" value="7" step="0.5"></div>
+          <div class="row"><label>stack (bb)</label>
+            <input id="sp_stack" type="number" value="100" step="10"></div>
+        </fieldset>
+
+        <div class="muted" id="sp_count" style="margin-bottom:8px"></div>
+        <button class="act" id="btnSpots" onclick="runSpots()">▶ Evaluate spots</button>
+      </div>
+
+      <!-- LIBRARY -->
+      <div class="body" id="pane-library" style="display:none">
+        <fieldset><legend>Model</legend>
+          <select id="lb_model" class="wide"></select></fieldset>
+
+        <fieldset><legend>Suite</legend>
+          <div class="stats" id="lb_stats"></div>
+          <div class="row" style="margin-top:8px"><label>category filter</label></div>
+          <select id="lb_cat" class="wide" onchange="loadLibrary()">
+            <option value="">— all —</option></select>
+        </fieldset>
+
+        <button class="act" id="btnLbVal" onclick="validateLibrary()"
+                style="margin-bottom:9px">▶ Validate against library</button>
+
+        <fieldset><legend>Add / seed</legend>
+          <button class="ghost" onclick="lbNew()" style="width:100%;margin-bottom:6px">
+            + new spot</button>
+          <button class="ghost" onclick="lbSeed()" style="width:100%">
+            seed from generator (current Spots filters)</button>
+          <div class="muted" style="margin-top:6px">seeded spots start unlabelled —
+            set the right action on each</div>
+        </fieldset>
+      </div>
+
+      <!-- VECTORS -->
+      <div class="body" id="pane-vector" style="display:none">
+        <fieldset><legend>Model</legend>
+          <select id="vc_model" class="wide"></select></fieldset>
+        <fieldset><legend>Start from a logged spot</legend>
+          <select id="vc_sample" class="wide" onchange="vcLoadSample()"></select>
+          <div class="muted" style="margin-top:5px" id="vc_sampleinfo"></div>
+        </fieldset>
+        <fieldset><legend>Legal actions</legend>
+          <div id="vc_legal" class="chips"></div></fieldset>
+        <fieldset><legend>View</legend>
+          <label class="muted"><input type="checkbox" id="vc_keyonly" checked
+            onchange="renderVector()"> key features only</label>
+        </fieldset>
+        <button class="ghost" onclick="vcReset()" style="width:100%">↺ reset to sample</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>History</h2>
+      <div class="body" style="padding:0;max-height:260px;overflow:auto">
+        <table id="histTable"><tbody></tbody></table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─────────── right: live ─────────── -->
+  <div>
+    <!-- SPOT RESULTS (shown only on the Spots tab) -->
+    <div id="spotsView" style="display:none">
+      <div class="card">
+        <h2>Decisions by category <span class="grow"></span>
+          <span class="muted" id="sp_status"></span></h2>
+        <div class="body"><div id="sp_summary" class="muted">
+          pick filters on the left and hit Evaluate</div></div>
+      </div>
+      <div class="card">
+        <h2>Spots <span class="grow"></span>
+          <span class="viewtabs">
+            <span class="chip on" id="vw-cards" onclick="setView('cards')">cards</span>
+            <span class="chip" id="vw-table" onclick="setView('table')">table</span>
+          </span>
+          <label class="muted" style="font-weight:400;margin-left:8px">
+            <input type="checkbox" id="sp_showraw" checked onchange="renderSpots()">
+            raw model</label></h2>
+        <div class="body" style="padding:0;max-height:720px;overflow:auto">
+          <div id="sp_grid" class="spotgrid"></div>
+          <table id="sp_table" style="display:none"><tbody></tbody></table>
+        </div>
+      </div>
+    </div>
+
+    <!-- LIBRARY RESULTS -->
+    <div id="libraryView" style="display:none">
+      <div class="card">
+        <h2>Validation <span class="grow"></span>
+          <span class="muted" id="lb_status"></span></h2>
+        <div class="body"><div id="lb_summary" class="muted">
+          label some spots, then hit Validate</div></div>
+      </div>
+      <div class="card">
+        <h2>Spots in library <span class="grow"></span>
+          <label class="muted" style="font-weight:400">
+            <input type="checkbox" id="lb_wrongonly" onchange="renderLibrary()">
+            only mismatches</label></h2>
+        <div class="body" style="padding:0;max-height:700px;overflow:auto">
+          <table id="lb_table"><tbody></tbody></table>
+        </div>
+      </div>
+    </div>
+
+    <!-- VECTOR EXPLORER -->
+    <div id="vectorView" style="display:none">
+      <div class="card">
+        <h2>Model output <span class="grow"></span>
+          <span class="muted" id="vc_status"></span></h2>
+        <div class="body"><div id="vc_out" class="muted">
+          pick a logged spot on the left</div></div>
+      </div>
+      <div class="card">
+        <h2>Observation vector <span class="grow"></span>
+          <span class="muted">edit any value — output updates live</span></h2>
+        <div class="body" style="padding:0;max-height:620px;overflow:auto">
+          <div id="vc_feats"></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="jobView">
+    <div class="card">
+      <h2>Progress <span class="grow"></span>
+        <button class="ghost stop" id="btnStop" onclick="stopJob()" disabled>■ Stop</button></h2>
+      <div class="body">
+        <div class="stats" id="progStats"></div>
+        <div class="bar"><i id="progBar" style="width:0%"></i></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Losses</h2>
+      <div class="body"><canvas id="lossChart"></canvas>
+        <div class="band"><span style="color:#4c8dff">■</span> advantage
+          &nbsp; <span style="color:#d29922">■</span> strategy</div></div>
+    </div>
+
+    <div class="card">
+      <h2>Self-play action mix <span class="muted" style="font-weight:400">GTO bands</span></h2>
+      <div class="body"><div class="stats" id="spStats">
+        <div class="muted">no eval yet — runs every EVAL_INTERVAL iters after phase 2</div></div></div>
+    </div>
+
+    <div class="card">
+      <h2>Annotated spot score</h2>
+      <div class="body"><div class="stats" id="spotStats">
+        <div class="muted">no spot eval yet</div></div></div>
+    </div>
+
+    <div class="card">
+      <h2>Console <span class="grow"></span>
+        <label class="muted" style="font-weight:400">
+          <input type="checkbox" id="autoscroll" checked> autoscroll</label></h2>
+      <div id="console"></div>
+    </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let DEF = null, ES = null, METRICS = null;
+
+// ── init ───────────────────────────────────────────────────────────────────
+async function init(){
+  DEF = await (await fetch('/api/defaults')).json();
+  const t = DEF.training, o = DEF.opponent;
+  for (const [k,v] of Object.entries({...t, ...o})) {
+    const el = $(k);
+    if (!el) continue;
+    if (el.type === 'checkbox') el.checked = !!v; else el.value = v;
+  }
+  $('trainNote').textContent = DEF.notes.join('  •  ');
+
+  const opts = DEF.checkpoints.map(c => `<option value="${c}">${c}</option>`).join('');
+  $('resume').innerHTML = '<option value="">— none (fresh) —</option>' + opts;
+  $('kbest_seed').innerHTML = opts;
+  $('v_model').innerHTML = opts;
+  $('equity_model').innerHTML = '<option value="">— none —</option>' + opts;
+  if (DEF.equity_model) $('equity_model').value = DEF.equity_model;
+
+  const d = await (await fetch('/api/disk')).json();
+  if (d.free_gb != null) $('diskInfo').textContent = `disk ${d.free_gb}GB free (${d.used_pct}% used)`;
+
+  vKindChanged();
+  await refreshStatus();
+  connectStream();
+  loadHistory();
+  setInterval(refreshStatus, 3000);
+}
+
+function showTab(n){
+  for (const x of ['train','validate','spots','library','vector']) {
+    $('pane-'+x).style.display = x===n ? 'block' : 'none';
+    $('tab-'+x).classList.toggle('on', x===n);
+  }
+  // Each analysis tab replaces the live job panels — unrelated views.
+  $('spotsView').style.display   = n==='spots'   ? 'block' : 'none';
+  $('libraryView').style.display = n==='library' ? 'block' : 'none';
+  $('vectorView').style.display  = n==='vector'  ? 'block' : 'none';
+  $('jobView').style.display = ['spots','library','vector'].includes(n)
+      ? 'none' : 'block';
+  if (n==='spots'   && !SPCAT) initSpots();
+  if (n==='library' && !LBROWS) initLibrary();
+  if (n==='vector'  && !VCSCHEMA) initVector();
+}
+
+// ── spots tab ──────────────────────────────────────────────────────────────
+let SPCAT = null, SPRES = null;
+
+function chips(host, items, key, label, preselect){
+  $(host).innerHTML = items.map(it => {
+    const k = String(typeof it==='object' ? it[key] : it);
+    const l = typeof it==='object' ? (it[label]||k) : String(it);
+    const on = preselect==null || preselect.includes(k) ? ' on' : '';
+    return `<span class="chip${on}" data-k="${k}"
+             onclick="this.classList.toggle('on');spCount()">${l}</span>`;
+  }).join('');
+}
+function picked(host){
+  return [...$(host).querySelectorAll('.chip.on')].map(e=>e.dataset.k);
+}
+
+async function initSpots(){
+  SPCAT = await (await fetch('/api/spots/catalog')).json();
+  chips('sp_cats', SPCAT.categories, 'key', 'label');
+  chips('sp_streets', SPCAT.streets, null, null, ['flop']);
+  chips('sp_pos', SPCAT.positions, 'key', 'label');
+  chips('sp_facing', SPCAT.facing, 'key', 'label');
+  chips('sp_players', SPCAT.player_counts, null, null, ['6']);
+  $('sp_model').innerHTML = '<option value="">— default model —</option>'
+    + (DEF ? DEF.checkpoints.map(c=>`<option value="${c}">${c}</option>`).join('') : '');
+  $('sp_pot').value = SPCAT.defaults.pot_bb;
+  $('sp_stack').value = SPCAT.defaults.stack_bb;
+  spCount();
+}
+
+function spSelAll(on){
+  $('sp_cats').querySelectorAll('.chip').forEach(c=>c.classList.toggle('on',on));
+  spCount();
+}
+function spSelGroup(){
+  const made = new Set(SPCAT.categories.filter(c=>
+    ['monster','strong','made','marginal'].includes(c.group)).map(c=>c.key));
+  $('sp_cats').querySelectorAll('.chip').forEach(c=>
+    c.classList.toggle('on', made.has(c.dataset.k)));
+  spCount();
+}
+function spCount(){
+  const n = picked('sp_cats').length * picked('sp_streets').length
+          * picked('sp_pos').length * picked('sp_facing').length
+          * picked('sp_players').length;
+  $('sp_count').textContent = `${n} spots selected` + (n>600 ? ' — too many, max 600' : '');
+  $('sp_count').style.color = n>600 ? 'var(--bad)' : '';
+  $('btnSpots').disabled = n===0 || n>600;
+}
+
+async function runSpots(){
+  $('sp_status').textContent = 'evaluating…';
+  $('btnSpots').disabled = true;
+  try{
+    const r = await fetch('/api/spots/evaluate', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({
+        model: $('sp_model').value,
+        categories: picked('sp_cats'), streets: picked('sp_streets'),
+        positions: picked('sp_pos'), facings: picked('sp_facing'),
+        player_counts: picked('sp_players').map(Number),
+        pot_bb: parseFloat($('sp_pot').value)||7,
+        stack_bb: parseFloat($('sp_stack').value)||100,
+      })});
+    if(!r.ok){ const e=await r.json().catch(()=>({}));
+      $('sp_status').textContent = 'error: '+(e.detail||r.status); return; }
+    SPRES = await r.json();
+    $('sp_status').textContent = `${SPRES.count} spots`;
+    renderSpotStats(); renderSpots();
+  } finally { $('btnSpots').disabled = false; }
+}
+
+function mixBar(p){
+  const t = p.reduce((a,b)=>a+b,0) || 1;
+  const f = 100*p[0]/t, c = 100*p[1]/t, a = 100*(p.slice(2).reduce((x,y)=>x+y,0))/t;
+  return `<div class="mix" title="fold ${f.toFixed(0)}% / call ${c.toFixed(0)}% / aggr ${a.toFixed(0)}%">
+    <i class="f" style="width:${f}%"></i><i class="c" style="width:${c}%"></i>
+    <i class="a" style="width:${a}%"></i></div>`;
+}
+function cardHtml(cs, small){
+  return cs.map(c=>{
+    const red = 'hd'.includes(c[1]);
+    const suit = {s:'♠',h:'♥',d:'♦',c:'♣'}[c[1]] || c[1];
+    return `<span class="pc${red?' red':''}${small?' sm':''}">
+      <span class="rk">${c[0]}</span><span class="st">${suit}</span></span>`;
+  }).join('');
+}
+function actTag(name){
+  const cls = name==='Fold' ? 'fold' : (name==='Call' ? 'call' : 'aggr');
+  return `<span class="act-tag ${cls}">${name}</span>`;
+}
+
+function renderSpotStats(){
+  const s = SPRES.stats, o = s.overall;
+  let html = `<div class="stats">
+    ${stat('spots', o.n)}
+    ${stat('fold', (100*o.fold).toFixed(0)+'%')}
+    ${stat('call', (100*o.call).toFixed(0)+'%')}
+    ${stat('aggression', (100*o.aggr).toFixed(0)+'%')}
+  </div><table style="margin-top:10px"><tbody>`;
+  for (const c of s.by_category){
+    html += `<tr><td style="width:130px">${c.label}</td>
+      <td style="width:60px" class="mono muted">${c.n}</td>
+      <td>${mixBar([c.fold, c.call, c.aggr])}</td>
+      <td class="mono muted" style="width:130px">
+        f ${(100*c.fold).toFixed(0)}% · c ${(100*c.call).toFixed(0)}% ·
+        a ${(100*c.aggr).toFixed(0)}%</td></tr>`;
+  }
+  $('sp_summary').innerHTML = html + '</tbody></table>';
+}
+
+let SPVIEW = 'cards';
+function setView(v){
+  SPVIEW = v;
+  $('vw-cards').classList.toggle('on', v==='cards');
+  $('vw-table').classList.toggle('on', v==='table');
+  $('sp_grid').style.display  = v==='cards' ? 'grid' : 'none';
+  $('sp_table').style.display = v==='table' ? 'table' : 'none';
+  renderSpots();
+}
+
+const ACT_COLOR = ['var(--bad)','var(--warn)','var(--ok)','var(--ok)','var(--ok)','var(--ok)'];
+const ACT_LABEL = ['Fold','Call/Check','Bet ½','Bet pot','All-in','Raise min'];
+
+function actClass(name){
+  return name==='Fold' ? 'fold' : (name==='Call' ? 'call' : 'aggr');
+}
+
+function spotCard(r){
+  const s = r.spot, showRaw = $('sp_showraw').checked;
+  const disagree = r.raw_name !== r.pipeline_name;
+  // Rows for every action the model put weight on, biggest first.
+  const rows = r.pipeline.map((p,i)=>({p,i}))
+      .filter(x => x.p > 0.001)
+      .sort((a,b)=>b.p-a.p)
+      .map(x => `<div class="arow">
+          <span>${ACT_LABEL[x.i]||('a'+x.i)}</span>
+          <span class="track"><i style="width:${(100*x.p).toFixed(1)}%;
+            background:${ACT_COLOR[x.i]||'var(--dim)'}"></i></span>
+          <span class="pct">${(100*x.p).toFixed(0)}%</span></div>`).join('');
+
+  return `<div class="spotcard${disagree&&showRaw?' warn':''}">
+    <div class="sc-head">
+      <span class="sc-title">${s.category_label}</span>
+      <span class="tag ${s.position==='IP'?'ip':'oop'}">${s.position}</span>
+      <span class="tag">${s.street}</span>
+      <span class="tag">${s.num_players} players</span>
+      <span class="tag">${s.facing_label}</span>
+      <span class="grow"></span>
+      <span class="tag">SPR ${s.spr}</span>
+    </div>
+    <div class="sc-cards">
+      <div><div class="lbl">hero</div>${cardHtml(s.hole)}</div>
+      <div><div class="lbl">board</div>${cardHtml(s.board, true)}</div>
+      <div><div class="lbl">equity</div>
+        <span class="sc-big">${r.equity==null?'—':(100*r.equity).toFixed(0)+'%'}</span></div>
+    </div>
+    <div class="sc-out">
+      <span class="lbl" style="width:70px">this sample</span>
+      <span class="sc-big ${actClass(r.pipeline_name)}">${r.pipeline_name}</span>
+      ${showRaw ? `<span class="muted" style="font-size:11.5px">
+          raw pick: <b class="${actClass(r.raw_name)}" style="color:inherit">${r.raw_name}</b>
+          ${disagree?'⚠ differs':''}</span>` : ''}
+    </div>
+    <div class="lbl" style="margin:6px 0 3px">strategy — what it does over many hands</div>
+    ${rows || '<div class="muted" style="font-size:11.5px">no strategy returned</div>'}
+    <div class="muted" style="font-size:10.5px;margin-top:6px">
+      pot ${s.pot_bb}bb${s.call_bb>0?` · to call ${s.call_bb}bb`:''} ·
+      ${r.made_hand||'—'}</div>
+  </div>`;
+}
+
+function renderSpots(){
+  if(!SPRES) return;
+  if (SPVIEW === 'cards'){
+    $('sp_grid').innerHTML = SPRES.results.map(spotCard).join('');
+    return;
+  }
+  const showRaw = $('sp_showraw').checked;
+  let html = `<tr><th>hand</th><th>board</th><th>spot</th><th>eq</th>
+    <th>agent</th>${showRaw?'<th>raw</th>':''}<th>mix</th></tr>`;
+  let lastCat = null;
+  for (const r of SPRES.results){
+    const s = r.spot;
+    if (s.category !== lastCat){
+      lastCat = s.category;
+      html += `<tr class="grouprow"><td colspan="${showRaw?7:6}">${s.category_label}</td></tr>`;
+    }
+    const dis = showRaw && r.raw_name !== r.pipeline_name ? ' class="disagree"' : '';
+    html += `<tr>
+      <td>${cardHtml(s.hole, true)}</td>
+      <td>${cardHtml(s.board, true)}</td>
+      <td class="muted" style="font-size:11.5px">${s.street} · ${s.position} ·
+          ${s.num_players}p · ${s.facing_label} · SPR ${s.spr}</td>
+      <td class="mono">${r.equity==null?'—':r.equity.toFixed(2)}</td>
+      <td${dis}>${actTag(r.pipeline_name)}</td>
+      ${showRaw?`<td>${actTag(r.raw_name)}</td>`:''}
+      <td>${mixBar(r.pipeline)}</td></tr>`;
+  }
+  $('sp_table').querySelector('tbody').innerHTML = html;
+}
+
+function vKindChanged(){
+  const k = $('v_kind').value;
+  $('row_hands').style.display    = k==='self_play' ? 'grid':'none';
+  $('row_range').style.display    = k==='self_play' ? 'grid':'none';
+  $('row_maxhands').style.display = k==='validate_hh' ? 'grid':'none';
+  const hints = {
+    self_play:'Primary metric for Deep CFR. Keep CBet 55-70%, AF 2.0-3.5, WTSD 25-32%.',
+    validate_hh:'--betting-line is added automatically (required for 53-dim models).',
+    spots:'Shows raw model output beside the post-guard decision for ~25 typical spots.',
+    spot_logs:'Scores the model against your right_action annotations in logs/action_debug.'
+  };
+  $('v_hint').textContent = hints[k] || '';
+}
+
+// ── run ────────────────────────────────────────────────────────────────────
+function num(id){ const v = parseFloat($(id).value); return isNaN(v) ? 0 : v; }
+function int(id){ const v = parseInt($(id).value,10); return isNaN(v) ? 0 : v; }
+
+async function startTrain(){
+  const body = {
+    num_iterations:int('num_iterations'), traversals_per_iteration:int('traversals_per_iteration'),
+    batch_size:int('batch_size'), train_passes:int('train_passes'),
+    learning_rate:num('learning_rate'), buffer_size:int('buffer_size'),
+    checkpoint_interval:int('checkpoint_interval'), lr_scheduler_t_max:int('lr_scheduler_t_max'),
+    imitation_weight:num('imitation_weight'), imitation_passes:int('imitation_passes'),
+    imitation_batch_size:int('imitation_batch_size'),
+    random_preflop_folds:$('random_preflop_folds').value,
+    deck_reshuffle:$('deck_reshuffle').checked, bluff_draw_exempt:$('bluff_draw_exempt').checked,
+    bluff_penalty:num('bluff_penalty'), call_bonus:num('call_bonus'),
+    value_bonus:num('value_bonus'), fold_penalty:num('fold_penalty'),
+    draw_call_boost:num('draw_call_boost'), draw_bet_boost:num('draw_bet_boost'),
+    barrel_fold_bonus:num('barrel_fold_bonus'), mid_pair_fold_bonus:num('mid_pair_fold_bonus'),
+    allin_monster_rate:num('allin_monster_rate'),
+    allin_monster_threshold:num('allin_monster_threshold'),
+    station_rate:num('station_rate'), station_call_boost:num('station_call_boost'),
+    workers:int('workers'), device:$('device').value, models_dir:$('models_dir').value,
+    resume:$('resume').value, equity_model:$('equity_model').value,
+    kbest_seed:[...$('kbest_seed').selectedOptions].map(o=>o.value),
+    kbest_update_interval:int('kbest_update_interval'),
+    preflop_ranges:$('preflop_ranges').checked,
+    label:$('train_label').value,
+  };
+  post('/api/run/train', body);
+}
+
+function startValidate(){
+  post('/api/run/validate', {
+    kind:$('v_kind').value, model:$('v_model').value,
+    hands:int('v_hands'), max_hands:int('v_maxhands'),
+    range_analysis:$('v_range').checked,
+  });
+}
+
+async function post(url, body){
+  const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'},
+                             body:JSON.stringify(body)});
+  if (!r.ok) { const e = await r.json().catch(()=>({detail:r.statusText}));
+               alert('Could not start: ' + (e.detail||r.status)); return; }
+  $('console').innerHTML = '';
+  refreshStatus();
+}
+
+async function stopJob(){
+  if (!confirm('Stop the running job? Partial checkpoints are kept.')) return;
+  await fetch('/api/stop', {method:'POST'});
+  refreshStatus();
+}
+
+// ── status ─────────────────────────────────────────────────────────────────
+async function refreshStatus(){
+  const s = await (await fetch('/api/status')).json();
+  METRICS = s.metrics;
+  const pill = $('statusPill');
+  const st = s.job ? s.job.status : 'idle';
+  pill.textContent = s.running ? 'running' : st;
+  pill.className = 'pill ' + (s.running ? 'run' : (st==='failed' ? 'fail':'idle'));
+  $('jobLabel').textContent = s.job ? `${s.job.label} · ${fmtDur(s.job.elapsed)}` : '';
+  $('btnStop').disabled = !s.running;
+  $('btnTrain').disabled = s.running;
+  renderProgress(s);
+  renderLoss();
+  renderSelfPlay();
+  renderSpotScore();
+}
+
+function fmtDur(sec){
+  sec = Math.round(sec||0);
+  const h = Math.floor(sec/3600), m = Math.floor(sec%3600/60), s = sec%60;
+  return h ? `${h}h${m}m` : (m ? `${m}m${s}s` : `${s}s`);
+}
+
+function stat(k, v, cls){ return `<div class="stat"><div class="k">${k}</div>
+  <div class="v ${cls||''}">${v}</div></div>`; }
+
+function renderProgress(s){
+  const m = METRICS || {};
+  const it = m.iter||0, tot = m.total||0;
+  const pct = tot ? Math.min(100, 100*it/tot) : 0;
+  $('progBar').style.width = pct + '%';
+  const last = a => a && a.length ? a[a.length-1] : null;
+  let eta = '—';
+  if (s.running && it && tot && m.trav && m.trav.length) {
+    const n = Math.min(10, m.trav.length);
+    const per = (m.trav.slice(-n).reduce((x,y)=>x+y,0) + m.train.slice(-n).reduce((x,y)=>x+y,0))/n;
+    eta = fmtDur(per * (tot - it));
+  }
+  const cells = [
+    stat('iteration', tot ? `${it}/${tot}` : (it||'—')),
+    stat('phase', m.phase || '—'),
+    stat('adv loss', fmt(last(m.adv))),
+    stat('strat loss', fmt(last(m.strat))),
+    stat('lr', fmt(last(m.lr), 5)),
+    stat('buffer', last(m.buf) ? last(m.buf).toLocaleString() : '—'),
+    stat('trav/iter', last(m.trav) ? last(m.trav).toFixed(1)+'s' : '—'),
+    stat('eta', eta),
+  ];
+  if (m.filling) cells.push(stat('warmup',
+      Math.round(100*m.filling.have/m.filling.need)+'%', 'warn'));
+  $('progStats').innerHTML = cells.join('');
+}
+function fmt(v, d){ return v==null ? '—' : Number(v).toFixed(d||4); }
+
+// GTO bands from CLAUDE.md — colour the numbers so drift is obvious.
+function band(v, lo, hi){ return v==null ? '' : (v>=lo && v<=hi ? 'ok' : (v>hi ? 'bad':'warn')); }
+
+function renderSelfPlay(){
+  const sp = (METRICS && METRICS.selfplay) || [];
+  if (!sp.length) return;
+  const l = sp[sp.length-1];
+  $('spStats').innerHTML = [
+    stat('AF', l.af.toFixed(2), band(l.af, 2.0, 3.5)),
+    stat('bet %', l.bet.toFixed(0)+'%', band(l.bet, 55, 70)),
+    stat('call %', l.call.toFixed(0)+'%'),
+    stat('check %', l.chk.toFixed(0)+'%'),
+    stat('fold %', l.fold.toFixed(0)+'%'),
+    stat('at iter', l.iter),
+  ].join('') + `<div class="band" style="grid-column:1/-1">
+     target: AF 2.0–3.5 · bet 55–70% — above 70% is the over-aggression drift, revert</div>`;
+}
+
+function renderSpotScore(){
+  const sp = (METRICS && METRICS.spots) || [];
+  if (!sp.length) return;
+  const l = sp[sp.length-1];
+  $('spotStats').innerHTML = [
+    stat('score', l.pct.toFixed(1)+'%', l.pct>=90?'ok':(l.pct>=80?'warn':'bad')),
+    stat('exact', l.exact),
+    stat('partial', l.partial),
+    stat('spots', l.n),
+    stat('at iter', l.iter),
+  ].join('');
+}
+
+// ── chart (no library: plain canvas) ───────────────────────────────────────
+function renderLoss(){
+  const c = $('lossChart'), m = METRICS;
+  const dpr = window.devicePixelRatio || 1;
+  const w = c.clientWidth, h = 170;
+  c.width = w*dpr; c.height = h*dpr;
+  const g = c.getContext('2d'); g.scale(dpr,dpr);
+  g.clearRect(0,0,w,h);
+  if (!m || !m.adv || m.adv.length < 2) {
+    g.fillStyle = '#8b97a8'; g.font = '12px sans-serif';
+    g.fillText('waiting for iterations…', 10, 24); return;
+  }
+  const series = [[m.adv,'#4c8dff'], [m.strat,'#d29922']];
+  const all = series.flatMap(s=>s[0]).filter(v=>isFinite(v));
+  let lo = Math.min(...all), hi = Math.max(...all);
+  if (hi===lo) { hi = lo+1; }
+  const pad = (hi-lo)*0.1; lo-=pad; hi+=pad;
+  const L=44, R=8, T=8, B=20, PW=w-L-R, PH=h-T-B;
+  // grid + y labels
+  g.strokeStyle='#2a3140'; g.fillStyle='#8b97a8'; g.font='10px monospace'; g.lineWidth=1;
+  for (let i=0;i<=4;i++){
+    const y = T + PH*i/4, val = hi-(hi-lo)*i/4;
+    g.beginPath(); g.moveTo(L,y); g.lineTo(w-R,y); g.stroke();
+    g.fillText(val.toFixed(3), 3, y+3);
+  }
+  const xs = m.iters;
+  const x0 = xs[0], x1 = xs[xs.length-1] || x0+1;
+  g.fillText(String(x0), L, h-6);
+  g.fillText(String(x1), w-R-28, h-6);
+  for (const [arr,col] of series){
+    g.strokeStyle=col; g.lineWidth=1.6; g.beginPath();
+    arr.forEach((v,i)=>{
+      const x = L + PW*( (xs[i]-x0) / Math.max(1,(x1-x0)) );
+      const y = T + PH*(1-(v-lo)/(hi-lo));
+      i ? g.lineTo(x,y) : g.moveTo(x,y);
+    });
+    g.stroke();
+  }
+}
+window.addEventListener('resize', renderLoss);
+
+// ── console stream ─────────────────────────────────────────────────────────
+function connectStream(){
+  if (ES) ES.close();
+  ES = new EventSource('/api/stream');
+  ES.onmessage = e => {
+    const r = JSON.parse(e.data);
+    if (r.kind === 'end') { refreshStatus(); loadHistory(); return; }
+    appendLine(r);
+  };
+  ES.onerror = () => { ES.close(); setTimeout(connectStream, 3000); };
+}
+
+function appendLine(r){
+  const el = $('console');
+  const div = document.createElement('div');
+  let cls = r.kind === 'meta' ? 'meta' : '';
+  if (/error|traceback|exception/i.test(r.line)) cls = 'error';
+  else if (/warn|deprecated/i.test(r.line)) cls = 'warn';
+  div.className = cls;
+  div.textContent = r.line;
+  el.appendChild(div);
+  while (el.childNodes.length > 1200) el.removeChild(el.firstChild);
+  if ($('autoscroll').checked) el.scrollTop = el.scrollHeight;
+}
+
+// ══ LIBRARY TAB ═══════════════════════════════════════════════════════════
+let LBROWS = null, LBVAL = null;
+const ACT_OPTS = [[0,'Fold'],[1,'Call/Check'],[2,'Raise ½'],[3,'Raise pot'],[4,'All-in']];
+
+async function initLibrary(){
+  $('lb_model').innerHTML = '<option value="">— default model —</option>'
+    + (DEF ? DEF.checkpoints.map(c=>`<option value="${c}">${c}</option>`).join('') : '');
+  await loadLibrary();
+}
+
+async function loadLibrary(){
+  const cat = $('lb_cat').value;
+  const d = await (await fetch('/api/library/spots'
+      + (cat?`?category=${encodeURIComponent(cat)}`:''))).json();
+  LBROWS = d.spots;
+  const s = d.stats;
+  $('lb_stats').innerHTML = stat('total', s.total) + stat('labelled', s.labelled)
+    + stat('to label', s.unlabelled, s.unlabelled? 'warn':'ok');
+  const cur = $('lb_cat').value;
+  $('lb_cat').innerHTML = '<option value="">— all —</option>'
+    + d.categories.map(c=>`<option${c===cur?' selected':''}>${c}</option>`).join('');
+  renderLibrary();
+}
+
+function lbActSelect(row){
+  return `<select onchange="lbSetAction(${row.id}, this.value)"
+      style="width:104px">
+    <option value="">— unset —</option>
+    ${ACT_OPTS.map(([v,l])=>`<option value="${v}"
+      ${row.right_action===v?'selected':''}>${l}</option>`).join('')}
+  </select>`;
+}
+
+async function lbSetAction(id, val){
+  const row = LBROWS.find(r=>r.id===id); if(!row) return;
+  row.right_action = val===''? null : parseInt(val,10);
+  await fetch(`/api/library/spots/${id}`, {method:'PUT',
+    headers:{'Content-Type':'application/json'}, body:JSON.stringify(row)});
+  loadLibrary();
+}
+
+async function lbDelete(id){
+  if(!confirm('Delete this spot from the library?')) return;
+  await fetch(`/api/library/spots/${id}`, {method:'DELETE'});
+  loadLibrary();
+}
+
+async function lbNew(){
+  const hole = prompt('Hero cards (e.g. "Ah Kd")', 'Ah Kd'); if(!hole) return;
+  const board = prompt('Board (e.g. "As 7d 2c")', 'As 7d 2c'); if(!board) return;
+  const body = {
+    label: prompt('Label', 'custom spot') || 'custom spot',
+    category: prompt('Category', 'custom') || 'custom',
+    street: prompt('Street (flop/turn/river)', 'flop') || 'flop',
+    position: prompt('Position (IP/OOP)', 'IP') || 'IP',
+    num_players: parseInt(prompt('Players', '2')||'2', 10),
+    facing: 'checked_to',
+    hole: hole.trim().split(/\s+/), board: board.trim().split(/\s+/),
+    pot_bb: parseFloat(prompt('Pot (bb)', '7')||'7'),
+    call_bb: parseFloat(prompt('To call (bb, 0 = checked to)', '0')||'0'),
+    stack_bb: 100, right_action: null, notes:'', tags:'manual',
+  };
+  body.facing = body.call_bb>0 ? 'bet_half' : 'checked_to';
+  await fetch('/api/library/spots', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  loadLibrary();
+}
+
+async function lbSeed(){
+  if(!SPCAT){ alert('Open the Spots tab once first — it loads the catalog.'); return; }
+  const body = {
+    categories: picked('sp_cats'), streets: picked('sp_streets'),
+    positions: picked('sp_pos'), facings: picked('sp_facing'),
+    player_counts: picked('sp_players').map(Number),
+    pot_bb: parseFloat($('sp_pot').value)||7,
+    stack_bb: parseFloat($('sp_stack').value)||100,
+  };
+  const r = await (await fetch('/api/library/seed', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)})).json();
+  alert(`Added ${r.added} spots.`);
+  loadLibrary();
+}
+
+async function validateLibrary(){
+  $('lb_status').textContent = 'running…'; $('btnLbVal').disabled = true;
+  try{
+    const r = await (await fetch('/api/library/validate', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({model: $('lb_model').value, category: $('lb_cat').value})
+    })).json();
+    LBVAL = r;
+    const s = r.summary;
+    $('lb_status').textContent = `${s.correct}/${s.n} correct`;
+    $('lb_summary').innerHTML = `<div class="stats">
+      ${stat('labelled spots', s.n)}
+      ${stat('correct', s.correct, 'ok')}
+      ${stat('wrong', s.wrong, s.wrong? 'bad':'ok')}
+      ${stat('score', (s.pct||0)+'%', s.pct>=90?'ok':(s.pct>=75?'warn':'bad'))}
+    </div>` + (r.by_category.length ? '<table style="margin-top:10px"><tbody>'
+      + r.by_category.map(c=>`<tr><td>${c.category}</td>
+          <td class="mono">${c.correct}/${c.n}</td>
+          <td>${mixBar([c.n-c.correct, 0, c.correct])}</td>
+          <td class="mono muted">${c.pct}%</td></tr>`).join('')
+      + '</tbody></table>' : '');
+    renderLibrary();
+  } finally { $('btnLbVal').disabled = false; }
+}
+
+function renderLibrary(){
+  if(!LBROWS) return;
+  const byId = {};
+  if (LBVAL) for (const r of LBVAL.results) byId[r.spot.db_id] = r;
+  const wrongOnly = $('lb_wrongonly').checked;
+  let html = `<tr><th>spot</th><th>hero</th><th>board</th>
+    <th>right action</th><th>model</th><th></th></tr>`;
+  for (const row of LBROWS){
+    const v = byId[row.id];
+    if (wrongOnly && (!v || v.ok)) continue;
+    const verdict = v ? (v.ok
+        ? `<span class="act-tag aggr">✓ ${v.pipeline_name}</span>`
+        : `<span class="act-tag fold">✗ ${v.pipeline_name}</span>`)
+      : '<span class="muted">—</span>';
+    html += `<tr>
+      <td style="font-size:11.5px">${row.label||'(no label)'}<br>
+        <span class="muted">${row.street} · ${row.position} ·
+        ${row.num_players}p · pot ${row.pot_bb}bb${row.call_bb>0?` · call ${row.call_bb}bb`:''}</span></td>
+      <td>${cardHtml(row.hole, true)}</td>
+      <td>${cardHtml(row.board, true)}</td>
+      <td>${lbActSelect(row)}</td>
+      <td>${verdict}</td>
+      <td><button class="ghost" onclick="lbDelete(${row.id})">✕</button></td>
+    </tr>`;
+  }
+  $('lb_table').querySelector('tbody').innerHTML = html;
+}
+
+// ══ VECTOR TAB ════════════════════════════════════════════════════════════
+let VCSCHEMA = null, VCSAMPLES = null, VCOBS = null, VCBASE = null, VCLEGAL = [0,1,2,3,4];
+
+async function initVector(){
+  VCSCHEMA = await (await fetch('/api/vector/schema')).json();
+  const d = await (await fetch('/api/vector/samples?limit=80')).json();
+  VCSAMPLES = d.samples;
+  $('vc_model').innerHTML = '<option value="">— default model —</option>'
+    + (DEF ? DEF.checkpoints.map(c=>`<option value="${c}">${c}</option>`).join('') : '');
+  $('vc_sample').innerHTML = VCSAMPLES.map((s,i)=>
+    `<option value="${i}">${s.street} · ${s.hole.join('')} · ${s.board.join('')}</option>`).join('');
+  chips('vc_legal', [[0,'Fold'],[1,'Call'],[2,'R½'],[3,'RPot'],[4,'AllIn']]
+        .map(([k,l])=>({key:String(k),label:l})), 'key','label');
+  $('vc_legal').addEventListener('click', ()=>{ vcSyncLegal(); vcPredict(); });
+  if (VCSAMPLES.length) vcLoadSample();
+}
+
+function vcSyncLegal(){ VCLEGAL = picked('vc_legal').map(Number); }
+
+function vcLoadSample(){
+  const s = VCSAMPLES[parseInt($('vc_sample').value||'0',10)];
+  if(!s) return;
+  VCBASE = s.obs.slice(); VCOBS = s.obs.slice();
+  $('vc_sampleinfo').innerHTML = `${s.name}<br>right action: ` +
+    (s.right_action==null?'—':(ACT_OPTS.find(a=>a[0]===s.right_action)||[,'?'])[1]);
+  renderVector(); vcPredict();
+}
+function vcReset(){ if(VCBASE){ VCOBS = VCBASE.slice(); renderVector(); vcPredict(); } }
+
+function renderVector(){
+  if(!VCSCHEMA || !VCOBS) return;
+  const keyOnly = $('vc_keyonly').checked;
+  const feats = VCSCHEMA.features.filter(f => !keyOnly || f.key);
+  $('vc_feats').innerHTML = feats.map(f=>{
+    const v = VCOBS[f.idx];
+    const changed = VCBASE && Math.abs(v - VCBASE[f.idx]) > 1e-6;
+    return `<div class="arow" style="grid-template-columns:34px 190px 1fr 66px;
+              padding:3px 12px;${changed?'background:rgba(210,153,34,.08)':''}">
+      <span class="muted mono">${f.idx}</span>
+      <span style="font-size:11.5px">${f.name}</span>
+      <input type="range" min="0" max="1" step="0.01" value="${v}"
+        oninput="vcSet(${f.idx}, this.value)" style="width:100%">
+      <input type="number" step="0.01" value="${v.toFixed(3)}"
+        onchange="vcSet(${f.idx}, this.value, true)" style="width:62px">
+    </div>`;
+  }).join('');
+}
+
+let vcTimer = null;
+function vcSet(idx, val, rerender){
+  VCOBS[idx] = parseFloat(val);
+  if (rerender) renderVector();
+  clearTimeout(vcTimer);
+  vcTimer = setTimeout(vcPredict, 120);   // debounce while dragging a slider
+}
+
+async function vcPredict(){
+  if(!VCOBS) return;
+  $('vc_status').textContent = '…';
+  const r = await (await fetch('/api/vector/predict', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({model:$('vc_model').value, obs:VCOBS, legal:VCLEGAL})
+  })).json();
+  if (r.detail){ $('vc_status').textContent = r.detail; return; }
+  $('vc_status').textContent = '';
+  const p = r.strategy, best = p.indexOf(Math.max(...p));
+  $('vc_out').innerHTML = `<div class="sc-out">
+      <span class="sc-big ${best===0?'fold':(best===1?'call':'aggr')}">
+        ${ACT_LABEL[best]||'?'}</span></div>` +
+    p.map((v,i)=> v>0.001 ? `<div class="arow">
+        <span>${ACT_LABEL[i]||('a'+i)}</span>
+        <span class="track"><i style="width:${(100*v).toFixed(1)}%;
+          background:${ACT_COLOR[i]||'var(--dim)'}"></i></span>
+        <span class="pct">${(100*v).toFixed(1)}%</span></div>` : '').join('');
+}
+
+// ── history ────────────────────────────────────────────────────────────────
+async function loadHistory(){
+  const h = await (await fetch('/api/history')).json();
+  const rows = h.jobs.map(j => {
+    const col = j.status==='finished' ? 'var(--ok)'
+              : j.status==='failed' ? 'var(--bad)' : 'var(--dim)';
+    return `<tr><td class="mono" style="color:${col}">${j.status}</td>
+      <td>${j.label||j.kind}</td><td class="mono">${fmtDur(j.elapsed)}</td></tr>`;
+  }).join('');
+  $('histTable').querySelector('tbody').innerHTML =
+    rows || '<tr><td class="muted" colspan="3">no runs yet</td></tr>';
+}
+
+init();
+</script>
+</body>
+</html>
