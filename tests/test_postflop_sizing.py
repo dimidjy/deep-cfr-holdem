@@ -114,7 +114,8 @@ def test_sizing_override_picks_p75_for_raise_pot(seeded_db):
 
 def test_all_in_promotion_when_cohort_shoves(seeded_db):
     """Spot B has 70% shove rate ≥ default threshold of 50% → promote."""
-    lookup = PostflopSizingLookup(seeded_db, all_in_promotion_threshold=0.50)
+    lookup = PostflopSizingLookup(seeded_db, all_in_promotion_threshold=0.50,
+                                  min_samples_for_promotion=10)
     inputs = dict(
         street='river',
         obs=_obs(made_hand=HAND_TRIPS),

@@ -48,11 +48,13 @@ class TestDeepCFR:
         
         output = network(input_tensor)
         
+        # The network returns logits; masking + softmax happen in DeepCFR.
         assert output.shape == (batch_size, output_size)
-        assert torch.allclose(output.sum(dim=1), torch.ones(batch_size), atol=1e-5)
+        probs = torch.softmax(output, dim=1)
+        assert torch.allclose(probs.sum(dim=1), torch.ones(batch_size), atol=1e-5)
     
     def test_replay_buffer_add(self):
-        buffer = ReplayBuffer(capacity=1000)
+        buffer = ReplayBuffer(capacity=1000, obs_size=72, act_size=6)
         
         state = np.random.randn(72)
         action = 1
@@ -66,7 +68,7 @@ class TestDeepCFR:
     
     def test_replay_buffer_capacity(self):
         capacity = 10
-        buffer = ReplayBuffer(capacity=capacity)
+        buffer = ReplayBuffer(capacity=capacity, obs_size=72, act_size=6)
         
         for i in range(20):
             buffer.add(np.random.randn(72), i % 6, 0.5, np.random.rand(6), 0)
@@ -74,7 +76,7 @@ class TestDeepCFR:
         assert len(buffer) == capacity
     
     def test_replay_buffer_sample(self):
-        buffer = ReplayBuffer(capacity=1000)
+        buffer = ReplayBuffer(capacity=1000, obs_size=72, act_size=6)
         
         for i in range(100):
             buffer.add(np.random.randn(72), i % 6, 0.5, np.random.rand(6), i % 2)

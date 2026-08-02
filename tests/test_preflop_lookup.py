@@ -228,7 +228,7 @@ def test_coverage_levels(seeded_db):
 
 def test_size_rounded_to_half_bb():
     """Cohort medians like 2.42 or 11.43 get rounded to 2.5 / 11.5 before
-    being typed into the bet-input field. Verified by direct call to the
+    being emitted as the raise size. Verified by direct call to the
     rounding helper plus a mocked lookup row with non-clean median."""
     from src.preflop_lookup import _round_to_half_bb
     assert _round_to_half_bb(2.42) == 2.5

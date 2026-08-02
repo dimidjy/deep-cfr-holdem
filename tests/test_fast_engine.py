@@ -61,7 +61,9 @@ class TestBasicFlow:
 
     def test_action_space_size(self):
         eng = FastPokerEngine(num_players=6)
-        assert eng.get_action_space_size() == 5
+        # fold, call, raise_half, raise_pot — all-in enters only via
+        # runtime promotions, never as a network head.
+        assert eng.get_action_space_size() == 4
 
     def test_agents_list(self):
         eng = FastPokerEngine(num_players=6)
@@ -470,8 +472,8 @@ class TestFeatureParity:
     def test_street_features_one_hot(self):
         """Street features should always be a valid one-hot vector."""
         eng = FastEnhancedPokerEngine(num_players=6)
-        # Feature layout: pos(8) + pot_odds(3) + hand_str(5) + stack(2) + equity(8) + street(4)
-        street_start = 8 + 3 + 5 + 2 + 8  # = 26
+        from src.obs_schema import index_of
+        street_start = index_of('is_preflop')
         for _ in range(100):
             eng.reset()
             while not eng.is_done():
