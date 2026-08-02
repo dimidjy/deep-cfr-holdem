@@ -38,7 +38,7 @@ CALL = 1
 RAISE_HALF = 2
 RAISE_POT = 3
 ALL_IN = 4
-RAISE_MIN = 5  # min raise — min raise (2BB)
+RAISE_MIN = 5  # min raise (2BB)
 
 _RANK_ORDER = '23456789TJQKA'
 
@@ -239,7 +239,7 @@ class PreflopRanges:
         Sizing logic:
         - 3bet-range hands (premium): 80% pot raise, 20% min raise (2BB)
         - Other RFI hands: 80% min raise (2BB), 20% pot raise
-        Min raise uses RAISE_MIN (action 5) = min raise.
+        Min raise uses RAISE_MIN (action 5) = 2BB.
         """
         rfi_range = self.ranges.get('rfi', {}).get(pos_key, {})
         if _is_in_range(combo, rfi_range):

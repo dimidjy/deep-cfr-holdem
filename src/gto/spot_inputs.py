@@ -11,8 +11,8 @@ Scope v1: heads-up (`num_active==2`), streets in `scope_streets`. Returns None
 preflop / non-HU / missing-cards / missing-obs spots.
 
 All chip amounts are `round(bb * 100)` ints — only ratios matter to the solver.
-The spot-key SPR/action-context use default_core's conventions (pot_total,
-hero stack + call) so the lookup hits the same cells the runtime agent would.
+The spot-key SPR/action-context use the decision pipeline's conventions
+(pot_total, hero stack + call) so the lookup hits the same cells the agent would.
 """
 from dataclasses import dataclass
 from typing import List, Optional, Tuple

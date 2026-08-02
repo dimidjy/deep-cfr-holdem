@@ -586,8 +586,7 @@ class PreflopLookup:
             # Strategy vector always points at a preset slot (production
             # action_size=6 has no RAISE_CUSTOM index). If we have a target
             # raise size from cohort data (L0/L1 with trust_size=True), ALWAYS
-            # emit it via the side-channel — the action layer decides
-            # type-vs-preset based on whether bet_input is calibrated.
+            # emit it via the side-channel so callers can use the exact size.
             #
             # The expanded-action-size case (action_size > 8, used in some
             # tests) writes raise mass directly to the RAISE_CUSTOM index.
@@ -603,8 +602,7 @@ class PreflopLookup:
                     effective_stack, legal_actions)
                 if preset is not None:
                     strategy[preset] = strategy[preset] + raise_p
-                    # Emit size whenever cohort gave us one — action layer
-                    # decides how to execute (type or preset size).
+                    # Emit size whenever cohort gave us one.
                     if target_size_bb is not None:
                         custom_size = _round_to_half_bb(float(target_size_bb))
                 else:

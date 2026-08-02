@@ -1,7 +1,7 @@
 """
 Unified Decision Engine — single source of truth for all poker decisions.
 
-Every consumer (runtime agent, GUI, validation, analysis) uses this class.
+Every consumer (spot evaluator, GUI, self-play, validation, analysis) uses this class.
 No decision logic should exist outside this module.
 
 Pipeline:
@@ -106,9 +106,9 @@ class SpotContext:
     call_amount_bb: float = 0.0  # for nearest-preset sizing fallback
 
     # OUTPUT side-channel: populated by DecisionEngine when the preflop
-    # lookup chooses an explicit BB raise size to be typed (rather than a
-    # preset button). None for postflop, unused fallback paths, or
-    # non-raise actions. Read by the action executor.
+    # lookup chooses an explicit BB raise size (rather than a preset
+    # fraction). None for postflop, unused fallback paths, or non-raise
+    # actions.
     custom_size_bb_out: Optional[float] = None
 
 
@@ -157,17 +157,14 @@ class DecisionConfig:
     # (≥95% on virtually every kept row), so per-row mixing multipliers
     # have no effect. Defaults below tighten BTN by 20% (0.25 → 0.30) and
     # loosen non-BTN by 20% (0.25 → 0.20).
-    # THE single source of truth for these thresholds. The runtime agent used to
-    # carry its own copy in the agent config that had
-    # drifted (BTN .35/SB .30 live vs BTN .30/SB .50 here), so self-play and
-    # validation were measuring a different strategy than the agent played.
-    # The JSON copy was removed; per-table overrides remain possible but are
-    # no longer needed to reproduce production behavior.
+    # THE single source of truth for these thresholds. A second copy in a
+    # JSON config once drifted from these values, so self-play and validation
+    # measured a different strategy than the one being evaluated.
     preflop_pos_min_play_rate: Dict[str, float] = field(default_factory=lambda: {
         # Position-aware thresholds. Cohort plays loose from BTN/SB and tight
         # from EP, so use HIGH thresholds late (trim BTN/SB) and LOW thresholds
         # early (let LJ/HJ open as wide as the cohort allows). Values below are
-        # the ones the runtime agent has actually been playing.
+        # the tournament-selected ones.
         # See scripts/analyze_preflop_ranges.py for the calibration data.
         'BTN': 0.35, 'SB': 0.30, 'BB': 0.30, 'LJ': 0.20, 'HJ': 0.20, 'CO': 0.25,
     })
@@ -607,7 +604,7 @@ class DecisionEngine:
         """Get preflop strategy from PreflopLookup (data-driven) or
         PreflopRanges (static fallback). Side-effect: writes
         `ctx.custom_size_bb_out` when the lookup chose an explicit BB size
-        for a raise; the action executor reads that field to type the size.
+        for a raise.
         """
         try:
             pf = self._preflop_ranges.get(ctx.num_players)

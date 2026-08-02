@@ -1513,7 +1513,7 @@ def main():
 
     config = load_config(str(Path(__file__).parent.parent / 'configs/training_config.json'))
 
-    # ── Split model mode (uses DecisionEngine — same logic as runtime agent) ──
+    # ── Split model mode (uses DecisionEngine — same logic as self-play) ──
     if args.model_facing_bet and args.model_checked_to:
         from src.decision_engine import DecisionEngine, DecisionConfig, SpotContext
 
@@ -1557,7 +1557,7 @@ def main():
         num_players = 6
         legacy = False
         args.behavioral_stats = True
-        print(f'Split model via DecisionEngine (same pipeline as runtime agent)')
+        print(f'Split model via DecisionEngine (same pipeline as self-play)')
 
     elif not args.model:
         print('Error: --model or (--model-facing-bet + --model-checked-to) required')

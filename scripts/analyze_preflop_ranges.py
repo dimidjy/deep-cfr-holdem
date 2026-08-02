@@ -105,17 +105,11 @@ def load_static_rfi() -> Dict[str, Dict[str, float]]:
 
 
 def load_thresholds() -> Tuple[Dict[str, float], float]:
-    """Returns ({position: threshold}, global_default). Reads agent_config.json."""
-    cfg = json.loads(AGENT_CONFIG_PATH.read_text())
-    # Navigate to the first table's preflop_pos_min_play_rate
-    pos_thr: Dict[str, float] = {}
-    global_thr = 0.25
-    tables = cfg.get('tables', [])
-    if tables:
-        core_cfg = tables[0].get('core', {})
-        pos_thr = dict(core_cfg.get('preflop_pos_min_play_rate', {}))
-        global_thr = float(core_cfg.get('preflop_min_play_rate', 0.25))
-    return pos_thr, global_thr
+    """Returns ({position: threshold}, global_default) from DecisionConfig."""
+    sys.path.insert(0, str(PROJECT_ROOT))
+    from src.decision_engine import DecisionConfig
+    dc = DecisionConfig()
+    return dict(dc.preflop_pos_min_play_rate), float(dc.preflop_min_play_rate)
 
 
 def render_grid(play_rates: Dict[str, float], threshold: float,
@@ -256,7 +250,7 @@ def main() -> int:
     ap.add_argument('--position', default=None,
                     help='Analyze single position only (LJ/HJ/CO/BTN/SB)')
     ap.add_argument('--threshold', type=float, default=None,
-                    help='Override threshold (default: from agent_config.json)')
+                    help='Override threshold (default: from DecisionConfig)')
     ap.add_argument('--threshold-sweep', action='store_true',
                     help='Show RFI%% at multiple thresholds for each position')
     ap.add_argument('--diff', action='store_true',

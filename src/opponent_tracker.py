@@ -1,5 +1,5 @@
 """
-Per-player opponent stat tracking for play.
+Per-player opponent stat tracking across hands.
 
 Tracks VPIP, PFR, AF, Fold-to-CBet, and WTSD across hands.
 Persists to JSON files so stats survive between sessions.

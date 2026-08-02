@@ -4,11 +4,11 @@ When the model picks RAISE_HALF/RAISE_POT/ALL_IN on a postflop street, this
 module queries cohort empirical sizes and returns:
   - a possibly-modified action (e.g. RAISE_POT promoted to ALL_IN when
     cohort shoves the spot frequently), AND
-  - a custom_size_bb to type into the bet input field.
+  - an explicit custom_size_bb for the bet.
 
 If the model didn't pick a raise, or the spot has no cohort data, this
 module returns the input action unchanged with no custom size — the action
-flows through the existing preset-size path.
+keeps its preset size.
 
 The module is purely a sizing-override layer. It never overrides the
 strategic decision (FOLD vs CALL vs raise) — only the size of the chosen
@@ -316,13 +316,13 @@ class PostflopSizingLookup:
         # ── Sizing override ─────────────────────────────────────────────
         # Special case: model picked ALL_IN but cohort didn't promote here.
         # Don't downsize the model's strategic intent — type the effective
-        # stack so the bet input gets the shove value typed correctly.
+        # stack so the shove size is exact.
         if action_idx == ALL_IN:
             target_bb = _round_to_half_bb(effective_stack_bb,
                                           min_bb=max(2.0, pot_bb * 0.10))
             self._counters['sizing_override'] += 1
             logger.info(
-                f"Postflop ALL-IN typed: {spot.to_tuple()} "
+                f"Postflop ALL-IN sized: {spot.to_tuple()} "
                 f"→ {target_bb:.1f}bb (cohort shove% = {row['all_in_pct']:.0f}% "
                 f"below SPR{spot.spr_bucket} threshold {spr_threshold*100:.0f}%, "
                 f"n={row['n_samples']})")

@@ -113,7 +113,7 @@ try a DIFFERENT approach. Follow this cycle:
 - Both obs builders (src/agent/obs_builder.py and src/hand_history/obs_builder.py) must stay in sync
 - Name new models incrementally: v9, v10, etc. Never overwrite existing models
 - Log every experiment and its results to optimization_log.md
-- After each successful improvement, update the default model paths in the agent config
+- After each successful improvement, update `DEFAULT_MODEL` in src/spot_evaluator.py
 - Run validate_vs_hh with same --max-hands 20000 every time for comparable results
 - If training fails or produces worse results, revert ALL code changes before trying next idea
 

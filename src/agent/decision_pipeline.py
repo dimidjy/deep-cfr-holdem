@@ -1,9 +1,9 @@
 """Unified staged decision pipeline — the single source of truth for how a
 poker decision is built from a model strategy.
 
-Both the runtime agent (`src/agent/policy_core.py`) and self-play
-(`scripts/analysis/self_play.py`) drive this one ordered pipeline, so they no
-longer diverge. Each stage is a thin wrapper that delegates to the existing,
+The spot evaluator (`src/spot_evaluator.py`) and self-play
+(`scripts/analysis/self_play.py`) drive this one ordered pipeline, so they
+cannot diverge. Each stage is a thin wrapper that delegates to the existing,
 already-tested logic in `src/decision_engine.py` / `src/postflop_sizing.py`;
 this module owns only the ORDER and the small relocated guards. The ordered
 list in `build_pipeline()` is the place to read to see "what overrides what".
@@ -382,8 +382,7 @@ class PostflopSizingStage(DecisionStage):
 
 
 class RaiseThirdSizingStage(DecisionStage):
-    """RAISE_THIRD → typed 1/3-pot bet (the client's 1/3-pot preset button is a
-    min-bet, so we compute + type the size). Verbatim relocation."""
+    """RAISE_THIRD → explicit 1/3-pot bet size in BB."""
     name = 'raise_third_sizing'
 
     def applies(self, st: DecisionState) -> bool:
@@ -398,8 +397,7 @@ class RaiseThirdSizingStage(DecisionStage):
         logger.info(
             f"RAISE_THIRD → custom 1/3-pot bet {st.custom_size_bb:.2f}bb "
             f"(pot={pot_bb:.2f} call={call_bb:.2f} "
-            f"min_raise={min_raise_bb:.2f})"
-            f"")
+            f"min_raise={min_raise_bb:.2f})")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -425,7 +423,7 @@ def build_pipeline(engine, config: dict,
     """Declare the ONE ordered decision pipeline. This list is the single
     source of truth for what overrides what, and in what order.
 
-    `low_pot_sampling`: False for the runtime agent (plain argmax sampling),
+    `low_pot_sampling`: False for single-spot evaluation (plain argmax sampling),
     True for self-play (preserves its stochastic small-pot sampling).
     """
     skew_fn = None

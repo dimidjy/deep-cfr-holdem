@@ -2,7 +2,7 @@
 """
 Self-play analysis: run the model 6-max vs itself and compute core poker metrics.
 
-Plays N hands using DecisionEngine (same pipeline as runtime agent), records every
+Plays N hands using DecisionEngine (same staged pipeline as the spot evaluator), records every
 action, then computes standard poker statistics:
 
   Preflop: VPIP, PFR, 3Bet%, Fold-to-3Bet%, RFI by position, open-raise sizes
@@ -50,10 +50,10 @@ def _preflop_pot_context(eng, hero_seat: int, num_players: int) -> dict:
     but reads directly from the pkrs engine state.
 
     Returns dict with action_history, num_to_act, num_limpers, num_callers.
-    Used to populate SpotContext so the live PreflopLookup hierarchy
+    Used to populate SpotContext so the PreflopLookup hierarchy
     (L0/L1/L2) keys correctly — without this, every spot keys with
     action_history=None and num_to_act=0, causing self-play to hit
-    different lookup rows than the runtime agent.
+    different lookup rows than single-spot evaluation.
     """
     state = eng._state  # noqa: SLF001 — internal state intentional
     # pkrs engine uses BB=2, SB=1 chip units (constant). Match the proxy
@@ -313,8 +313,8 @@ def run_self_play(engine: DecisionEngine, num_hands: int,
     t0 = time.time()
 
     # Build the unified decision pipeline for each real DecisionEngine (hero +
-    # a symmetric engine_b). This is the SAME pipeline the runtime agent runs, so
-    # self-play no longer diverges. low_pot_sampling=True preserves self-play's
+    # a symmetric engine_b). This is the SAME pipeline the spot evaluator runs,
+    # so the two cannot diverge. low_pot_sampling=True preserves self-play's
     # existing stochastic small-pot sampling. ArchetypeEngine (archetype mode)
     # is intentionally NOT unified — it keeps its own proportional sampler.
     from src.agent.decision_pipeline import build_pipeline, DecisionState
@@ -416,10 +416,10 @@ def run_self_play(engine: DecisionEngine, num_hands: int,
                 hole_cards = cards
 
             # Compute action_history / num_to_act / num_limpers for preflop
-            # spots so the live PreflopLookup hierarchy keys correctly.
+            # spots so the PreflopLookup hierarchy keys correctly.
             # Without these, every spot would key as action_history=None
             # (synth-prior heuristic) and num_to_act=0 — causing self-play
-            # to hit different lookup rows than the runtime agent.
+            # to hit different lookup rows than single-spot evaluation.
             pf_extras = {}
             call_amount_bb = 0.0
             if stage == 'Preflop':
@@ -451,7 +451,7 @@ def run_self_play(engine: DecisionEngine, num_hands: int,
             )
 
             # Get action via the UNIFIED decision pipeline (same code path as
-            # the runtime agent). In vs mode: even seats = engine A, odd = B.
+            # the spot evaluator). In vs mode: even seats = engine A, odd = B.
             active_engine = engine if (engine_b is None or seat % 2 == 0) else engine_b
             pipe = pipelines.get(id(active_engine))
             if pipe is not None:
@@ -1419,8 +1419,7 @@ def main():
                         help='Disable GTO preflop ranges (model plays preflop too)')
     parser.add_argument('--no-preflop-lookup', action='store_true',
                         help='Disable cohort preflop_lookup.sqlite (static '
-                             'ranges only). Matches runtime agent_config when '
-                             'use_preflop_lookup=false.')
+                             'ranges only).')
     parser.add_argument('--vs-no-preflop-lookup', action='store_true',
                         help='A-vs-B test with SAME model: engine A uses '
                              'whatever --no-preflop-lookup is set to, '
@@ -1452,8 +1451,7 @@ def main():
                         help='Override DecisionConfig.preflop_pos_min_play_rate '
                              'with a JSON dict (e.g. \'{"BTN":0.30,"SB":0.32,'
                              '"BB":0.22,"LJ":0.35,"HJ":0.32,"CO":0.28}\'). '
-                             'Wrap in single quotes in shell. Matches the same '
-                             'field in the agent config.')
+                             'Wrap in single quotes in shell.')
     parser.add_argument('--threat-range-equity', action='store_true',
                         help='Set when the model was trained with the '
                              'equity_vs_threat_range obs feature (+1 dim). '
