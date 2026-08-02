@@ -1,7 +1,15 @@
 [project]
-name = "holdem_selfplay"
+name = "deep-cfr-holdem"
 version = "0.1.0"
+description = "Deep CFR, offline RL and self-play evaluation for 6-max No-Limit Hold'em"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Dimitri K" }]
+requires-python = ">=3.10"
 
 [build-system]
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["src*"]

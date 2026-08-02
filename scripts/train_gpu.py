@@ -1492,7 +1492,7 @@ def main():
     parser.add_argument('--fold-penalty', type=float,
                         default=float(opp.get('fold_penalty', 0.0)),
                         help='Penalty coefficient for folding when equity clearly '
-                             'beats pot odds (excess > 15%). Symmetric to --bluff-penalty. '
+                             'beats pot odds (excess > 15%%). Symmetric to --bluff-penalty. '
                              '0 = off, 0.3 = soft, 0.5 = medium, 1.0 = strong. '
                              'Prevents folding overpairs / big equity edges vs bets. '
                              'Config default: opponent.fold_penalty.')

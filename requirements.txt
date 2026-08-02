@@ -1,9 +1,23 @@
-pettingzoo[classic]==1.24.3
+# Core: engine, training, evaluation
 torch==2.2.0
 numpy==1.26.4
+scipy>=1.11
+pokers==0.1.2
+eval7==0.1.10
+treys==0.1.8
+tensorboard>=2.15
+
+# Interactive play against checkpoints
 pygame==2.3.0
+
+# Web UI (python3 -m webui.server)
+fastapi>=0.110
+uvicorn>=0.29
+pydantic>=2.5
+
+# Optional: LLM-assisted spot annotation (scripts/annotate_spots_with_claude.py)
+anthropic>=0.40
+
+# Tests
 pytest==8.0.0
 pytest-cov==4.1.0
-pokers
-treys
-tensorboard

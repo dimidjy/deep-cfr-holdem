@@ -1,62 +1,43 @@
-.PHONY: install test quick-test gui demo train evaluate benchmark analyze clean
+.PHONY: install test train selfplay tournament spots webui gui clean help
+
+MODEL ?= models/best/checkpoint_iter_4000.pt
+HANDS ?= 10000
 
 install:
 	pip install -r requirements.txt
-	python scripts/check_setup.py
 
 test:
-	pytest tests/ -v --tb=short
-
-quick-test:
-	python scripts/quick_test.py
-
-gui:
-	python scripts/play_gui.py
-
-demo:
-	python scripts/demo_cfr.py
+	python3 -m pytest tests/ -q
 
 train:
-	python scripts/train.py
+	python3 scripts/train_gpu.py --config configs/training_config.json \
+		--equity-model models/equity_model_v3.pt
 
-evaluate:
-	python scripts/evaluate_model.py
+selfplay:
+	python3 scripts/analysis/self_play.py --model $(MODEL) --hands $(HANDS)
 
-benchmark:
-	python scripts/benchmark.py
+tournament:
+	python3 scripts/tournament.py --models-dir models/best --output-dir tournament/latest
 
-analyze:
-	python scripts/analyze_engine.py
+spots:
+	python3 scripts/inspect_model_spots.py --model $(MODEL)
 
-validate-spots:
-	python scripts/validate_spots.py
+webui:
+	python3 -m webui.server --host 127.0.0.1
 
-record-hands:
-	python scripts/record_hands.py
-
-play-vs-ai:
-	python scripts/play_vs_ai.py
+gui:
+	python3 scripts/play_gui_vs_enhanced_model.py
 
 clean:
 	find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 	find . -type d -name ".pytest_cache" -exec rm -rf {} + 2>/dev/null || true
-	find . -type f -name "*.pyc" -delete
-	rm -rf models/*.pt models/*.json
-	rm -rf data/logs/*
-	rm -rf data/training/*
 
 help:
-	@echo "Available commands:"
-	@echo "  make install        - Install dependencies"
-	@echo "  make test          - Run all tests"
-	@echo "  make quick-test    - Quick engine test"
-	@echo "  make gui           - Launch Pygame GUI"
-	@echo "  make demo          - Run CFR demo"
-	@echo "  make train         - Train full model"
-	@echo "  make evaluate      - Evaluate trained model"
-	@echo "  make benchmark     - Benchmark engine performance"
-	@echo "  make analyze       - Analyze engine statistics"
-	@echo "  make validate-spots - Validate poker spots"
-	@echo "  make record-hands  - Record hand histories"
-	@echo "  make play-vs-ai    - Play against AI"
-	@echo "  make clean         - Clean generated files"
+	@echo "make install     install dependencies"
+	@echo "make test        run the test suite"
+	@echo "make train       Deep CFR training (configs/training_config.json)"
+	@echo "make selfplay    6-max self-play stats for MODEL (HANDS hands)"
+	@echo "make tournament  spot / HH / head-to-head evaluation of models/best"
+	@echo "make spots       raw vs pipeline decisions on hand-picked spots"
+	@echo "make webui       job runner and spot explorer on localhost:8000"
+	@echo "make gui         play against a checkpoint in a pygame window"

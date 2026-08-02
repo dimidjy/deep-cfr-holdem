@@ -43,10 +43,7 @@ data/cache/
 *.swp
 *.swo
 models/*
-good_models/*
 data/*
-poker/*
-lasts/*
 *.png
 logs/*
 scripts/analysis/results/*
