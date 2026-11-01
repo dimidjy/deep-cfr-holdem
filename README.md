@@ -73,12 +73,15 @@ Details are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
 pip install -r requirements.txt
 make test                      # 355 tests, ~20 s on CPU
 
+make models                    # download the published checkpoint + equity model
+make selfplay HANDS=10000      # self-play stats for models/best/checkpoint_iter_4000.pt
+make gui                       # play against it
+make webui                     # job runner + spot explorer on http://127.0.0.1:8000
+
+# train your own
 make equity                    # neural equity model (generates its own data)
 make train                     # Deep CFR on GPU (configs/training_config.json)
-make selfplay MODEL=models/v3/checkpoint_iter_100.pt HANDS=10000
-make tournament                # round-robin over models/best
-make webui                     # http://127.0.0.1:8000
-make gui MODEL=...             # play against a checkpoint
+make tournament                # round-robin over a directory of checkpoints
 ```
 
 `configs/training_config.json` is sized for a many-core server (10M-entry
@@ -94,8 +97,8 @@ from a fresh clone.
 
 | Artifact | Needed by | How to get it |
 |---|---|---|
-| `models/equity_model_v3.pt` | `make train` | `make equity` |
-| checkpoints in `models/` | self-play, tournament, GUI | `make train` |
+| `models/equity_model_v3.pt` | `make train`, spot evaluator | `make models` (download) or `make equity` |
+| checkpoints in `models/` | self-play, tournament, GUI | `make models` (download `iter_4000`) or `make train` |
 | hand-history archive in `data/poker_archive/` (6-max NLHE text histories) | supervised / CQL / IQL training, HH validation, lookup DBs | your own dataset |
 | `data/preflop_lookup.sqlite`, `data/postflop_sizing.sqlite` | data-driven preflop/sizing stages (otherwise static ranges and preset sizes) | `scripts/build_preflop_lookup.py`, `scripts/build_postflop_lookup.py` |
 | labeled spot JSONs in `logs/action_debug/` | imitation term in training, tournament spot phase | your own spots, labeled with `scripts/annotate_spots_with_claude.py` (`ANTHROPIC_API_KEY`) |

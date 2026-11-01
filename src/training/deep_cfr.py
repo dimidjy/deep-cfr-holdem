@@ -727,12 +727,17 @@ class DeepCFR:
             self.strategy_networks[idx].load_state_dict(
                 checkpoint['strategy_networks'][idx]
             )
-            self.advantage_optimizers[idx].load_state_dict(
-                checkpoint['advantage_optimizers'][idx]
-            )
-            self.strategy_optimizers[idx].load_state_dict(
-                checkpoint['strategy_optimizers'][idx]
-            )
+            # Optimizer/scheduler state is only needed to resume training;
+            # inference-only checkpoints (see scripts/export_checkpoint.py)
+            # ship the networks alone.
+            if 'advantage_optimizers' in checkpoint:
+                self.advantage_optimizers[idx].load_state_dict(
+                    checkpoint['advantage_optimizers'][idx]
+                )
+            if 'strategy_optimizers' in checkpoint:
+                self.strategy_optimizers[idx].load_state_dict(
+                    checkpoint['strategy_optimizers'][idx]
+                )
             if 'advantage_schedulers' in checkpoint:
                 self.advantage_schedulers[idx].load_state_dict(
                     checkpoint['advantage_schedulers'][idx]

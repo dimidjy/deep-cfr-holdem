@@ -1,4 +1,4 @@
-.PHONY: install test equity train selfplay tournament spots webui gui clean help
+.PHONY: install test models equity train selfplay tournament spots webui gui clean help
 
 MODEL ?= models/best/checkpoint_iter_4000.pt
 HANDS ?= 10000
@@ -9,6 +9,9 @@ install:
 
 test:
 	python3 -m pytest tests/ -q
+
+models:
+	bash scripts/download_models.sh
 
 equity:
 	python3 scripts/train_equity_model.py --samples 10000000 --epochs 80 --output $(EQUITY)
@@ -40,6 +43,7 @@ clean:
 help:
 	@echo "make install     install dependencies"
 	@echo "make test        run the test suite"
+	@echo "make models      download the published checkpoint + equity model"
 	@echo "make equity      train the neural equity model (needed by train)"
 	@echo "make train       Deep CFR training (configs/training_config.json)"
 	@echo "make selfplay    6-max self-play stats for MODEL (HANDS hands)"
