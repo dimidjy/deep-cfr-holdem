@@ -118,6 +118,41 @@ from a fresh clone.
 
 ## Results
 
+### Against fixed opponents
+
+The published checkpoint against scripted baselines and against skewed
+copies of itself (`scripts/benchmark_baselines.py`; numbers in
+[`docs/results/baselines.json`](docs/results/baselines.json)):
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/figures/baselines-dark.png">
+  <img src="docs/figures/baselines-light.png" width="760"
+    alt="Bar chart of BB/100 with 95% confidence intervals against each opponent">
+</picture>
+
+| Opponent | BB/100 (95% CI) |
+|---|---:|
+| Random actions | +70.0 ± 4.6 |
+| Always call | +183.0 ± 7.8 |
+| Always pot-raise | +8.6 ± 5.5 |
+| Model + calling-station skew | -1.9 ± 2.5 |
+| Model + maniac skew | +0.7 ± 2.4 |
+| Model + nit skew | +0.9 ± 2.3 |
+| Model + weak-tight skew | +0.1 ± 2.3 |
+| Itself (mirror match) | -0.6 ± 2.4 |
+
+How to read it:
+- The mirror match lands at 0 within its interval, so the measurement is
+  unbiased.
+- Scripted opponents are beaten clearly. The always-pot-raise player is
+  beaten only narrowly (+8.6), which is consistent with the folding leak
+  listed under *Known limitations*: a stronger agent calls down lighter
+  against constant aggression.
+- Archetype-skewed copies of the model are all within about ±2 BB/100.
+  The agent plays one fixed strategy with no opponent modeling, so it
+  doesn't profit from these mild style distortions.
+
+
 ### Checkpoint tournament
 
 Eight late-stage checkpoints from one training arc. Each model played every

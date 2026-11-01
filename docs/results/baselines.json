@@ -1,0 +1,64 @@
+{
+  "model": "checkpoint_iter_4000.pt",
+  "date": "2026-11-01",
+  "hands_per_match": 50000,
+  "format": "6-max NLHE, 100BB, model in seats 0/2/4",
+  "results": [
+    {
+      "opponent": "random",
+      "label": "Random actions",
+      "hands": 50000,
+      "bb100": 69.99,
+      "ci95": 4.57
+    },
+    {
+      "opponent": "always_call",
+      "label": "Always call",
+      "hands": 50000,
+      "bb100": 183.03,
+      "ci95": 7.85
+    },
+    {
+      "opponent": "always_raise",
+      "label": "Always pot-raise",
+      "hands": 50000,
+      "bb100": 8.64,
+      "ci95": 5.55
+    },
+    {
+      "opponent": "calling_station",
+      "label": "Model + calling-station skew",
+      "hands": 50000,
+      "bb100": -1.89,
+      "ci95": 2.48
+    },
+    {
+      "opponent": "maniac",
+      "label": "Model + maniac skew",
+      "hands": 50000,
+      "bb100": 0.69,
+      "ci95": 2.44
+    },
+    {
+      "opponent": "nit",
+      "label": "Model + nit skew",
+      "hands": 50000,
+      "bb100": 0.87,
+      "ci95": 2.3
+    },
+    {
+      "opponent": "weak_tight",
+      "label": "Model + weak-tight skew",
+      "hands": 50000,
+      "bb100": 0.11,
+      "ci95": 2.31
+    },
+    {
+      "opponent": "mirror",
+      "label": "Itself (mirror match)",
+      "hands": 50000,
+      "bb100": -0.61,
+      "ci95": 2.42
+    }
+  ]
+}
