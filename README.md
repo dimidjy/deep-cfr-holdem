@@ -250,6 +250,14 @@ This repository is a game-AI and reinforcement-learning research project.
 It contains no code for connecting to, reading from or acting on any online
 poker platform.
 
+## Contact
+
+Questions, ideas or collaboration: Telegram [@dimidjy](https://t.me/dimidjy).
+
+I'm happy to discuss the dataset, the training setup and the results. The
+raw hand histories aren't distributed, since they contain other players'
+data.
+
 ## Citation
 
 If this code is useful in your work, see [`CITATION.cff`](CITATION.cff).
