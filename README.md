@@ -1,5 +1,14 @@
 # deep-cfr-holdem
 
+[![tests](https://github.com/dimidjy/deep-cfr-holdem/actions/workflows/tests.yml/badge.svg)](https://github.com/dimidjy/deep-cfr-holdem/actions/workflows/tests.yml)
+![python](https://img.shields.io/badge/python-3.10-3776ab)
+![pytorch](https://img.shields.io/badge/pytorch-2.2-ee4c2c)
+[![release](https://img.shields.io/github/v/release/dimidjy/deep-cfr-holdem)](https://github.com/dimidjy/deep-cfr-holdem/releases)
+[![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
+Deep CFR, offline reinforcement learning and self-play evaluation for
+**6-max No-Limit Texas Hold'em**.
+
 Research code for training and evaluating agents for **6-max No-Limit Texas
 Hold'em**, an imperfect-information, multi-agent game. It covers the whole
 loop: a fast game engine, Deep CFR self-play training on GPU, offline RL from
@@ -44,6 +53,9 @@ Python.
 - **Tooling.** A FastAPI web UI to launch jobs, stream metrics and explore
   model decisions spot by spot, plus a parametric spot library and
   LLM-assisted spot labeling.
+
+<p align="center"><img src="docs/figures/gui.png" width="720"
+  alt="Pygame table: a human seat against five copies of the trained agent on the river"></p>
 
 ## Repository layout
 
@@ -106,9 +118,17 @@ from a fresh clone.
 
 ## Results
 
-Tournament of eight late-stage checkpoints from one training arc. Each
-model played every other model head-to-head for 50k hands, plus 100k hands
-of hand-history validation (`tournament/tornament_v34/summary.md`):
+### Checkpoint tournament
+
+Eight late-stage checkpoints from one training arc. Each model played every
+other model head-to-head for 50k hands, plus 100k hands of hand-history
+validation (`tournament/tornament_v34/summary.md`):
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/figures/h2h-dark.png">
+  <img src="docs/figures/h2h-light.png" width="600"
+    alt="Heatmap of head-to-head edge in BB/100 between eight checkpoints">
+</picture>
 
 | Model | Spot % | H2H edge (BB/100) | W-T-L | CBet | AF | WTSD |
 |---|---:|---:|:---:|---:|---:|---:|
@@ -118,8 +138,9 @@ of hand-history validation (`tournament/tornament_v34/summary.md`):
 | iter_3900 | 85.3 | −1.00 | 3-6-5 | 58.9 | 2.79 | 30.2 |
 | iter_4100 | 90.4 | −3.31 | 1-6-7 | 62.7 | 2.34 | 32.1 |
 
-The selected checkpoint (`iter_4000`) lands inside all four postflop target
-bands used for model selection (CBet 55–70%, AF 2.0–3.5, WTSD 25–32%).
+The selected checkpoint (`iter_4000`) has the best average head-to-head
+edge and sits inside all three postflop target bands used for model
+selection (CBet 55–70%, AF 2.0–3.5, WTSD 25–32%).
 
 ## Lessons learned
 
@@ -128,20 +149,75 @@ bands used for model selection (CBet 55–70%, AF 2.0–3.5, WTSD 25–32%).
   read 0.70 in one and 0.19 in the other. The fix was structural: one
   schema module, and a parity test that compares all three builders on
   the same states.
-- **Head-to-head wins can mislead.** Late checkpoints drift toward
-  over-aggression (CBet 62% → 79% between iterations 3400 and 4200). They
-  beat passive siblings in self-play but are exploitable. Model selection
-  therefore requires self-play statistics inside target bands *before*
-  looking at head-to-head edge.
+- **Head-to-head wins can mislead.** Training drifts toward
+  over-aggression. CBet climbs from 41% at iteration 2600 to 72% at 3500
+  on the main run, and sibling runs reach 79%. Aggressive checkpoints beat
+  passive siblings in self-play but are exploitable, so model selection
+  requires self-play statistics inside the target bands *before* looking at
+  head-to-head edge
+  ([`docs/results/training_drift.csv`](docs/results/training_drift.csv)):
+
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/figures/drift-dark.png">
+    <img src="docs/figures/drift-light.png" width="720"
+      alt="Line chart of self-play CBet percentage rising with training iteration">
+  </picture>
+
 - **Shaping needs controlled A/B tests.** Several reward shapers looked good
   in isolation and were reverted after tournament comparison. Keeping them
   as config flags (default off) made that cheap.
+
+## Known limitations
+
+- **Hand-crafted spots expose leaks.** On synthetic spots from the spot
+  library, the raw network folds some very strong hands (trips on a paired
+  board) to small bets. Self-play and tournament play don't surface this.
+  It is the kind of gap the spot library and web UI were built to find, and
+  the next step is targeted imitation data for those spots.
+- **No exploitability measurement.** Exact best response is intractable
+  for 6-max NLHE. Evaluation relies on self-play statistics, tournaments
+  and fixed opponents rather than LBR or a learned best response.
+- **Hand-history data is not included.** The offline-RL components were
+  trained on a private archive of 6-max NLHE hand histories that is not
+  distributed. To reproduce, supply your own histories in the standard
+  text format, or use the public Pluribus logs
+  (`scripts/analysis/validate_vs_pluribus.py`).
+
+## References
+
+- N. Brown, A. Lerer, S. Gross, T. Sandholm. *Deep Counterfactual Regret
+  Minimization.* ICML 2019. [arXiv:1811.00164](https://arxiv.org/abs/1811.00164)
+- M. Lanctot et al. *Monte Carlo Sampling for Regret Minimization in
+  Extensive Games.* NeurIPS 2009 (external-sampling MCCFR).
+- N. Brown, T. Sandholm. *Superhuman AI for multiplayer poker* (Pluribus).
+  Science 2019.
+- A. Kumar et al. *Conservative Q-Learning for Offline Reinforcement
+  Learning.* NeurIPS 2020. [arXiv:2006.04779](https://arxiv.org/abs/2006.04779)
+- I. Kostrikov, A. Nair, S. Levine. *Offline Reinforcement Learning with
+  Implicit Q-Learning.* ICLR 2022. [arXiv:2110.06169](https://arxiv.org/abs/2110.06169)
+- V. Lisý, M. Bowling. *Equilibrium Approximation Quality of Current
+  No-Limit Poker Bots.* 2017 (local best response).
+  [arXiv:1612.07547](https://arxiv.org/abs/1612.07547)
+
+## Related projects
+
+- [OpenSpiel](https://github.com/google-deepmind/open_spiel): games and
+  algorithms for RL research, including CFR variants
+- [RLCard](https://github.com/datamllab/rlcard): RL toolkit for card games
+- [PokerKit](https://github.com/uoftcprg/pokerkit): poker simulation and
+  hand evaluation library
+- [TexasSolver](https://github.com/bupticybee/TexasSolver): open-source GTO
+  solver used for spot validation here
 
 ## Scope
 
 This repository is a game-AI and reinforcement-learning research project.
 It contains no code for connecting to, reading from or acting on any online
 poker platform.
+
+## Citation
+
+If this code is useful in your work, see [`CITATION.cff`](CITATION.cff).
 
 ## License
 

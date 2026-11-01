@@ -89,5 +89,11 @@ parallelized with `ProcessPoolExecutor` and resumable (skip-if-exists):
 3. round-robin head-to-head self-play (50k hands per pair)
 
 It writes `summary.{json,csv,md}` with the H2H matrix.
+`scripts/benchmark_baselines.py` plays a checkpoint against scripted
+opponents (random, always-call, always-raise) and archetype-skewed copies of
+itself. It reports BB/100 with a 95% confidence interval computed from
+per-hand results, with one sample per hand summed over the model's three seats.
+`scripts/make_figures.py` renders the README figures from `docs/results/`.
+
 `scripts/analysis/self_play.py` reports VPIP / PFR / 3-bet / CBet / AF / WTSD
 and, with `--range-analysis`, 13×13 range grids per position and history.

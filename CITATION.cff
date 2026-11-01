@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "deep-cfr-holdem: Deep CFR, offline RL and self-play evaluation for 6-max No-Limit Hold'em"
+authors:
+  - family-names: "K"
+    given-names: "Dimitri"
+version: 0.1.0
+date-released: 2026-11-01
+license: MIT
+repository-code: "https://github.com/dimidjy/deep-cfr-holdem"
+keywords:
+  - deep-cfr
+  - counterfactual-regret-minimization
+  - reinforcement-learning
+  - offline-reinforcement-learning
+  - self-play
+  - imperfect-information-games
+  - no-limit-holdem

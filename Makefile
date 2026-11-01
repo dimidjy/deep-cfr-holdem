@@ -1,4 +1,4 @@
-.PHONY: install test models equity train selfplay tournament spots webui gui clean help
+.PHONY: install test models equity train selfplay benchmark figures tournament spots webui gui clean help
 
 MODEL ?= models/best/checkpoint_iter_4000.pt
 HANDS ?= 10000
@@ -24,6 +24,12 @@ train:
 selfplay:
 	python3 scripts/analysis/self_play.py --model $(MODEL) --hands $(HANDS)
 
+benchmark:
+	python3 scripts/benchmark_baselines.py --model $(MODEL) --hands 50000
+
+figures:
+	python3 scripts/make_figures.py
+
 tournament:
 	python3 scripts/tournament.py --models-dir models/best --output-dir tournament/latest
 
@@ -47,6 +53,8 @@ help:
 	@echo "make equity      train the neural equity model (needed by train)"
 	@echo "make train       Deep CFR training (configs/training_config.json)"
 	@echo "make selfplay    6-max self-play stats for MODEL (HANDS hands)"
+	@echo "make benchmark   MODEL vs scripted/skewed opponents, BB/100 with 95% CI"
+	@echo "make figures     regenerate docs/figures from docs/results"
 	@echo "make tournament  spot / HH / head-to-head evaluation of models/best"
 	@echo "make spots       raw vs pipeline decisions on hand-picked spots"
 	@echo "make webui       job runner and spot explorer on localhost:8000"

@@ -222,6 +222,7 @@ class PlayerStats:
     won_at_showdown: int = 0
     # Winnings
     total_won_bb: float = 0.0
+    hand_won_bb: List[float] = field(default_factory=list)  # per hand, for CIs
     # By position
     vpip_by_pos: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
     hands_by_pos: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
@@ -666,6 +667,7 @@ def run_self_play(engine: DecisionEngine, num_hands: int,
             pl = _POS_LABELS_6.get(rp, f'P{rp}')
 
             stats[i].total_won_bb += reward_bb
+            stats[i].hand_won_bb.append(reward_bb)
             stats[i].won_by_pos[pl] += reward_bb
 
             if i in saw_flop_seats:

@@ -45,6 +45,7 @@ data/cache/
 models/*
 data/*
 *.png
+!docs/figures/*.png
 logs/*
 scripts/analysis/results/*
 tournament/*
