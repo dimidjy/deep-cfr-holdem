@@ -73,16 +73,33 @@ Details are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
 pip install -r requirements.txt
 make test                      # 355 tests, ~20 s on CPU
 
+make equity                    # neural equity model (generates its own data)
 make train                     # Deep CFR on GPU (configs/training_config.json)
-make selfplay MODEL=models/best/checkpoint_iter_4000.pt HANDS=10000
+make selfplay MODEL=models/v3/checkpoint_iter_100.pt HANDS=10000
 make tournament                # round-robin over models/best
 make webui                     # http://127.0.0.1:8000
+make gui MODEL=...             # play against a checkpoint
 ```
 
-Checkpoints, hand-history archives and the SQLite lookup databases are not
-checked in (see `.gitignore`). The scripts that build them are in `scripts/`
-(`build_training_data.py`, `build_preflop_lookup.py`,
-`build_postflop_lookup.py`, `train_equity_model.py`).
+`configs/training_config.json` is sized for a many-core server (10M-entry
+buffers, 64k batches). On a workstation, lower `buffer_size`, `batch_size`
+and `traversals_per_iteration`. Network updates start once the buffer
+holds 40 batches.
+
+### What is not in the repository
+
+Large or third-party artifacts are gitignored. The core loop (equity model →
+Deep CFR → self-play → tournament → web UI → GUI) needs none of them and runs
+from a fresh clone.
+
+| Artifact | Needed by | How to get it |
+|---|---|---|
+| `models/equity_model_v3.pt` | `make train` | `make equity` |
+| checkpoints in `models/` | self-play, tournament, GUI | `make train` |
+| hand-history archive in `data/poker_archive/` (6-max NLHE text histories) | supervised / CQL / IQL training, HH validation, lookup DBs | your own dataset |
+| `data/preflop_lookup.sqlite`, `data/postflop_sizing.sqlite` | data-driven preflop/sizing stages (otherwise static ranges and preset sizes) | `scripts/build_preflop_lookup.py`, `scripts/build_postflop_lookup.py` |
+| labeled spot JSONs in `logs/action_debug/` | imitation term in training, tournament spot phase | your own spots, labeled with `scripts/annotate_spots_with_claude.py` (`ANTHROPIC_API_KEY`) |
+| TexasSolver binary | GTO spot validation | `bash scripts/setup_texassolver.sh` |
 
 ## Results
 

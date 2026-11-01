@@ -111,7 +111,9 @@ def _run(cmd: List[str], dry_run: bool = False) -> str:
         return ''
     proc = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
     if proc.returncode != 0:
-        print(f'  FAILED: {proc.stderr[-500:]}', file=sys.stderr)
+        # Some scripts report fatal errors on stdout (e.g. missing data dirs).
+        msg = (proc.stderr.strip() or proc.stdout.strip())[-500:]
+        print(f'  FAILED ({cmd[1]}): {msg}', file=sys.stderr)
         return ''
     return proc.stdout
 

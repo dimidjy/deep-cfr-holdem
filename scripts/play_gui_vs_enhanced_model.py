@@ -156,17 +156,9 @@ class LiveBehavioralTracker:
 
 
 def _make_engine(num_players: int) -> FastEnhancedPokerEngine:
-    return FastEnhancedPokerEngine(
-        num_players=num_players,
-        add_position_features=True,
-        add_pot_odds_features=True,
-        add_hand_strength_features=True,
-        add_stack_features=True,
-        add_equity_features=True,
-        add_street_features=True,
-        add_game_state_features=True,
-        add_betting_history_features=True,
-    )
+    # Same feature set as training and self-play (53-dim observations).
+    from src.engine.factory import make_engine
+    return make_engine(num_players=num_players)
 
 
 class _SupervisedWrapper:
@@ -355,8 +347,6 @@ def main():
         print("\nExample:")
         print("  python3 scripts/play_gui_vs_enhanced_model.py --model models/final_model_enhanced.pt")
         print("  python3 scripts/play_gui_vs_enhanced_model.py --list")
-        print("\n⚠️  This script is for ENHANCED models only!")
-        print("    For base models, use: python3 scripts/play_gui_vs_model.py")
         return
     
     model_path = Path(args.model)
@@ -385,8 +375,7 @@ def main():
         deep_cfr, engine, trained_players = load_model(
             str(model_path), args.players, game_num_players=args.players)
         if deep_cfr is None or engine is None:
-            print("\n⚠️  If you're trying to load a BASE model, use:")
-            print("    python3 scripts/play_gui_vs_model.py --model", args.model)
+            print("\n⚠️  Could not load", args.model)
             return
 
     # Set up search if requested
